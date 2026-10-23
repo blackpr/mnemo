@@ -1,27 +1,29 @@
 import type { ModelRef, Scope } from "../../shared-kernel/index.js";
-import type { Episode, Fact, NewFact } from "../../memory/index.js";
+import type { Episode, ExtractedCandidate, Fact } from "../../memory/index.js";
 
 /**
  * Extractor: turns Episodes into candidate Facts. A strategy, replaceable per Bank.
- * Implementations are LLM-backed (one per provider via LlmClient) or NoopExtractor.
- * Must report which model and prompt version produced each candidate (Provenance.extractor).
+ * Implementations are LLM-backed (via LlmClient) or NoopExtractor.
+ * Reports which model and prompt version produced the candidates (Provenance.extractor).
  */
-export interface CandidateFact {
-  readonly fact: Omit<NewFact, "id" | "bankId">;
-  /** Existing facts the extractor believes this candidate relates to, with its judgement. */
-  readonly related: readonly { readonly factId: Fact["id"]; readonly contradicts: boolean; readonly candidateIsNewer: boolean }[];
-  readonly faithfulness: number;
-}
-
 export interface ExtractionUsage {
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly latencyMs: number;
 }
 
+export interface ExtractionContext {
+  /** The episode that triggered extraction. */
+  readonly trigger: Episode;
+  /** Recent episodes before the trigger, oldest first, for context. */
+  readonly recent: readonly Episode[];
+  /** Facts currently believed about the Subject, so the extractor can relate candidates to them. */
+  readonly existing: readonly Fact[];
+}
+
 export interface Extractor {
   readonly model: ModelRef;
-  extract(scope: Scope, episodes: readonly Episode[], existing: readonly Fact[]): Promise<{ readonly candidates: readonly CandidateFact[]; readonly usage: ExtractionUsage }>;
+  extract(scope: Scope, ctx: ExtractionContext): Promise<{ readonly candidates: readonly ExtractedCandidate[]; readonly usage: ExtractionUsage }>;
 }
 
 export const noopExtractor = (model: ModelRef): Extractor => ({

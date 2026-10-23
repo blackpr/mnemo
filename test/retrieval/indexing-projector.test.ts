@@ -17,7 +17,7 @@ describeWithDb("IndexingProjector", () => {
     await new PgBankRepository(db.pool).create(bankA);
   });
 
-  it("on FactSuperseded retracts the old fact in the index and indexes the new one; redelivery is safe", async () => {
+  it("on FactSuperseded re-indexes the old fact with closed validity and indexes the new one; redelivery is safe", async () => {
     const facts = new PgFactRepository(db.pool);
     const engine = new PgvectorEngine(db.pool, new HashingEmbedder(128));
     const projector = new IndexingProjector(engine, facts, new PgEpisodeRepository(db.pool));
@@ -30,7 +30,7 @@ describeWithDb("IndexingProjector", () => {
     await projector.handle([{ type: "memory.FactAsserted", occurredAt: t0, tenantId: tenant, bankId: bankA.id, payload: { factId: a.id } }]);
     expect((await engine.recall(scopeFor(bankA.id), "where does the user live", { limit: 5 })).map((h) => h.factId)).toEqual(["f-a"]);
 
-    const s = supersede(a, b, t1);
+    const s = supersede(a, b);
     if (!s.ok) throw new Error("setup");
     await facts.update(s.value.old);
     await facts.update(s.value.replacement);
@@ -38,6 +38,8 @@ describeWithDb("IndexingProjector", () => {
     await projector.handle([ev]);
     await projector.handle([ev]);
     expect((await engine.recall(scopeFor(bankA.id), "where does the user live", { limit: 5 })).map((h) => h.factId)).toEqual(["f-b"]);
+    // The superseded fact is still recallable for its interval.
+    expect((await engine.recall(scopeFor(bankA.id), "where does the user live", { limit: 5, asOf: new Date("2026-03-01T00:00:00Z") })).map((h) => h.factId)).toEqual(["f-a"]);
 
     const inv = invalidate(b, "contradicted", new Date("2026-10-01T00:00:00Z"));
     if (!inv.ok) throw new Error("setup");

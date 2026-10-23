@@ -1,4 +1,4 @@
-import type { BankId, DomainEvent, EpisodeId, FactId, Scope } from "../../shared-kernel/index.js";
+import type { BankId, DomainEvent, EpisodeId, FactId, PrincipalId, Scope } from "../../shared-kernel/index.js";
 import type { AuditLogStore } from "../../governance/index.js";
 import type { Bank } from "../domain/bank.js";
 import type { Episode } from "../domain/episode.js";
@@ -40,6 +40,8 @@ export interface EpisodeRepository {
   get(scope: Scope, id: EpisodeId): Promise<Episode | undefined>;
   getMany(scope: Scope, ids: readonly EpisodeId[]): Promise<readonly Episode[]>;
   listByBank(scope: Scope, opts?: { readonly after?: Date; readonly limit?: number }): Promise<readonly Episode[]>;
+  /** The `limit` most recent episodes at or before `before` (default now), returned oldest first. */
+  listRecent(scope: Scope, limit: number, before?: Date): Promise<readonly Episode[]>;
 }
 
 export interface FactRepository {
@@ -51,6 +53,8 @@ export interface FactRepository {
   get(scope: Scope, id: FactId, opts?: { readonly forUpdate?: boolean }): Promise<Fact | undefined>;
   getMany(scope: Scope, ids: readonly FactId[]): Promise<readonly Fact[]>;
   listCurrent(scope: Scope, at?: Date): Promise<readonly Fact[]>;
+  /** True if `writer` already produced facts while processing `triggerEpisodeId`. Extraction idempotency check. */
+  existsForTrigger(scope: Scope, triggerEpisodeId: EpisodeId, writer: PrincipalId): Promise<boolean>;
 }
 
 /** Transactional outbox: events are written in the same transaction as the state change. */

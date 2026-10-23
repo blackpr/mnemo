@@ -1,4 +1,4 @@
-import type { BankId, DomainEvent, EpisodeId, FactId, Scope, TenantId } from "../../../shared-kernel/index.js";
+import type { BankId, DomainEvent, EpisodeId, FactId, PrincipalId, Scope, TenantId } from "../../../shared-kernel/index.js";
 import type { Queryable } from "../../../platform/postgres/pool.js";
 import type { Bank } from "../../domain/bank.js";
 import type { Episode } from "../../domain/episode.js";
@@ -72,6 +72,17 @@ export class PgEpisodeRepository implements EpisodeRepository {
     return rows.map(toEpisode);
   }
 
+  async listRecent(scope: Scope, limit: number, before: Date = new Date()): Promise<readonly Episode[]> {
+    const { rows } = await this.db.query<EpisodeRow>(
+      `SELECT * FROM (
+         SELECT * FROM memory.episodes WHERE bank_id = $1 AND occurred_at <= $2
+         ORDER BY occurred_at DESC, id DESC LIMIT $3
+       ) recent ORDER BY occurred_at ASC, id ASC`,
+      [scope.bankId, before, limit],
+    );
+    return rows.map(toEpisode);
+  }
+
   async listByBank(scope: Scope, opts: { readonly after?: Date; readonly limit?: number } = {}): Promise<readonly Episode[]> {
     const { rows } = await this.db.query<EpisodeRow>(
       `SELECT * FROM memory.episodes
@@ -121,6 +132,16 @@ export class PgFactRepository implements FactRepository {
     if (ids.length === 0) return [];
     const { rows } = await this.db.query<FactRow>("SELECT * FROM memory.facts WHERE bank_id = $1 AND id = ANY($2::text[])", [scope.bankId, ids]);
     return rows.map(toFact);
+  }
+
+  async existsForTrigger(scope: Scope, triggerEpisodeId: EpisodeId, writer: PrincipalId): Promise<boolean> {
+    const { rows } = await this.db.query<{ one: number }>(
+      `SELECT 1 AS one FROM memory.facts
+       WHERE bank_id = $1 AND provenance->>'triggerEpisodeId' = $2 AND provenance->>'writerPrincipalId' = $3
+       LIMIT 1`,
+      [scope.bankId, triggerEpisodeId, writer],
+    );
+    return rows.length > 0;
   }
 
   async listCurrent(scope: Scope, at: Date = new Date()): Promise<readonly Fact[]> {

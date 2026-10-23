@@ -70,7 +70,7 @@ describeWithDb("Memory Postgres adapters", () => {
     expect(await facts.get(scopeFor(bankB.id), asFactId("f-a"))).toBeUndefined();
     expect((await facts.getMany(scopeFor(bankA.id), [asFactId("f-a"), asFactId("f-b"), asFactId("nope")])).map((f) => f.id).sort()).toEqual(["f-a", "f-b"]);
 
-    const s = supersede(a, b, t1);
+    const s = supersede(a, b);
     if (!s.ok) throw new Error("supersede failed");
     await facts.update(s.value.old);
     await facts.update(s.value.replacement);
@@ -80,10 +80,10 @@ describeWithDb("Memory Postgres adapters", () => {
 
     const oldRow = await facts.get(scopeFor(bankA.id), asFactId("f-a"));
     expect(oldRow?.validity.validTo).toEqual(t1);
-    expect(oldRow?.transaction.retractedAt).toEqual(t1);
+    expect(oldRow?.transaction.retractedAt).toBeUndefined();
     expect(oldRow?.supersededBy).toBe("f-b");
-    expect(oldRow?.invalidation?.reason).toBe("superseded");
-    expect(oldRow?.invalidation?.at).toEqual(t1);
+    // Point in time: in March the old fact was current.
+    expect((await facts.listCurrent(scopeFor(bankA.id), new Date("2026-03-01T00:00:00Z"))).map((f) => f.id)).toEqual(["f-a"]);
     expect((await facts.get(scopeFor(bankA.id), asFactId("f-b")))?.supersedes).toBe("f-a");
 
     await expect(db.pool.query("DELETE FROM memory.facts WHERE id = 'f-a'")).rejects.toThrow(/erasure/);

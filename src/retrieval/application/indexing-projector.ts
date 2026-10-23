@@ -39,10 +39,12 @@ export class IndexingProjector {
         return;
       }
       case "memory.FactSuperseded": {
+        // The old fact stays recallable for its (now closed) interval; re-index it with the new validity.
         const { oldFactId, newFactId } = e.payload as { oldFactId: FactId; newFactId: FactId };
-        await this.engine.retractFact(oldFactId);
-        const fact = await this.facts.get(scope, newFactId);
-        if (fact) await this.engine.indexFact(fact);
+        for (const id of [oldFactId, newFactId]) {
+          const fact = await this.facts.get(scope, id);
+          if (fact) await this.engine.indexFact(fact);
+        }
         return;
       }
       case "memory.FactInvalidated": {

@@ -16,10 +16,10 @@ A self-hosted **system of record for memory** that any model provider can read f
 | **Bank** | The isolated memory store for one Subject within one Tenant. Every read and write names exactly one Bank. | A database schema; an engine's "bank"/"workspace" (those are adapter details) |
 | **Episode** | An immutable record of something that happened: a conversation turn, a tool result, an imported document. Append-only. The raw, non-lossy provenance. | A Fact |
 | **Fact** | A durable, atomic statement believed about the Subject or their world, derived from one or more Episodes, with bi-temporal validity and provenance. | A chunk, an embedding, a "memory" in vendor terminology |
-| **Validity** (world time) | When the fact was true in the world: `validFrom`, `validTo` (open-ended until invalidated) | Transaction time |
+| **Validity** (world time) | When the fact was true in the world: `validFrom`, `validTo` (open-ended until superseded or closed) | Transaction time |
 | **Transaction time** | When we learned and when we stopped believing: `recordedAt`, `retractedAt` | Validity |
-| **Supersession** | Fact B replaces Fact A: A gets `validTo` and `retractedAt`, B links `supersedes: A`. Nothing is overwritten or deleted. | Deletion |
-| **Invalidation** | A fact is marked no longer believed, with a reason and a causing Episode. | Deletion |
+| **Supersession** | Fact B replaces Fact A: A gets `validTo` (world time) and `supersededBy: B`, B links `supersedes: A`. A is still believed about its interval, so point-in-time recall finds it. Nothing is retracted, overwritten or deleted. | Deletion, Invalidation |
+| **Invalidation** | A fact is marked no longer believed at all (`retractedAt`), with a reason. Used when we were wrong, not when the world moved on. | Deletion, Supersession |
 | **Provenance** | Source Episode ids, writer Principal, extractor model id and version, confirmation state (`asserted`, `confirmed`, `disputed`) | Metadata tags |
 | **Scope** | The (Tenant, Bank, Principal grants) tuple that every operation runs under. Enforced on every read path, including GET by id. | An API key |
 | **Principal** | The caller: a human, an agent, a tool integration. Has grants on Banks. | A Subject (the Principal may act on behalf of one) |
@@ -69,12 +69,12 @@ The system of record. Everything else derives from it.
 - **Invariants**
   1. An Episode is never updated or deleted except through Erasure.
   2. A Fact always carries at least one source Episode id and a writer Principal. No orphan facts.
-  3. Supersession and invalidation never delete; they close intervals and link.
+  3. Supersession closes the validity interval and links; invalidation retracts the belief. Neither deletes.
   4. `validFrom <= validTo`; `recordedAt <= retractedAt`.
   5. A Fact belongs to exactly one Bank, forever.
   6. Extractor `ModelRef` is recorded on every machine-written Fact (model drift is a correctness issue).
 - **Domain events** (persisted to outbox, same transaction): `EpisodeRecorded`, `FactAsserted`, `FactSuperseded`, `FactInvalidated`, `FactConfirmed`, `FactDisputed`
-- **Domain services**: `ConflictResolver` (recency-wins with explicit invalidation; returns a decision, performs no IO), `WritePolicy` (filter/canonicalize/dedupe rules; contradiction check ordered **before** the near-duplicate gate)
+- **Domain services**: `WritePolicy` (contradiction check ordered **before** the near-duplicate gate; decides assert / supersede / invalidate / historical / reject), `ConflictResolver` (executes the decision: a newer "updates" supersedes, a newer "contradicts" invalidates, an older candidate becomes history; performs no IO)
 - **Repositories (ports)**: `BankRepository`, `EpisodeRepository`, `FactRepository`, `Outbox`
 
 ### 2.2 Governance (core domain, cross-cutting policy)
@@ -93,10 +93,10 @@ This is the part nobody ships in open source and the reason the layer exists. It
 
 Turns Episodes into candidate Facts. Strategy, not identity: it will change often and must be replaceable per Bank.
 
-- **Port**: `Extractor.extract(episodes, existingFacts, scope) → CandidateFact[]` (LLM-backed adapters per provider; a `NoopExtractor` for the pgvector-only arm)
-- **Application service**: `RetainPipeline` consumes `EpisodeRecorded` from the outbox, runs the Extractor, passes candidates through Memory's `WritePolicy` and `ConflictResolver`, and issues `AssertFact`/`SupersedeFact` commands. Runs async; never on the request path.
+- **Port**: `Extractor.extract(scope, { trigger, recent, existing }) → { candidates: ExtractedCandidate[], usage }` (one LLM-backed implementation over the `LlmClient` port, whose single adapter is the Vercel AI SDK with provider packages; a `noopExtractor` for the pgvector-only arm)
+- **Application service**: `RetainPipeline` has two decoupled halves. As an outbox consumer it only enqueues `EpisodeRecorded` episodes into `extraction.runs` (cheap, idempotent), so indexing never waits on a model. As a worker (its own loop) it claims one due row at a time (`FOR UPDATE SKIP LOCKED`, stale claims retaken), gathers context (recent episodes, facts current now), runs the Extractor outside any transaction with a hard timeout, and submits candidates to Memory's `WriteExtractedFacts` command, which is idempotent per trigger episode and applies `WritePolicy` and `ConflictResolver` in one transaction. Failures back off (30s doubling to 1h, 8 attempts); non-retryable model errors dead-letter the episode. Banks without an extractor, and episodes not authored by the Subject (assistant or tool output), are skipped.
 - **Records** extractor `ModelRef`, prompt version and a faithfulness score into Provenance.
-- **Owns**: the per-turn write budget (token accounting), batching, and retry with idempotency keyed on Episode id.
+- **Owns**: the per-episode write budget (facts shown to the model capped, episode text truncated, output tokens capped), the token/latency ledger per episode (`extraction.runs`), retry policy, and idempotency keyed on the trigger episode.
 
 ### 2.4 Retrieval (supporting)
 
@@ -178,7 +178,7 @@ Every repository read filters by `scope.bankId` in SQL as a second line of defen
 
 ## 6. Request flows
 
-**Retain** (write): Attachment → `RecordEpisode` command → Governance `canWrite` → bank tenant must equal scope tenant → `Episode` persisted + `EpisodeRecorded` to outbox + `episode.recorded` audit entry (one transaction) → return. Async: outbox relay → Extraction `RetainPipeline` → candidates → `WritePolicy` (contradiction check, then dedupe) → `ConflictResolver` → `AssertFact` / `SupersedeFact` → `FactAsserted` → Retrieval indexes.
+**Retain** (write): Attachment → `RecordEpisode` command → Governance `canWrite` → bank tenant must equal scope tenant → `Episode` persisted + `EpisodeRecorded` to outbox + `episode.recorded` audit entry (one transaction) → return. Async, relay loop: Retrieval `IndexingProjector` indexes the episode; Extraction enqueues it. Async, worker loop: claim → `LlmExtractor` (recent episodes + current facts → structured candidates with relations to existing facts) → Memory `WriteExtractedFacts`: code guards (Subject-authored source, no secrets) → `WritePolicy` (contradiction check, then dedupe) → `ConflictResolver`: a newer "updates" supersedes (old validity closed and linked, still recallable for its interval), a newer "contradicts" invalidates (old retracted), an older candidate is recorded as history marked disputed → `FactAsserted` / `FactSuperseded` / `FactInvalidated` / `FactDisputed` → `extraction.applied` audit entry → next relay pass indexes the facts.
 
 **Recall** (read): Attachment → `Recall` query with `Scope` → Governance `canRead` → `RetrievalEngine.recall` → Fact and Episode ids → `FactRepository.getMany(scope, ids)` / `EpisodeRepository.get(scope, id)` (policy applied again) → response with provenance and validity → `recall.served` audit entry (ids only). Application handlers write the audit entries themselves: for writes inside the unit-of-work transaction (entry and change commit or roll back together), for reads right after the read. The attachment only audits capability denials.
 
@@ -199,7 +199,7 @@ Every repository read filters by `scope.bankId` in SQL as a second line of defen
 2. Governance domain: `Scope`, `AccessPolicy`, `ErasureRequest` state machine, hash-chained audit entries. Unit tests. **Done.** Postgres repositories for principals, API keys and the audit log (per-tenant advisory lock, canonical JSON hashing) **done**; erasure persistence still to add.
 3. Postgres adapters for Memory, unit of work, outbox relay, migrations for all three schemas. Contract tests. **Done.**
 4. Retrieval: `PgvectorEngine` behind the `RetrievalEngine` port, `HashingEmbedder` for offline tests, `EngineFactFinder` adapter into Memory's recall. This is spike arm B. **Done** (production embedder adapter still to add).
-5. Extraction: one LLM adapter behind `LlmClient`, `RetainPipeline`. Record `ModelRef`.
+5. Extraction: one LLM adapter behind `LlmClient` (Vercel AI SDK: Anthropic, Google, OpenAI, OpenAI-compatible), `LlmExtractor` with a versioned prompt and structured output, `RetainPipeline` off the outbox with an idempotency claim per episode and a per-episode token/latency ledger (`extraction.runs`), `WriteExtractedFactsHandler` in Memory applying WritePolicy + ConflictResolver (supersede or record-as-historical). **Done.** Extraction is per bank: `admin set-extractor --bank <id> --model provider:model`.
 6. Attachment: REST first (the eval arm adapters need it), then MCP, then the Anthropic memory-tool handler. **REST done**: scope resolution via API keys, retain, recall (facts and episodes), assert/list/get/confirm/dispute, audit on every served read and write, outbox relay + `IndexingProjector` in the same process, admin CLI for bootstrap.
 7. `HindsightEngine` and `HonchoEngine` adapters (spike arms C and D) using the same `RetrievalEngine` port and the same contract tests.
 8. Portability: JSONL/Markdown export, Claude Code memory-dir import.

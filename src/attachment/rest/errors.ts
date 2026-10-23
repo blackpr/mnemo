@@ -33,6 +33,8 @@ export function toHttpError(err: AppError): HttpError {
       return { status: 409, body: { error: "duplicate_fact", detail: { factId: error["factId"] } } };
     case "AlreadyRetracted":
       return { status: 409, body: { error: "fact_retracted", detail: { factId: error["factId"] } } };
+    case "AlreadySuperseded":
+      return { status: 409, body: { error: "fact_superseded", detail: { factId: error["factId"], by: error["by"] } } };
     case "NoProvenance":
     case "InvalidValidity":
     case "BankMismatch":

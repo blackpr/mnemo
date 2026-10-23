@@ -17,7 +17,7 @@ export interface RankedHit {
 
 export interface RecallOptions {
   readonly limit: number;
-  /** Point-in-time recall: only facts valid at this instant. */
+  /** Point-in-time recall: only facts valid at this instant. Default: now. */
   readonly asOf?: Date;
   readonly includeEpisodes?: boolean;
 }

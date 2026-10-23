@@ -39,19 +39,23 @@ describe("Fact invariants", () => {
     expect(a.ok && b.ok).toBe(true);
     if (!a.ok || !b.ok) return;
 
-    const r = supersede(a.value, b.value, t1);
+    const r = supersede(a.value, b.value);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
 
     expect(r.value.old.validity.validTo).toEqual(t1);
-    expect(r.value.old.transaction.retractedAt).toEqual(t1);
+    expect(r.value.old.transaction.retractedAt).toBeUndefined(); // still believed, about the past
     expect(r.value.old.supersededBy).toBe(b.value.id);
     expect(r.value.replacement.supersedes).toBe(a.value.id);
     expect(isCurrent(r.value.old, t2)).toBe(false);
     expect(isCurrent(r.value.replacement, t2)).toBe(true);
     // Point-in-time query: at t0 + 1 day the old fact was the truth.
-    expect(isCurrent(r.value.old, new Date("2026-01-02T00:00:00Z"))).toBe(false); // retracted in transaction time
-    expect(r.value.old.validity.validFrom <= new Date("2026-01-02T00:00:00Z")).toBe(true);
+    expect(isCurrent(r.value.old, new Date("2026-01-02T00:00:00Z"))).toBe(true);
+    expect(isCurrent(r.value.replacement, new Date("2026-01-02T00:00:00Z"))).toBe(false);
+    // And it cannot be superseded twice.
+    const c = assertFact(candidate("f3", "editor is emacs", t2), t2);
+    if (!c.ok) throw new Error("setup");
+    expect(supersede(r.value.old, c.value).ok).toBe(false);
   });
 
   it("refuses to supersede an already retracted fact", () => {
@@ -60,7 +64,7 @@ describe("Fact invariants", () => {
     if (!a.ok || !b.ok) throw new Error("setup");
     const inv = invalidate(a.value, "contradicted", t1);
     if (!inv.ok) throw new Error("setup");
-    const r = supersede(inv.value, b.value, t2);
+    const r = supersede(inv.value, b.value);
     expect(r.ok).toBe(false);
   });
 });
@@ -74,7 +78,7 @@ describe("WritePolicy ordering", () => {
       [{ fact: existing.value, similarity: 0.97, contradicts: true, candidateIsNewer: true }],
       defaultBankPolicy,
     );
-    expect(decision).toEqual({ action: "supersede", oldFactId: existing.value.id });
+    expect(decision).toEqual({ action: "supersede", oldFactId: existing.value.id, mode: "supersede" });
   });
 
   it("rejects a plain near-duplicate", () => {

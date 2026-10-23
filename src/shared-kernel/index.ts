@@ -87,6 +87,8 @@ export interface Provenance {
   readonly writerPrincipalId: PrincipalId;
   /** Present when a model (extractor) wrote the fact; absent for human-authored facts. */
   readonly extractor?: ModelRef;
+  /** For extracted facts: the episode whose processing produced this fact (may differ from the cited sources). */
+  readonly triggerEpisodeId?: EpisodeId;
   readonly confirmation: ConfirmationState;
   /** 0..1, optional faithfulness score from the write policy. */
   readonly faithfulness?: number;

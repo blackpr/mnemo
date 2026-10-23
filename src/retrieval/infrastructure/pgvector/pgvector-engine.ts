@@ -63,8 +63,8 @@ export class PgvectorEngine implements RetrievalEngine {
        WHERE bank_id = $2
          AND kind = ANY($3::text[])
          AND NOT retracted
-         AND ($4::timestamptz IS NULL OR (valid_from IS NULL OR valid_from <= $4))
-         AND ($4::timestamptz IS NULL OR (valid_to IS NULL OR valid_to > $4))
+         AND (valid_from IS NULL OR valid_from <= COALESCE($4::timestamptz, now()))
+         AND (valid_to IS NULL OR valid_to > COALESCE($4::timestamptz, now()))
        ORDER BY embedding <=> $1::vector
        LIMIT $5`,
       [toVectorLiteral(qvec ?? []), scope.bankId, kinds, options.asOf ?? null, options.limit],

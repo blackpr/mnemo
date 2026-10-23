@@ -15,7 +15,7 @@ src/shared-kernel   ids, Clock, Scope, Validity, Provenance, ModelRef, Result, D
 src/memory          core: Bank, Episode, Fact (bi-temporal), WritePolicy, events, repositories, RecordEpisode, Recall
 src/governance      core: AccessPolicy, Principal/Grant, ErasureRequest (fails closed), hash-chained AuditLog
 src/retrieval       RetrievalEngine port; adapters pgvector / Hindsight / Honcho
-src/extraction      Extractor and LlmClient ports; RetainPipeline
+src/extraction      Extractor, LlmClient, run-store ports; LlmExtractor + prompt; RetainPipeline; AI SDK adapter
 src/attachment      REST, MCP, Anthropic memory tool, (later) OpenAI proxy
 src/portability     export / import / render
 src/platform        shared infrastructure utilities (Postgres pool, transactions, migrator); not a bounded context
@@ -50,8 +50,11 @@ npm run admin -- create-bank --id bank-me --tenant t1 --subject me
 npm run admin -- create-principal --id claude-code --tenant t1 --kind agent --name "Claude Code"
 npm run admin -- grant --principal claude-code --bank bank-me --caps read,write
 npm run admin -- issue-key --principal claude-code --label laptop   # prints the API key once
+npm run admin -- set-extractor --bank bank-me --model anthropic:claude-opus-5-5   # optional: turn on fact extraction
 npm start                                                            # http://localhost:8787
 ```
+
+Extraction needs the provider's key in the environment (`ANTHROPIC_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `OPENAI_API_KEY`, or `OPENAI_COMPATIBLE_BASE_URL` for Ollama-style endpoints) and runs in a worker loop separate from indexing (`EXTRACTION_POLL_MS`, `LLM_TIMEOUT_MS`). Without `set-extractor`, a bank stores and recalls raw episodes only (the pgvector-only arm of the spike). Only the Subject's own turns are extracted from; assistant and tool output is context.
 
 See `src/attachment/README.md` for the routes.
 

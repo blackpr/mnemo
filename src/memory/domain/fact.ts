@@ -5,15 +5,17 @@ export type FactError =
   | { readonly kind: "NoProvenance" }
   | { readonly kind: "InvalidValidity"; readonly detail: string }
   | { readonly kind: "AlreadyRetracted"; readonly factId: FactId }
+  | { readonly kind: "AlreadySuperseded"; readonly factId: FactId; readonly by: FactId }
   | { readonly kind: "BankMismatch"; readonly expected: BankId; readonly actual: BankId }
   | { readonly kind: "SelfSupersession"; readonly factId: FactId };
 
-export type InvalidationReason = "superseded" | "contradicted" | "disputed_by_subject" | "source_retracted" | "other";
+export type InvalidationReason = "contradicted" | "disputed_by_subject" | "source_retracted" | "other";
 
 /**
  * Fact: a durable, atomic statement believed about the Subject or their world.
  * Bi-temporal: Validity is world time; TransactionTime is when we believed it.
- * Supersession and invalidation close intervals and link; they never delete (invariant 3).
+ * Supersession closes the validity interval and links (the fact stays believed about its
+ * interval); invalidation retracts the belief. Neither deletes (invariant 3).
  */
 export interface Fact {
   readonly id: FactId;
@@ -71,17 +73,19 @@ export const isCurrent = (f: Fact, at: Date = new Date()): boolean =>
   (f.validity.validTo === undefined || f.validity.validTo.getTime() > at.getTime());
 
 /**
- * Supersede `old` with `replacement`: closes old's validity at the replacement's validFrom,
- * retracts old at `now`, and links both ways. Returns the two updated facts. Nothing is deleted.
+ * Supersede `old` with `replacement`: closes old's validity at the replacement's validFrom and
+ * links both ways. The old fact is NOT retracted: we still believe it held during its interval,
+ * so point-in-time recall keeps finding it. Retraction (`invalidate`) is for facts we no longer
+ * believe at all. Nothing is deleted.
  */
 export function supersede(
   old: Fact,
   replacement: Fact,
-  now: Date,
 ): Result<{ readonly old: Fact; readonly replacement: Fact }, FactError> {
   if (old.id === replacement.id) return err({ kind: "SelfSupersession", factId: old.id });
   if (old.bankId !== replacement.bankId) return err({ kind: "BankMismatch", expected: old.bankId, actual: replacement.bankId });
   if (old.transaction.retractedAt !== undefined) return err({ kind: "AlreadyRetracted", factId: old.id });
+  if (old.supersededBy !== undefined) return err({ kind: "AlreadySuperseded", factId: old.id, by: old.supersededBy });
 
   const closedValidity: Validity = {
     validFrom: old.validity.validFrom,
@@ -90,24 +94,20 @@ export function supersede(
   const checked = checkValidity(closedValidity);
   if (!checked.ok) return checked;
 
-  const closedOld: Fact = Object.freeze({
-    ...old,
-    validity: closedValidity,
-    transaction: { recordedAt: old.transaction.recordedAt, retractedAt: now },
-    supersededBy: replacement.id,
-    invalidation: { reason: "superseded" as const, at: now },
-  });
+  const closedOld: Fact = Object.freeze({ ...old, validity: closedValidity, supersededBy: replacement.id });
   const linkedReplacement: Fact = Object.freeze({ ...replacement, supersedes: old.id });
   return ok({ old: closedOld, replacement: linkedReplacement });
 }
 
-/** Mark a fact as no longer believed. Keeps the row; closes transaction time. */
+/**
+ * Mark a fact as no longer believed (we were wrong). Keeps the row; closes transaction time.
+ * Validity is left as it was: the fact was never true, so there is no world-time interval to close.
+ */
 export function invalidate(fact: Fact, reason: InvalidationReason, now: Date, note?: string): Result<Fact, FactError> {
   if (fact.transaction.retractedAt !== undefined) return err({ kind: "AlreadyRetracted", factId: fact.id });
   return ok(
     Object.freeze({
       ...fact,
-      validity: { validFrom: fact.validity.validFrom, validTo: fact.validity.validTo ?? now },
       transaction: { recordedAt: fact.transaction.recordedAt, retractedAt: now },
       invalidation: { reason, at: now, ...(note !== undefined ? { note } : {}) },
     }),

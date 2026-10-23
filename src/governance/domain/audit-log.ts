@@ -17,6 +17,7 @@ export type AuditAction =
   | "fact.disputed"
   | "facts.listed"
   | "fact.read"
+  | "extraction.applied"
   | "access.denied"
   | "erasure.requested"
   | "erasure.deleted"

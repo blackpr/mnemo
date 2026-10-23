@@ -10,4 +10,5 @@ export const migrationSources: readonly MigrationSource[] = [
   { label: "memory", dir: resolve(src, "memory/infrastructure/postgres/migrations") },
   { label: "governance", dir: resolve(src, "governance/infrastructure/postgres/migrations") },
   { label: "retrieval", dir: resolve(src, "retrieval/infrastructure/pgvector/migrations") },
+  { label: "extraction", dir: resolve(src, "extraction/infrastructure/postgres/migrations") },
 ];

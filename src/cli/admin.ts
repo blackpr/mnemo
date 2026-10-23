@@ -5,6 +5,7 @@ import { migrate } from "../platform/postgres/migrator.js";
 import { migrationSources } from "../platform/postgres/migrations.js";
 import { generateApiKey, hashApiKey, PgApiKeyStore, PgPrincipalRepository, type Grant } from "../governance/index.js";
 import { createBank, PgBankRepository, PgOutboxRelay } from "../memory/index.js";
+import { parseModelSpec, PgExtractionRunStore } from "../extraction/index.js";
 
 /**
  * Bootstrap CLI. Creates the records the REST attachment needs before a first request:
@@ -15,6 +16,10 @@ import { createBank, PgBankRepository, PgOutboxRelay } from "../memory/index.js"
  *   npm run admin -- issue-key --principal claude-code --label laptop
  *   npm run admin -- revoke-key --key mem_...
  *   npm run admin -- requeue-dead-letters
+ *   npm run admin -- set-extractor --bank bank-vangelis --model anthropic:claude-opus-5-5
+ *   npm run admin -- clear-extractor --bank bank-vangelis
+ *   npm run admin -- extraction-status
+ *   npm run admin -- requeue-extraction
  *
  * The API key is printed once and never stored in plaintext. Every command refuses to silently
  * change existing state: create-* fail if the id exists, grants require matching tenants.
@@ -43,6 +48,8 @@ const { values } = parseArgs({
     caps: { type: "string" },
     label: { type: "string" },
     key: { type: "string" },
+    model: { type: "string" },
+    version: { type: "string" },
   },
 });
 
@@ -104,6 +111,37 @@ try {
       console.log(revoked ? "key revoked" : "no active key matched");
       break;
     }
+    case "set-extractor": {
+      const bankId = asBankId(need("bank"));
+      const bank = (await banks.get(bankId)) ?? die(`bank ${bankId} not found`);
+      const extractor = (() => {
+        try {
+          return parseModelSpec(need("model"), values.version ?? "v1");
+        } catch (e) {
+          return die(e instanceof Error ? e.message : String(e));
+        }
+      })();
+      await banks.update({ ...bank, policy: { ...bank.policy, extractor } });
+      console.log(`bank ${bankId} will extract with ${extractor.provider}:${extractor.model} (${extractor.version}); new episodes only`);
+      break;
+    }
+    case "clear-extractor": {
+      const bankId = asBankId(need("bank"));
+      const bank = (await banks.get(bankId)) ?? die(`bank ${bankId} not found`);
+      const { extractor: _drop, ...policy } = bank.policy;
+      await banks.update({ ...bank, policy });
+      console.log(`bank ${bankId} extraction disabled; existing facts untouched`);
+      break;
+    }
+    case "extraction-status": {
+      console.log(JSON.stringify(await new PgExtractionRunStore(pool).counts()));
+      break;
+    }
+    case "requeue-extraction": {
+      const n = await new PgExtractionRunStore(pool).requeueFailed();
+      console.log(`${n} failed/dead extraction run(s) requeued`);
+      break;
+    }
     case "requeue-dead-letters": {
       const relay = new PgOutboxRelay(pool);
       const n = await relay.requeueDeadLetters();
@@ -111,7 +149,7 @@ try {
       break;
     }
     default:
-      die("usage: admin <create-bank|create-principal|grant|issue-key|revoke-key|requeue-dead-letters> [options]");
+      die("usage: admin <create-bank|create-principal|grant|issue-key|revoke-key|set-extractor|clear-extractor|extraction-status|requeue-extraction|requeue-dead-letters> [options]");
   }
 } finally {
   await pool.end();
