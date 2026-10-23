@@ -86,7 +86,7 @@ This is the part nobody ships in open source and the reason the layer exists. It
 - **Events**: `AccessDenied`, `ErasureRequested`, `ErasureVerified`, `ErasureReceiptIssued`, `HistoryRedacted`
 - **Rules**
   - Audit entry is written *before* the destructive action; if the audit write fails, the action does not happen.
-  - Erasure fans out to every store that holds derived data (engine adapters implement `purgeSubject`), then re-queries each and records zero-hit proof in the receipt.
+  - Erasure fans out to every store that holds Subject data (each context implements the `ErasableStore` port; engine adapters implement `countBank` / `purgeBank`), then re-queries each and records zero-hit proof in the receipt.
   - Redaction removes content from historical Fact versions and Episodes while keeping the tombstone and audit chain.
 
 ### 2.3 Extraction (supporting)
@@ -168,7 +168,7 @@ Dependency rules: `domain ← application ← infrastructure`; `ports` are decla
 - `memory.banks`, `memory.episodes` (append-only: a trigger refuses UPDATE, and DELETE unless the session flag `mem.erasure = 'on'` is set by the Erasure workflow), `memory.facts` (bi-temporal columns, `supersedes_id` / `superseded_by_id`, CHECK that provenance has at least one source episode, DELETE refused outside erasure), `memory.outbox`
 - `governance.principals`, `governance.grants`, `governance.erasure_requests`, `governance.audit_log` (hash chain columns, immutable by trigger)
 - `retrieval.pgvector_index` (our default engine; derived state, no foreign keys to `memory.*` so it can be dropped and rebuilt), plus external engines' own storage
-- `portability.exports` (manifest of produced exports, for receipts) — not yet created
+- `portability.exports` (manifest of produced exports, for receipts)
 
 Migrations are plain SQL files owned by each context (`src/<context>/infrastructure/**/migrations/*.sql`), applied in context order by `src/platform/postgres/migrator.ts` under an advisory lock and recorded in `public.schema_migrations`. `npm run db:migrate` applies them; tests apply them on setup.
 
@@ -182,7 +182,7 @@ Every repository read filters by `scope.bankId` in SQL as a second line of defen
 
 **Recall** (read): Attachment → `Recall` query with `Scope` → Governance `canRead` → `RetrievalEngine.recall` → Fact and Episode ids → `FactRepository.getMany(scope, ids)` / `EpisodeRepository.get(scope, id)` (policy applied again) → response with provenance and validity → `recall.served` audit entry (ids only). Application handlers write the audit entries themselves: for writes inside the unit-of-work transaction (entry and change commit or roll back together), for reads right after the read. The attachment only audits capability denials.
 
-**Erase**: Attachment → `RequestErasure` → Governance aggregate `ErasureRequest` → audit entry first → inventory (facts, episodes, engine stores, caches) → delete everywhere → verify zero hits per store → receipt (hash, counts, timestamps) → `ErasureReceiptIssued`.
+**Erase**: Attachment (REST or admin CLI; never MCP) → `EraseBank` → Governance `canErase` → `ErasureRequest` created (`requested`; the database refuses a second in-flight one per bank) → `erasure.requested` audit entry first (if it fails, nothing is deleted) → bank frozen (`erasing`) → inventory every `ErasableStore` (memory facts/episodes/outbox, retrieval engine, extraction runs, portability exports) → purge each store, each deletion saved on the request before the next store starts (Memory in one transaction under `mem.erasure = 'on'`) → `erasure.deleted` → re-count every store; any hit fails closed → bank tombstoned (`erased`) → receipt (canonical-JSON digest over request id, subject, per-store zero counts, time) → `erasure.receipt_issued` audit entry carrying the digest. Any failure: request `failed` with the reason, bank stays frozen, a new request may retry.
 
 ## 7. What we deliberately do not do (yet)
 
@@ -196,7 +196,7 @@ Every repository read filters by `scope.bankId` in SQL as a second line of defen
 ## 8. Build order
 
 1. Shared kernel + Memory domain with unit tests (no IO). Invariants 1-6 as tests. **Done.**
-2. Governance domain: `Scope`, `AccessPolicy`, `ErasureRequest` state machine, hash-chained audit entries. Unit tests. **Done.** Postgres repositories for principals, API keys and the audit log (per-tenant advisory lock, canonical JSON hashing) **done**; erasure persistence still to add.
+2. Governance domain: `Scope`, `AccessPolicy`, `ErasureRequest` state machine, hash-chained audit entries. Unit tests. **Done.** Postgres repositories for principals, API keys and the audit log (per-tenant advisory lock, canonical JSON hashing) **done**. Erasure workflow **done**: `EraseBank` (audit entry before any deletion, bank frozen, per-store inventory / purge / re-count through the `ErasableStore` port implemented by Memory, Retrieval, Extraction and Portability, receipt with a canonical-JSON digest chained into the audit log as `erasure.receipt_issued`, fails closed with deletions recorded per store), `governance.erasure_requests` persistence with one in-flight request per bank enforced by a partial unique index, REST `POST/GET /v1/banks/:bankId/erasure`, `admin erase-bank` / `erasure-status`. Memory deletes under `SET LOCAL mem.erasure = 'on'`; the bank row stays as an `erased` tombstone.
 3. Postgres adapters for Memory, unit of work, outbox relay, migrations for all three schemas. Contract tests. **Done.**
 4. Retrieval: `PgvectorEngine` behind the `RetrievalEngine` port, `HashingEmbedder` for offline tests, `AiSdkEmbedder` for production (OpenAI, Google, OpenAI-compatible; configured by `EMBEDDER`), `EngineMemoryFinder` adapter into Memory's recall. Rows record their embedder; recall filters by it; `admin reindex` rebuilds a bank after a switch. This is spike arm B. **Done.**
 5. Extraction: one LLM adapter behind `LlmClient` (Vercel AI SDK: Anthropic, Google, OpenAI, OpenAI-compatible), `LlmExtractor` with a versioned prompt and structured output, `RetainPipeline` off the outbox with an idempotency claim per episode and a per-episode token/latency ledger (`extraction.runs`), `WriteExtractedFactsHandler` in Memory applying WritePolicy + ConflictResolver (supersede or record-as-historical). **Done.** Extraction is per bank: `admin set-extractor --bank <id> --model provider:model`.
