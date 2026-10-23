@@ -2,7 +2,7 @@
 
 Last updated 2026-10-23. Read this first when resuming work. `ARCHITECTURE.md` is the design; this file is where things stand.
 
-## What exists (all committed, 108 tests passing on `npm test`)
+## What exists (all committed, 131 tests passing on `npm test`)
 
 | Area | State |
 |---|---|
@@ -12,9 +12,10 @@ Last updated 2026-10-23. Read this first when resuming work. `ARCHITECTURE.md` i
 | Retrieval | pgvector engine filtered by embedder id; `AiSdkEmbedder` (OpenAI/Google) configured by `EMBEDDER`; `HashingEmbedder` for tests; `admin reindex` |
 | Extraction | `LlmExtractor` (Vercel AI SDK, any provider), claim-based worker loop separate from indexing, idempotent per trigger episode, cost ledger in `extraction.runs`, code guards (Subject-authored source, secret detection) |
 | Attachments | REST (`/v1/banks/:bankId/...`) and MCP (`/v1/banks/:bankId/mcp`, stateless Streamable HTTP) over the same handlers and audit |
-| Tooling | `admin` CLI (banks, principals, grants, keys, extractor, reindex, queues), `eval/demo-extraction.sh`, `docker-compose.yml` (dev DB `mem`, test DB `mem_test`) |
+| Portability | `BankExport` v1 (JSONL with tombstones, deterministic Markdown by topic, JSON Schema `src/portability/schema/bank-export.v1.json`), export ledger `portability.exports` + `export.produced` audit, REST `GET /v1/banks/:bankId/export?format=jsonl\|markdown`; Claude Code memory-dir importer (gray-matter, idempotent via path+digest externalRef, episodes only); Claude/Gemini paste renderers. See `src/portability/README.md` |
+| Tooling | `admin` CLI (banks, principals, grants, keys, extractor, reindex, queues, `export`, `import-claude-code`, `render-import`), `eval/demo-extraction.sh`, `docker-compose.yml` (dev DB `mem`, test DB `mem_test`) |
 
-Verified live on 2026-10-23: Claude Opus 5.5 extraction, OpenAI `text-embedding-3-small` recall, Claude Code connected over MCP (`claude mcp list` shows `mem ✔ Connected`), a retain over MCP extracted into a fact.
+Verified live on 2026-10-23: Claude Opus 5.5 extraction, OpenAI `text-embedding-3-small` recall, Claude Code connected over MCP (`claude mcp list` shows `mem ✔ Connected`), a retain over MCP extracted into a fact. Also on 2026-10-23: all three portability admin commands and the REST export against `bank-demo`; four real memory files from `~/.claude/projects/-Users-blackpr-code-local-vector-search/memory` imported and extracted into facts (bank-demo now holds those too).
 
 ## Running it
 
@@ -34,7 +35,11 @@ npm test                       # unit + Postgres suites on mem_test; npm run tes
 - The server keeps the embedder it booted with. After changing `EMBEDDER`, run `admin reindex --bank <id>` and restart.
 - `npm test` with keys in `.env` would spend money; paid tests are gated behind `RUN_LIVE_TESTS=1`.
 - The nested `claude -p` CLI on this machine has an expired OAuth session; use the MCP SDK client or the interactive app to exercise tools.
-- `preview_start` in the desktop app looked for `launch.json` in the old scratch folder; the server is run with `npm start` in the background instead.
+- `preview_start` in the desktop app looked for `launch.json` in the old scratch folder; the server is run with `npm start` in the background instead. The server does not reload code: after changing attachment code, kill the `npm start` process and start it again.
+- gray-matter's default engine table evals `---js` frontmatter; the Claude Code reader passes an options object that replaces the javascript/coffee engines with throwing parsers. Keep it that way for any future Markdown importer.
+- Postgres jsonb does not preserve key order; exports rebuild nested objects key by key so output is byte-stable.
+- `DuplicateEpisodeError` carries the attempted (new) id, not the existing episode's id; importers can only report the externalRef of a skipped document.
+- zsh expands `=word` on the command line; do not use `====` as an echo separator in shell commands.
 
 ## Working agreements (from the user)
 
@@ -49,11 +54,11 @@ npm test                       # unit + Postgres suites on mem_test; npm run tes
 - Extraction: config errors (bad provider, missing key) retry 8 times before dead; a zero-fact extraction leaves no idempotency marker (cost only); Google `taskType` hint unused.
 - Retrieval: `vector(N)` column and HNSW index deferred until the embedder is pinned (`EMBEDDING_DIMENSIONS`); delete foreign-embedder rows before adding the index.
 - MCP: DNS-rebinding protection off (bearer key makes it moot on localhost); no `assert_fact` or erase tool by design.
-- Governance: erasure persistence and the erase workflow (purge across facts, episodes, index, receipt) not built; `portability.exports` table not created.
+- Governance: erasure persistence and the erase workflow (purge across facts, episodes, index, receipt) not built; erasure must also purge `portability.exports` rows for the bank.
+- Portability: export ledger row and audit entry are two transactions (audit first, so a failure between them over-reports); symlinked memory files are skipped by the reader (`isFile()` is false); no MCP `export` tool yet (README lists it); the other import adapters (claude.ai export, Gemini Takeout, ChatGPT ZIP) are not built; id generation lives in the application layer rather than the attachment, unlike Memory.
 
 ## Suggested next steps, in order
 
-1. Portability: JSONL/Markdown export with provenance and tombstones; importer for the Claude Code memory directory (CLAUDE.md hierarchy, auto-memory files) creating episodes; renderer for the Claude/Gemini paste-import formats.
-2. Erasure end to end: persist `ErasureRequest`, purge across stores with `mem.erasure` session flag, verify, receipt into the audit chain; admin command.
-3. The spike (`spike-plan-hindsight-vs-honcho.md`): wire the four arms into promptfoo through REST; Hindsight and Honcho adapters must pass `test/retrieval/retrieval-engine.contract.ts`.
-4. Hardening: HNSW index migration, erasure of API keys, rate limits on attachments.
+1. Erasure end to end: persist `ErasureRequest`, purge across stores with `mem.erasure` session flag, verify, receipt into the audit chain; admin command.
+2. The spike (`spike-plan-hindsight-vs-honcho.md`): wire the four arms into promptfoo through REST; Hindsight and Honcho adapters must pass `test/retrieval/retrieval-engine.contract.ts`.
+3. Hardening: HNSW index migration, erasure of API keys, rate limits on attachments.
