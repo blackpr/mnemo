@@ -6,7 +6,7 @@
 #
 # Frozen for the spike: answering model anthropic:claude-opus-5-5 in every arm (eval/llm.ts), grader
 # model anthropic:claude-opus-5-5 with the committed prompt in grader/grader-prompt.txt.
-description: mem memory-engine spike, stage 1 (arms A full context and B pgvector)
+description: mem memory-engine spike, stage 2 (arms A full context, B pgvector, C Hindsight, D Honcho)
 
 # The arms read the question from vars, not from the rendered prompt; rendering the id keeps template
 # syntax inside a question ({{ or {%) from breaking the row.
@@ -18,6 +18,11 @@ providers:
     label: A-full-context
   - id: file://arms/pgvector.ts
     label: B-pgvector
+  # Arms C and D need their containers (npm run engines:up) and the HINDSIGHT_* / HONCHO_* variables in .env.
+  - id: file://arms/hindsight.ts
+    label: C-hindsight
+  - id: file://arms/honcho.ts
+    label: D-honcho
 
 tests: file://questions/load.ts
 

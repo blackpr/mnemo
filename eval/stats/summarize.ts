@@ -4,28 +4,18 @@
  * answers with the grader's reason. Costs use the list price in eval/llm.ts; embedding tokens are
  * not metered by the REST attachment and are reported as not counted.
  *
- *   npm run eval:summary            # reads eval/results/latest.json
+ *   npm run eval:summary                          # reads eval/results/latest.json
+ *   npm run eval:summary -- a.json b.json         # several files; arms merged by metadata.arm
  *
  * The cluster-robust confidence interval and minimum detectable difference (plan section 6) are
- * not computed here yet; with a handful of conversations they would not be meaningful.
+ * printed by `npm run eval:ci` (eval/stats/ci.ts).
  */
-import { readFile } from "node:fs/promises";
 import { costUsd, PRICE_USD_PER_MTOK } from "../llm.js";
+import { armOf, loadRows, typeOf, type Row } from "./rows.js";
 
-interface Row {
-  success: boolean;
-  score: number;
-  latencyMs?: number;
-  provider?: { id?: string; label?: string };
-  vars?: Record<string, unknown>;
-  response?: { tokenUsage?: { prompt?: number; completion?: number; cached?: number }; metadata?: Record<string, unknown>; cached?: boolean; output?: unknown };
-  gradingResult?: { reason?: string; tokensUsed?: { prompt?: number; completion?: number; total?: number } };
-  testCase?: { description?: string; metadata?: Record<string, unknown> };
-}
-
-const file = process.argv[2] ?? "eval/results/latest.json";
-const rows = (JSON.parse(await readFile(file, "utf8")) as { results: { results: Row[] } }).results.results;
-if (rows.length === 0) throw new Error(`no results in ${file}`);
+const files = process.argv.slice(2);
+const file = files.length > 0 ? files.join(", ") : "eval/results/latest.json";
+const { rows, notRun } = await loadRows(files.length > 0 ? files : ["eval/results/latest.json"]);
 
 const percentile = (xs: number[], p: number): number => {
   if (xs.length === 0) return 0;
@@ -35,23 +25,27 @@ const percentile = (xs: number[], p: number): number => {
 const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 const pct = (n: number, d: number): string => (d === 0 ? "n/a" : `${Math.round((100 * n) / d)}% (${n}/${d})`);
 
-/** The arm name the provider recorded (B-pgvector vs B-pgvector-raw share one YAML label), else the label. */
-const armOf = (r: Row): string => String(r.response?.metadata?.arm ?? r.provider?.label ?? r.provider?.id ?? "?");
 const arms = [...new Set(rows.map(armOf))].sort();
-const types = [...new Set(rows.map((r) => String(r.testCase?.metadata?.type ?? r.vars?.type ?? "?")))].sort();
+const types = [...new Set(rows.map(typeOf))].sort();
 
-console.log(`Source: ${file} (${rows.length} results, ${arms.length} arm(s), ${new Set(rows.map((r) => String(r.vars?.conversationId ?? ""))).size} conversation(s)).`);
-console.log(`Prices: $${PRICE_USD_PER_MTOK.input}/M input, $${PRICE_USD_PER_MTOK.output}/M output (claude-opus-5-5). Embedding tokens: not counted.\n`);
+console.log(`Source: ${file} (${rows.length} answered results, ${arms.length} arm(s), ${new Set(rows.map((r) => String(r.vars?.conversationId ?? ""))).size} conversation(s)).`);
+if (notRun.size > 0) console.log(`Not run (provider error, excluded from every row below): ${[...notRun].map(([a, n]) => `${a} ${n}`).join(", ")}.`);
+console.log(`Prices: $${PRICE_USD_PER_MTOK.input}/M input, $${PRICE_USD_PER_MTOK.output}/M output (claude-opus-5-5); write cost counts input + output at list price (prompt-cached input is charged at full price here, an over-estimate for engines that cache). Embedding tokens: not priced.\n`);
 
 const header = ["Measure", ...arms];
 const table: string[][] = [];
 const col = (f: (rs: Row[]) => string): string[] => arms.map((a) => f(rows.filter((r) => armOf(r) === a)));
 
-table.push(["Questions", ...col((rs) => String(rs.length))]);
+table.push(["Questions answered", ...col((rs) => String(rs.length))]);
+if (notRun.size > 0) table.push(["Questions not run (provider error)", ...arms.map((a) => String(notRun.get(a) ?? 0))]);
 table.push(["Answers served from cache", ...col((rs) => String(rs.filter((r) => r.response?.cached).length))]);
+table.push(["Extraction model (write path)", ...col((rs) => {
+  const models = new Set(rs.map((r) => r.response?.metadata?.extractionModel).filter((m): m is string => typeof m === "string"));
+  return models.size === 0 ? "none" : [...models].join(", ");
+})]);
 table.push(["Accuracy, overall", ...col((rs) => pct(rs.filter((r) => r.success).length, rs.length))]);
 for (const t of types) table.push([`Accuracy, ${t}`, ...col((rs) => {
-  const sub = rs.filter((r) => String(r.testCase?.metadata?.type ?? r.vars?.type) === t);
+  const sub = rs.filter((r) => typeOf(r) === t);
   return pct(sub.filter((r) => r.success).length, sub.length);
 })]);
 table.push(["Read tokens per question (prompt, mean, nominal)", ...col((rs) => Math.round(rs.reduce((n, r) => n + num(r.response?.tokenUsage?.prompt), 0) / Math.max(1, rs.length)).toLocaleString())]);
@@ -63,6 +57,24 @@ table.push(["Write tokens, total (extraction, per bank once)", ...col((rs) => {
     if (typeof m.bankId === "string") banks.set(m.bankId, num(m.writeInputTokens) + num(m.writeOutputTokens));
   }
   return banks.size === 0 ? "0 (no write path)" : [...banks.values()].reduce((a, b) => a + b, 0).toLocaleString();
+})]);
+table.push(["Write LLM calls / prompt-cached tokens (where the engine reports them)", ...col((rs) => {
+  const banks = new Map<string, { calls: number; cached: number }>();
+  for (const r of rs) {
+    const m = r.response?.metadata ?? {};
+    if (typeof m.bankId === "string" && typeof m.writeLlmCalls === "number") banks.set(m.bankId, { calls: num(m.writeLlmCalls), cached: num(m.writeCachedTokens) });
+  }
+  if (banks.size === 0) return "not reported";
+  const v = [...banks.values()];
+  return `${v.reduce((a, b) => a + b.calls, 0).toLocaleString()} / ${v.reduce((a, b) => a + b.cached, 0).toLocaleString()}`;
+})]);
+table.push(["Embedding tokens, total (where metered)", ...col((rs) => {
+  const banks = new Map<string, number>();
+  for (const r of rs) {
+    const m = r.response?.metadata ?? {};
+    if (typeof m.bankId === "string" && typeof m.embeddingTokens === "number") banks.set(m.bankId, num(m.embeddingTokens));
+  }
+  return banks.size === 0 ? "not metered" : [...banks.values()].reduce((a, b) => a + b, 0).toLocaleString();
 })]);
 table.push(["Grader tokens, total", ...col((rs) => rs.reduce((n, r) => n + num(r.gradingResult?.tokensUsed?.total), 0).toLocaleString())]);
 table.push(["Answer latency p50 / p95 (ms, uncached)", ...col((rs) => {
@@ -111,5 +123,5 @@ const failures = rows.filter((r) => !r.success);
 console.log(`\nFailed answers (${failures.length}):`);
 for (const r of failures) {
   const q = String(r.vars?.questionId ?? r.testCase?.description ?? "?");
-  console.log(`- ${armOf(r)} ${q} [${String(r.testCase?.metadata?.type ?? "?")}]: ${(r.gradingResult?.reason ?? "").replace(/\s+/g, " ").slice(0, 220)}`);
+  console.log(`- ${armOf(r)} ${q} [${typeOf(r)}]: ${(r.gradingResult?.reason ?? "").replace(/\s+/g, " ").slice(0, 220)}`);
 }

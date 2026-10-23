@@ -1,7 +1,7 @@
 /**
  * The question set schema. One line per question in `questions.jsonl`. A drafted question is
- * `audited: false` until a human has checked the answer key; corrections and drops are logged in
- * `answer-key-log.md`, never silently applied.
+ * `audited: false` until the answer key has been checked against the transcript (`auditedBy` says
+ * by whom); corrections and drops are logged in `answer-key-log.md`, never silently applied.
  */
 import { z } from "zod";
 
@@ -19,6 +19,8 @@ export const questionSchema = z.object({
   type: z.enum(QUESTION_TYPES),
   evidenceTurnIndexes: z.array(z.number().int().nonnegative()).default([]),
   audited: z.boolean(),
+  /** Who settled the key: a model re-reading the transcript (stage 2) or a human. The plan wants a human audit; this keeps the two distinguishable. */
+  auditedBy: z.enum(["model", "human"]).optional(),
   note: z.string().optional(),
 });
 

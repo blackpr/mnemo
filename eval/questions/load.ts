@@ -4,8 +4,9 @@
  * rubric (question, type, answer key). The arms read the question and its conversation id from vars.
  *
  * Env for subsets: EVAL_CONVERSATIONS (comma-separated ids), EVAL_MAX_CONVERSATIONS, EVAL_MAX_QUESTIONS,
- * EVAL_MAX_PER_CONVERSATION (spread a small run across conversations), EVAL_REQUIRE_AUDITED=1 (skip
- * questions a human has not checked yet; a smoke run allows them).
+ * EVAL_MAX_PER_CONVERSATION (spread a small run across conversations), EVAL_REQUIRE_AUDITED=1 (only
+ * audited questions, by a model or a human; since stage 2 that is all of them) or
+ * EVAL_REQUIRE_AUDITED=human (only questions a human audited; none yet).
  */
 import { readFile } from "node:fs/promises";
 import path from "node:path";
@@ -36,11 +37,13 @@ export function selectQuestions(all: readonly Question[], env: NodeJS.ProcessEnv
   const maxConversations = env.EVAL_MAX_CONVERSATIONS ? Number(env.EVAL_MAX_CONVERSATIONS) : Infinity;
   const maxQuestions = env.EVAL_MAX_QUESTIONS ? Number(env.EVAL_MAX_QUESTIONS) : Infinity;
   const maxPerConversation = env.EVAL_MAX_PER_CONVERSATION ? Number(env.EVAL_MAX_PER_CONVERSATION) : Infinity;
-  const requireAudited = env.EVAL_REQUIRE_AUDITED === "1";
+  const requireAudited = env.EVAL_REQUIRE_AUDITED === "1" || env.EVAL_REQUIRE_AUDITED === "human";
+  const requireHuman = env.EVAL_REQUIRE_AUDITED === "human";
   const perConversation = new Map<string, number>();
   const out: Question[] = [];
   for (const q of interleaveTypes(all)) {
     if (requireAudited && !q.audited) continue;
+    if (requireHuman && q.auditedBy !== "human") continue;
     if (only.length > 0 && !only.includes(q.conversationId)) continue;
     const taken = perConversation.get(q.conversationId);
     if (taken === undefined) {
@@ -65,7 +68,7 @@ export function toTestCase(q: Question): TestCase {
     description: `${q.id} [${q.type}]`,
     vars: { question: q.question, conversationId: q.conversationId, questionId: q.id, type: q.type, asOf: q.asOf ?? "", rubric: rubricFor(q) },
     assert: [{ type: "llm-rubric", value: "{{ rubric }}" }],
-    metadata: { questionId: q.id, conversationId: q.conversationId, type: q.type, audited: q.audited },
+    metadata: { questionId: q.id, conversationId: q.conversationId, type: q.type, audited: q.audited, auditedBy: q.auditedBy ?? null },
   };
 }
 

@@ -14,13 +14,12 @@
  * A bank id is never reused for different content: the ingestion record carries a digest of the
  * conversation, and a mismatch fails closed (erase the bank, delete the record, run again).
  */
-import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { ApiProvider, CallApiContextParams, ProviderResponse } from "promptfoo";
 import { loadConversation } from "../corpus/store.js";
 import { ANSWERING_MODEL } from "../llm.js";
-import { admin, answer, asOfInstruction, evalVars, providerResponse, recall, REPO_ROOT, retain, sleep, type RecalledEpisode, type RecalledFact } from "./lib.js";
+import { admin, answer, asOfInstruction, evalVars, providerResponse, recall, REPO_ROOT, retain, type RecalledEpisode, type RecalledFact } from "./lib.js";
+import { digestOf, IngestionRecord, SerializedIngestion, sleep } from "./ingestion.js";
 
 const EXTRACTOR = process.env.EVAL_B_EXTRACTOR ?? ANSWERING_MODEL;
 export const ARM = EXTRACTOR === "none" ? "B-pgvector-raw" : "B-pgvector";
@@ -30,7 +29,8 @@ const SOURCE = "eval-corpus";
 const RECALL_LIMIT = Number(process.env.EVAL_RECALL_LIMIT ?? 10);
 const DRAIN_POLL_MS = 5_000;
 const DRAIN_TIMEOUT_MS = Number(process.env.EVAL_DRAIN_TIMEOUT_MS ?? 30 * 60_000);
-const STATE_PATH = path.join(REPO_ROOT, "eval", "results", "pgvector-banks.json");
+const record = new IngestionRecord<Ingestion>(path.join(REPO_ROOT, "eval", "results", "pgvector-banks.json"));
+const serialized = new SerializedIngestion<Ingestion>();
 
 interface Ingestion {
   readonly bankId: string;
@@ -50,30 +50,7 @@ interface Ingestion {
 type RunCounts = Record<"pending" | "running" | "done" | "failed" | "dead" | "skipped", number>;
 type ExtractionSummary = { counts: RunCounts; inputTokens: number; outputTokens: number };
 
-const inFlight = new Map<string, Promise<Ingestion>>();
-/** Serializes read-modify-write of the state file; two conversations can finish ingesting at once. */
-let stateWrites: Promise<unknown> = Promise.resolve();
-
 const drained = (c: RunCounts, turns: number): boolean => c.pending + c.running + c.failed === 0 && c.done + c.skipped + c.dead >= turns;
-
-async function readState(): Promise<Record<string, Ingestion>> {
-  try {
-    return JSON.parse(await readFile(STATE_PATH, "utf8")) as Record<string, Ingestion>;
-  } catch {
-    return {};
-  }
-}
-
-function saveState(key: string, ingestion: Ingestion): Promise<void> {
-  const write = stateWrites.then(async () => {
-    await mkdir(path.dirname(STATE_PATH), { recursive: true });
-    const state = await readState();
-    state[key] = ingestion;
-    await writeFile(STATE_PATH, JSON.stringify(state, null, 2) + "\n");
-  });
-  stateWrites = write.catch(() => undefined);
-  return write;
-}
 
 async function extractionSummary(bankId: string): Promise<ExtractionSummary> {
   return JSON.parse(await admin("extraction-status", "--bank", bankId)) as ExtractionSummary;
@@ -97,12 +74,12 @@ async function ingest(conversationId: string): Promise<Ingestion> {
   const bankId = `eval-${conversationId.slice(0, 8)}${EXTRACTOR === "none" ? "-raw" : ""}`;
   if (!bankId.startsWith("eval-")) throw new Error("refusing to ingest into a non-eval bank");
   const turns = await loadConversation(conversationId);
-  const digest = createHash("sha256").update(JSON.stringify(turns)).digest("hex");
+  const digest = digestOf(turns);
   const stateKey = `${conversationId}${EXTRACTOR === "none" ? ":raw" : ""}`;
-  const known = (await readState())[stateKey];
+  const known = await record.get(stateKey);
   if (known) {
     if (known.bankId !== bankId || known.digest !== digest || known.extractor !== EXTRACTOR) {
-      throw new Error(`${bankId} was ingested from different content or settings (${JSON.stringify({ bankId: known.bankId, extractor: known.extractor, digest: known.digest.slice(0, 12) })}); erase it with \`npm run admin -- erase-bank\`, remove its entry from ${STATE_PATH}, and run again`);
+      throw new Error(`${bankId} was ingested from different content or settings (${JSON.stringify({ bankId: known.bankId, extractor: known.extractor, digest: known.digest.slice(0, 12) })}); erase it with \`npm run admin -- erase-bank\`, remove its entry from ${record.path}, and run again`);
     }
     const s = await extractionSummary(bankId);
     if (drained(s.counts, known.turns)) return known;
@@ -144,32 +121,17 @@ async function ingest(conversationId: string): Promise<Ingestion> {
     runs: s.counts,
     ingestedAt: new Date().toISOString(),
   };
-  await saveState(stateKey, ingestion);
+  await record.save(stateKey, ingestion);
   console.log(`[${ARM}] ${bankId}: ${created} retained, ${duplicates} already there, drained in ${Math.round(ingestion.ingestMs / 1000)} s, write tokens ${s.inputTokens} in / ${s.outputTokens} out, runs ${JSON.stringify(s.counts)}`);
   return ingestion;
 }
 
 /**
- * Ingestions run one at a time: `admin grant` rewrites the principal's whole grant list without a
- * transaction, so two concurrent grants lose one bank; and a single extraction worker drains them
- * sequentially anyway. Per conversation the promise is shared by every row, and a failure is retried
- * by the next row of that conversation.
+ * Ingestions run one at a time (`SerializedIngestion`): `admin grant` rewrites the principal's whole
+ * grant list without a transaction, so two concurrent grants lose one bank; and a single extraction
+ * worker drains them sequentially anyway.
  */
-let ingestQueue: Promise<unknown> = Promise.resolve();
-
-function ensureIngested(conversationId: string): Promise<Ingestion> {
-  let p = inFlight.get(conversationId);
-  if (!p) {
-    p = ingestQueue.then(() => ingest(conversationId));
-    ingestQueue = p.catch(() => undefined);
-    p = p.catch((e) => {
-      inFlight.delete(conversationId);
-      throw e;
-    });
-    inFlight.set(conversationId, p);
-  }
-  return p;
-}
+const ensureIngested = (conversationId: string): Promise<Ingestion> => serialized.ensure(conversationId, () => ingest(conversationId));
 
 function renderFact(f: RecalledFact): string {
   const to = f.validity.validTo ? ` until ${f.validity.validTo}` : "";
@@ -212,6 +174,7 @@ export default class PgvectorProvider implements ApiProvider {
         asOf: vars.asOf ?? null,
         bankId: ingestion.bankId,
         extractor: ingestion.extractor,
+        extractionModel: ingestion.extractor,
         recallMs,
         recalledFacts: recalled.facts.length,
         recalledEpisodes: recalled.episodes.length,
