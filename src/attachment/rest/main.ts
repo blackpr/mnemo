@@ -7,6 +7,7 @@ import { PgAuditLog, PgPrincipalRepository, ScopeResolver, scopeAccessPolicy } f
 import { PgBankRepository, PgEpisodeRepository, PgFactRepository, PgOutboxRelay, PgUnitOfWork, WriteExtractedFactsHandler } from "../../memory/index.js";
 import { embedderFromEnv, EngineMemoryFinder, IndexingProjector, PgvectorEngine } from "../../retrieval/index.js";
 import { AiSdkLlmClient, LlmExtractor, PgExtractionRunStore, RetainPipeline, type Extractor } from "../../extraction/index.js";
+import { PgExportStore } from "../../portability/index.js";
 import { createApp } from "./app.js";
 
 /**
@@ -56,9 +57,11 @@ const app = createApp({
   audit: new PgAuditLog(pool),
   clock: systemClock,
   uow,
+  banks,
   facts,
   episodes,
   finder: new EngineMemoryFinder(engine),
+  exports: new PgExportStore(pool),
 });
 
 // Extractors are created lazily per configured model and cached for the process lifetime.

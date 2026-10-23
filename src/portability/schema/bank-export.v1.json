@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mem.local/schema/bank-export.v1.json",
+  "title": "BankExport v1 record",
+  "description": "One line of a mem bank export (JSONL). The first line is a header; every other line is a fact or a tombstone (a retracted fact). Facts are bi-temporal: validity is world time, transaction is when the system believed it.",
+  "oneOf": [{ "$ref": "#/$defs/header" }, { "$ref": "#/$defs/fact" }, { "$ref": "#/$defs/tombstone" }],
+  "$defs": {
+    "dateTime": { "type": "string", "format": "date-time" },
+    "id": { "type": "string", "minLength": 1 },
+    "header": {
+      "type": "object",
+      "required": ["record", "schema", "bankId", "subjectId", "exportedAt", "counts"],
+      "additionalProperties": false,
+      "properties": {
+        "record": { "const": "header" },
+        "schema": { "const": "bank-export.v1" },
+        "bankId": { "$ref": "#/$defs/id" },
+        "subjectId": { "$ref": "#/$defs/id" },
+        "exportedAt": { "$ref": "#/$defs/dateTime" },
+        "counts": {
+          "type": "object",
+          "required": ["facts", "tombstones"],
+          "additionalProperties": false,
+          "properties": {
+            "facts": { "type": "integer", "minimum": 0 },
+            "tombstones": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "predicate": {
+      "type": ["object", "null"],
+      "required": ["subject", "predicate", "object"],
+      "additionalProperties": false,
+      "properties": {
+        "subject": { "type": "string" },
+        "predicate": { "type": "string" },
+        "object": { "type": "string" }
+      }
+    },
+    "modelRef": {
+      "type": ["object", "null"],
+      "required": ["provider", "model", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "type": "string" },
+        "model": { "type": "string" },
+        "version": { "type": "string" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["sourceEpisodeIds", "writerPrincipalId", "extractor", "triggerEpisodeId", "confirmation", "faithfulness"],
+      "additionalProperties": false,
+      "properties": {
+        "sourceEpisodeIds": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/id" } },
+        "writerPrincipalId": { "$ref": "#/$defs/id" },
+        "extractor": { "$ref": "#/$defs/modelRef" },
+        "triggerEpisodeId": { "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "confirmation": { "enum": ["asserted", "confirmed", "disputed"] },
+        "faithfulness": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+      }
+    },
+    "factFields": {
+      "type": "object",
+      "required": ["record", "id", "statement", "predicate", "topic", "validity", "transaction", "provenance", "supersedes", "supersededBy"],
+      "properties": {
+        "record": { "enum": ["fact", "tombstone"] },
+        "transaction": { "type": "object" },
+        "id": { "$ref": "#/$defs/id" },
+        "statement": { "type": "string", "minLength": 1 },
+        "predicate": { "$ref": "#/$defs/predicate" },
+        "topic": { "type": "string", "minLength": 1 },
+        "validity": {
+          "type": "object",
+          "required": ["validFrom", "validTo"],
+          "additionalProperties": false,
+          "properties": {
+            "validFrom": { "$ref": "#/$defs/dateTime" },
+            "validTo": { "oneOf": [{ "$ref": "#/$defs/dateTime" }, { "type": "null" }] }
+          }
+        },
+        "provenance": { "$ref": "#/$defs/provenance" },
+        "supersedes": { "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "supersededBy": { "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }
+      }
+    },
+    "fact": {
+      "allOf": [
+        { "$ref": "#/$defs/factFields" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "record": { "const": "fact" },
+            "id": true, "statement": true, "predicate": true, "topic": true, "validity": true, "provenance": true, "supersedes": true, "supersededBy": true,
+            "transaction": {
+              "type": "object",
+              "required": ["recordedAt", "retractedAt"],
+              "additionalProperties": false,
+              "properties": { "recordedAt": { "$ref": "#/$defs/dateTime" }, "retractedAt": { "type": "null" } }
+            }
+          }
+        }
+      ]
+    },
+    "tombstone": {
+      "allOf": [
+        { "$ref": "#/$defs/factFields" },
+        {
+          "type": "object",
+          "required": ["invalidation"],
+          "additionalProperties": false,
+          "properties": {
+            "record": { "const": "tombstone" },
+            "id": true, "statement": true, "predicate": true, "topic": true, "validity": true, "provenance": true, "supersedes": true, "supersededBy": true,
+            "transaction": {
+              "type": "object",
+              "required": ["recordedAt", "retractedAt"],
+              "additionalProperties": false,
+              "properties": { "recordedAt": { "$ref": "#/$defs/dateTime" }, "retractedAt": { "$ref": "#/$defs/dateTime" } }
+            },
+            "invalidation": {
+              "type": "object",
+              "required": ["reason", "at", "note"],
+              "additionalProperties": false,
+              "properties": {
+                "reason": { "enum": ["contradicted", "disputed_by_subject", "source_retracted", "other"] },
+                "at": { "$ref": "#/$defs/dateTime" },
+                "note": { "type": ["string", "null"] }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

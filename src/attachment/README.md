@@ -30,6 +30,7 @@ All bank-scoped routes take `Authorization: Bearer mem_...`. Errors: 400 invalid
 | GET | `/v1/banks/:bankId/facts/:factId` | read | one fact, same policy as search |
 | POST | `/v1/banks/:bankId/facts/:factId/confirm` | write | mark provenance confirmed |
 | POST | `/v1/banks/:bankId/facts/:factId/dispute` | write | mark provenance disputed |
+| GET | `/v1/banks/:bankId/export?format=jsonl\|markdown` | read | the whole bank (closed and retracted facts included) as a download; recorded in `portability.exports` and audited `export.produced` (see `src/portability/README.md`) |
 
 Bootstrap with the admin CLI (`npm run admin -- create-bank | create-principal | grant | issue-key`). The server process also runs two background loops. The outbox relay (every `OUTBOX_POLL_MS`) indexes episodes and facts and enqueues extraction work. The extraction worker (every `EXTRACTION_POLL_MS`) turns queued episodes into facts for banks with `set-extractor`, calling the model with a hard `LLM_TIMEOUT_MS`; a changed state supersedes the old fact, which stays recallable for its past interval via `asOf`, and a contradiction retracts it. `npm run admin -- extraction-status` shows queue counts; `requeue-extraction` retries failed and dead runs. A failed event retries with exponential backoff (1s, 2s, 4s, ... capped at 5 min) and is dead-lettered after 5 attempts (`memory.outbox.failed_at`), logged, and never blocks the queue; `npm run admin -- requeue-dead-letters` puts dead letters back.
 

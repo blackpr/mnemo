@@ -23,6 +23,7 @@
     "@hono/node-server": "^2.1.5",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "ai": "^7.0.150",
+    "gray-matter": "^4.0.3",
     "hono": "^4.13.13",
     "pg": "^8.23.1",
     "zod": "^4.6.7"
@@ -30,6 +31,8 @@
   "devDependencies": {
     "@types/node": "^24.10.1",
     "@types/pg": "^8.23.1",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3",
     "vitest": "^3.2.4"

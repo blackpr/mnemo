@@ -34,6 +34,11 @@ export const listFactsQuery = z.object({
   asOf: isoDate.optional(),
 });
 
+/** Over REST only the archival formats; the provider paste formats are an admin concern (`admin render-import`). */
+export const exportQuery = z.object({
+  format: z.enum(["jsonl", "markdown"]).default("jsonl"),
+});
+
 export type RetainBody = z.infer<typeof retainBody>;
 export type RecallBody = z.infer<typeof recallBody>;
 export type AssertFactBody = z.infer<typeof assertFactBody>;

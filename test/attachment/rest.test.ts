@@ -5,6 +5,7 @@ import { generateApiKey, PgApiKeyStore, PgAuditLog, PgPrincipalRepository, Scope
 import { PgBankRepository, PgEpisodeRepository, PgFactRepository, PgOutboxRelay, PgUnitOfWork } from "../../src/memory/index.js";
 import { EngineMemoryFinder, HashingEmbedder, IndexingProjector, PgvectorEngine } from "../../src/retrieval/index.js";
 import { createApp } from "../../src/attachment/rest/app.js";
+import { PgExportStore } from "../../src/portability/index.js";
 import { describeWithDb, setupTestDb, type TestDb } from "../helpers/postgres.js";
 import { bankFixture, tenant } from "../helpers/fixtures.js";
 
@@ -45,9 +46,11 @@ describeWithDb("REST attachment", () => {
       audit: new PgAuditLog(db.pool),
       clock: systemClock,
       uow: new PgUnitOfWork(db.pool),
+      banks: new PgBankRepository(db.pool),
       facts,
       episodes,
       finder: new EngineMemoryFinder(engine),
+      exports: new PgExportStore(db.pool),
     });
   });
   afterAll(async () => db.close());
@@ -216,6 +219,34 @@ describeWithDb("REST attachment", () => {
     const recalled = await json<{ facts: unknown[] }>(await post(`/v1/banks/${bankA.id}/recall`, rwKey, { query: "sky green" }));
     expect(recalled.facts).toEqual([]);
     expect((await post(`/v1/banks/${bankA.id}/facts/${fact.id}/confirm`, rwKey, {})).status).toBe(409);
+  });
+
+  it("export: read capability, JSONL by default, Markdown on request, bad format is 400; recorded and audited", async () => {
+    const ep = await retain(rwKey, bankA.id, "source");
+    await post(`/v1/banks/${bankA.id}/facts`, rwKey, { statement: "the user's editor is neovim", sourceEpisodeIds: [ep] });
+
+    const jsonl = await get(`/v1/banks/${bankA.id}/export`, roKey);
+    expect(jsonl.status).toBe(200);
+    expect(jsonl.headers.get("content-type")).toBe("application/x-ndjson; charset=utf-8");
+    expect(jsonl.headers.get("content-disposition")).toMatch(/^attachment; filename="bank-a-.*\.jsonl"$/);
+    const lines = (await jsonl.text()).trim().split("\n").map((l) => JSON.parse(l) as { record: string; statement?: string });
+    expect(lines.map((l) => l.record)).toEqual(["header", "fact"]);
+    expect(lines[1]?.statement).toBe("the user's editor is neovim");
+
+    const md = await get(`/v1/banks/${bankA.id}/export?format=markdown`, roKey);
+    expect(md.status).toBe(200);
+    expect(md.headers.get("content-type")).toBe("text/markdown; charset=utf-8");
+    expect(await md.text()).toContain("- the user's editor is neovim");
+
+    expect((await get(`/v1/banks/${bankA.id}/export?format=xml`, roKey)).status).toBe(400);
+    expect((await get(`/v1/banks/${bankB.id}/export`, roKey)).status).toBe(403);
+
+    const exportId = jsonl.headers.get("x-mem-export-id");
+    const recorded = await new PgExportStore(db.pool).listByBank({ tenantId: tenant, bankId: bankA.id, principalId: asPrincipalId("ro"), capabilities: new Set() });
+    expect(recorded.map((e) => e.format).sort()).toEqual(["jsonl", "markdown"]);
+    expect(recorded.some((e) => e.id === exportId && e.principalId === "ro")).toBe(true);
+    const audit = await new PgAuditLog(db.pool).list(tenant);
+    expect(audit.map((a) => a.action)).toEqual(["episode.recorded", "fact.asserted", "export.produced", "export.produced", "access.denied"]);
   });
 
   it("projector is idempotent under redelivery", async () => {

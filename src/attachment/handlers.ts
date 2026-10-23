@@ -1,5 +1,7 @@
 import type { BankId, Clock, Scope } from "../shared-kernel/index.js";
 import type { AccessPolicy, AuditLogStore, ScopeResolver } from "../governance/index.js";
+import type { BankRepository } from "../memory/index.js";
+import { ExportBankHandler, type ExportStore } from "../portability/index.js";
 import {
   AssertFactHandler,
   GetFactHandler,
@@ -23,9 +25,11 @@ export interface AttachmentDeps {
   readonly audit: AuditLogStore;
   readonly clock: Clock;
   readonly uow: UnitOfWork;
+  readonly banks: BankRepository;
   readonly facts: FactRepository;
   readonly episodes: EpisodeRepository;
   readonly finder: MemoryFinder;
+  readonly exports: ExportStore;
 }
 
 export interface Handlers {
@@ -35,6 +39,7 @@ export interface Handlers {
   readonly listFacts: ListFactsHandler;
   readonly getFact: GetFactHandler;
   readonly setConfirmation: SetConfirmationHandler;
+  readonly exportBank: ExportBankHandler;
 }
 
 export function buildHandlers(deps: AttachmentDeps): Handlers {
@@ -45,6 +50,7 @@ export function buildHandlers(deps: AttachmentDeps): Handlers {
     listFacts: new ListFactsHandler(deps.facts, deps.access, deps.audit, deps.clock),
     getFact: new GetFactHandler(deps.facts, deps.access, deps.audit, deps.clock),
     setConfirmation: new SetConfirmationHandler(deps.uow, deps.access, deps.clock),
+    exportBank: new ExportBankHandler(deps.banks, deps.facts, deps.access, deps.exports, deps.audit, deps.clock),
   };
 }
 

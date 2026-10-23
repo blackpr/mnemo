@@ -6,6 +6,7 @@ import { generateApiKey, PgApiKeyStore, PgAuditLog, PgPrincipalRepository, Scope
 import { PgBankRepository, PgEpisodeRepository, PgFactRepository, PgOutboxRelay, PgUnitOfWork } from "../../src/memory/index.js";
 import { EngineMemoryFinder, HashingEmbedder, IndexingProjector, PgvectorEngine } from "../../src/retrieval/index.js";
 import { createApp } from "../../src/attachment/rest/app.js";
+import { PgExportStore } from "../../src/portability/index.js";
 import { describeWithDb, setupTestDb, type TestDb } from "../helpers/postgres.js";
 import { bankFixture, tenant } from "../helpers/fixtures.js";
 
@@ -47,9 +48,11 @@ describeWithDb("MCP attachment", () => {
       audit: new PgAuditLog(db.pool),
       clock: systemClock,
       uow: new PgUnitOfWork(db.pool),
+      banks: new PgBankRepository(db.pool),
       facts,
       episodes,
       finder: new EngineMemoryFinder(engine),
+      exports: new PgExportStore(db.pool),
     });
   });
   afterAll(async () => db.close());
@@ -165,9 +168,11 @@ describeWithDb("MCP attachment", () => {
       audit: new PgAuditLog(db.pool),
       clock: systemClock,
       uow: new PgUnitOfWork(db.pool),
+      banks: new PgBankRepository(db.pool),
       facts: new PgFactRepository(db.pool),
       episodes: new PgEpisodeRepository(db.pool),
       finder: { find: async () => { throw new Error("connection to host=db.internal failed"); } },
+      exports: new PgExportStore(db.pool),
     });
     const transport = new StreamableHTTPClientTransport(new URL(`http://mem.test/v1/banks/${bankA.id}/mcp`), {
       fetch: async (url, init) => broken.request(url instanceof URL ? url.toString() : url, init),

@@ -29,6 +29,7 @@ export async function setupTestDb(): Promise<TestDb> {
     pool,
     async truncateAll() {
       await pool.query(`TRUNCATE
+        portability.exports,
         extraction.runs,
         retrieval.pgvector_index,
         governance.audit_log, governance.erasure_requests, governance.api_keys, governance.grants, governance.principals,

@@ -8,7 +8,8 @@ import { auditDenial, buildHandlers, type AppError, type AttachmentDeps } from "
 import { createMcpServer } from "../mcp/server.js";
 import { serializeEpisode, serializeFact } from "../serialize.js";
 import { toHttpError } from "../errors.js";
-import { assertFactBody, listFactsQuery, recallBody, retainBody } from "./schemas.js";
+import { fileExtensionOf } from "../../portability/index.js";
+import { assertFactBody, exportQuery, listFactsQuery, recallBody, retainBody } from "./schemas.js";
 
 /**
  * REST attachment. Thin: resolve Scope, validate input, call one application handler, map the
@@ -24,7 +25,7 @@ type Env = { Variables: { scope: Scope; bankId: BankId } };
 export function createApp(deps: RestDeps): Hono<Env> {
   const app = new Hono<Env>();
   const handlers = buildHandlers(deps);
-  const { recordEpisode, recall, assertFact: assertFactH, listFacts, getFact, setConfirmation } = handlers;
+  const { recordEpisode, recall, assertFact: assertFactH, listFacts, getFact, setConfirmation, exportBank } = handlers;
 
   app.get("/healthz", (c) => c.json({ ok: true }));
 
@@ -158,6 +159,23 @@ export function createApp(deps: RestDeps): Hono<Env> {
       return c.json(serializeFact(r.value));
     });
   }
+
+  // Export: the whole bank (every fact, closed and retracted ones included) as JSONL or Markdown. Read capability; recorded and audited.
+  app.get("/v1/banks/:bankId/export", async (c) => {
+    const q = exportQuery.safeParse(Object.fromEntries(new URL(c.req.url).searchParams));
+    if (!q.success) return c.json({ error: "invalid_query", detail: q.error.issues }, 400);
+    const scope = c.get("scope");
+    const bankId = c.get("bankId");
+    const r = await exportBank.handle(scope, { bankId, format: q.data.format });
+    if (!r.ok) return fail(c, r.error, scope, bankId, deps);
+    const stamp = r.value.producedAt.toISOString().replace(/[:.]/g, "-");
+    const safeName = bankId.replace(/[^A-Za-z0-9._-]/g, "_");
+    return c.body(r.value.content, 200, {
+      "content-type": r.value.contentType,
+      "content-disposition": `attachment; filename="${safeName}-${stamp}.${fileExtensionOf(r.value.format)}"`,
+      "x-mem-export-id": r.value.exportId,
+    });
+  });
 
   app.onError((err, c) => {
     console.error(err);

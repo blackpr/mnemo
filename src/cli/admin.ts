@@ -1,10 +1,13 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { asBankId, asPrincipalId, asSubjectId, asTenantId, type Capability } from "../shared-kernel/index.js";
+import { asBankId, asPrincipalId, asSubjectId, asTenantId, systemClock, type BankId, type Capability, type Scope } from "../shared-kernel/index.js";
 import { createPool } from "../platform/postgres/pool.js";
 import { migrate } from "../platform/postgres/migrator.js";
 import { migrationSources } from "../platform/postgres/migrations.js";
-import { generateApiKey, hashApiKey, PgApiKeyStore, PgPrincipalRepository, type Grant } from "../governance/index.js";
-import { createBank, PgBankRepository, PgEpisodeRepository, PgFactRepository, PgOutboxRelay } from "../memory/index.js";
+import { generateApiKey, hashApiKey, PgApiKeyStore, PgAuditLog, PgPrincipalRepository, scopeAccessPolicy, type Grant } from "../governance/index.js";
+import { createBank, PgBankRepository, PgEpisodeRepository, PgFactRepository, PgOutboxRelay, PgUnitOfWork, RecordEpisodeHandler } from "../memory/index.js";
+import { EXPORT_FORMATS, ExportBankHandler, ImportDocumentsHandler, PgExportStore, readClaudeCodeMemory, type ExportFormat } from "../portability/index.js";
 import { parseModelSpec, PgExtractionRunStore } from "../extraction/index.js";
 import { embedderFromEnv, PgvectorEngine } from "../retrieval/index.js";
 
@@ -22,6 +25,12 @@ import { embedderFromEnv, PgvectorEngine } from "../retrieval/index.js";
  *   npm run admin -- extraction-status
  *   npm run admin -- requeue-extraction
  *   npm run admin -- reindex --bank bank-vangelis        # after changing EMBEDDER
+ *   npm run admin -- export --bank bank-vangelis --out exports/bank-vangelis.jsonl [--format jsonl|markdown]
+ *   npm run admin -- import-claude-code --bank bank-vangelis --dir ~/.claude/projects/<project>/memory
+ *   npm run admin -- render-import --bank bank-vangelis --target claude|gemini [--out <path>]
+ *
+ * Portability commands act as the internal principal "system:admin" (admin capability on the
+ * bank); exports are recorded in portability.exports and audited like any other read.
  *
  * The API key is printed once and never stored in plaintext. Every command refuses to silently
  * change existing state: create-* fail if the id exists, grants require matching tenants.
@@ -52,6 +61,10 @@ const { values } = parseArgs({
     key: { type: "string" },
     model: { type: "string" },
     version: { type: "string" },
+    out: { type: "string" },
+    dir: { type: "string" },
+    format: { type: "string" },
+    target: { type: "string" },
   },
 });
 
@@ -60,6 +73,8 @@ const die = (msg: string): never => {
   process.exit(1);
 };
 const need = (k: keyof typeof values): string => values[k] ?? die(`--${k} is required`);
+
+const adminScope = (bankId: BankId, tenantId: Scope["tenantId"]): Scope => ({ tenantId, bankId, principalId: asPrincipalId("system:admin"), capabilities: new Set<Capability>(["admin"]) });
 
 const pool = createPool(url, 2);
 try {
@@ -150,6 +165,55 @@ try {
       else console.log("if the server was started with a different EMBEDDER, restart it so recall uses this index");
       break;
     }
+    case "export":
+    case "render-import": {
+      const bankId = asBankId(need("bank"));
+      const bank = (await banks.get(bankId)) ?? die(`bank ${bankId} not found`);
+      const format: ExportFormat = (() => {
+        if (command === "render-import") {
+          const target = need("target");
+          if (target === "claude") return "claude-paste";
+          if (target === "gemini") return "gemini-paste";
+          return die("--target must be claude or gemini");
+        }
+        const f = values.format ?? "jsonl";
+        if (f !== "jsonl" && f !== "markdown") return die(`--format must be jsonl or markdown (all formats: ${EXPORT_FORMATS.join(", ")})`);
+        return f;
+      })();
+      const handler = new ExportBankHandler(banks, new PgFactRepository(pool), scopeAccessPolicy, new PgExportStore(pool), new PgAuditLog(pool), systemClock);
+      const r = await handler.handle(adminScope(bankId, bank.tenantId), { bankId, format });
+      const produced = r.ok ? r.value : die(`export failed: ${r.error.kind}`);
+      const out = command === "export" ? need("out") : values.out;
+      if (out !== undefined) {
+        const path = resolve(out);
+        await mkdir(dirname(path), { recursive: true });
+        try {
+          await writeFile(path, produced.content, { encoding: "utf8", mode: 0o600, flag: "wx" });
+        } catch (e) {
+          if ((e as { code?: string }).code === "EEXIST") die(`${path} already exists; refusing to overwrite it`);
+          throw e;
+        }
+        console.error(`wrote ${format} export ${produced.exportId} of ${bankId} to ${path}: ${produced.factCount} fact(s), ${produced.tombstoneCount} tombstone(s)`);
+      } else {
+        process.stdout.write(produced.content);
+        console.error(`export ${produced.exportId} of ${bankId} (${format}): ${produced.factCount} fact(s) considered`);
+      }
+      break;
+    }
+    case "import-claude-code": {
+      const bankId = asBankId(need("bank"));
+      const bank = (await banks.get(bankId)) ?? die(`bank ${bankId} not found`);
+      const dir = resolve(need("dir"));
+      const docs = await readClaudeCodeMemory(dir);
+      if (docs.length === 0) die(`no memory files found under ${dir} (looking for memory/*.md, MEMORY.md, CLAUDE.md, CLAUDE.local.md)`);
+      const handler = new ImportDocumentsHandler(new RecordEpisodeHandler(new PgUnitOfWork(pool), scopeAccessPolicy, systemClock));
+      const r = await handler.handle(adminScope(bankId, bank.tenantId), bankId, docs);
+      const outcome = r.ok ? r.value : die(`import stopped at ${r.error.path}: ${r.error.kind}`);
+      for (const i of outcome.imported) console.log(`imported ${i.path} -> episode ${i.episodeId}`);
+      for (const k of outcome.skipped) console.log(`skipped  ${k.path} (unchanged)`);
+      console.log(`${outcome.imported.length} imported, ${outcome.skipped.length} unchanged, from ${docs.length} file(s); extraction runs on the server for banks with an extractor`);
+      break;
+    }
     case "extraction-status": {
       console.log(JSON.stringify(await new PgExtractionRunStore(pool).counts()));
       break;
@@ -166,7 +230,7 @@ try {
       break;
     }
     default:
-      die("usage: admin <create-bank|create-principal|grant|issue-key|revoke-key|set-extractor|clear-extractor|reindex|extraction-status|requeue-extraction|requeue-dead-letters> [options]");
+      die("usage: admin <create-bank|create-principal|grant|issue-key|revoke-key|set-extractor|clear-extractor|reindex|export|import-claude-code|render-import|extraction-status|requeue-extraction|requeue-dead-letters> [options]");
   }
 } finally {
   await pool.end();
