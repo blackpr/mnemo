@@ -18,16 +18,25 @@
     "eval:draft-questions": "node --env-file-if-exists=.env --import tsx eval/questions/draft.ts",
     "eval:grader-sanity": "PROMPTFOO_DISABLE_TELEMETRY=1 node --env-file-if-exists=.env --import tsx node_modules/promptfoo/dist/src/entrypoint.js eval -c eval/grader/sanity.yaml -o eval/results/grader-sanity.json --no-progress-bar; node --import tsx eval/grader/check-sanity.ts eval/results/grader-sanity.json",
     "eval:run": "PROMPTFOO_DISABLE_TELEMETRY=1 node --env-file-if-exists=.env --import tsx node_modules/promptfoo/dist/src/entrypoint.js eval -c eval/promptfooconfig.yaml -o eval/results/latest.json --no-progress-bar",
-    "eval:summary": "node --import tsx eval/stats/summarize.ts eval/results/latest.json",
-    "eval:view": "PROMPTFOO_DISABLE_TELEMETRY=1 node --env-file-if-exists=.env --import tsx node_modules/promptfoo/dist/src/entrypoint.js view -y"
+    "eval:summary": "node --import tsx eval/stats/summarize.ts",
+    "eval:view": "PROMPTFOO_DISABLE_TELEMETRY=1 node --env-file-if-exists=.env --import tsx node_modules/promptfoo/dist/src/entrypoint.js view -y",
+    "eval:ci": "node --import tsx eval/stats/ci.ts",
+    "engines:up": "docker compose --profile hindsight --profile honcho up -d --wait",
+    "engines:hindsight:up": "docker compose --profile hindsight up -d --wait hindsight",
+    "engines:honcho:up": "docker compose --profile honcho up -d --wait honcho honcho-deriver",
+    "engines:honcho:admin-jwt": "docker compose exec -T honcho /app/.venv/bin/python -c 'from src.security import create_admin_jwt; print(create_admin_jwt())'",
+    "engines:down": "docker compose --profile hindsight --profile honcho stop hindsight honcho honcho-deriver honcho-db honcho-redis",
+    "test:engines": "RUN_ENGINE_TESTS=1 node --env-file-if-exists=.env node_modules/vitest/vitest.mjs run test/retrieval/hindsight-engine.test.ts test/retrieval/honcho-engine.test.ts"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^4.0.87",
     "@ai-sdk/google": "^4.0.104",
     "@ai-sdk/openai": "^4.0.101",
+    "@honcho-ai/sdk": "^2.7.0",
     "@hono/mcp": "^0.3.2",
     "@hono/node-server": "^2.1.5",
     "@modelcontextprotocol/sdk": "^1.32.1",
+    "@vectorize-io/hindsight-client": "^1.1.0",
     "ai": "^7.0.150",
     "gray-matter": "^4.0.3",
     "hono": "^4.13.13",
@@ -35,6 +44,8 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@stdlib/random-base-mt19937": "^0.2.3",
+    "@stdlib/stats-base-dists-t-quantile": "^0.2.3",
     "@types/node": "^24.10.1",
     "@types/pg": "^8.23.1",
     "ajv": "^8.20.0",

@@ -5,7 +5,7 @@ import { migrate } from "../../platform/postgres/migrator.js";
 import { migrationSources } from "../../platform/postgres/migrations.js";
 import { PgAuditLog, PgErasureRequestRepository, PgErasureUnitOfWork, PgPrincipalRepository, ScopeResolver, scopeAccessPolicy } from "../../governance/index.js";
 import { PgBankRepository, PgEpisodeRepository, PgFactRepository, PgMemoryErasure, PgOutboxRelay, PgUnitOfWork, WriteExtractedFactsHandler } from "../../memory/index.js";
-import { embedderFromEnv, EngineErasableStore, EngineMemoryFinder, IndexingProjector, PgvectorEngine } from "../../retrieval/index.js";
+import { embedderFromEnv, engineFromEnv, EngineErasableStore, EngineMemoryFinder, IndexingProjector, PgvectorEngine } from "../../retrieval/index.js";
 import { AiSdkLlmClient, ExtractionErasableStore, LlmExtractor, PgExtractionRunStore, RetainPipeline, type Extractor } from "../../extraction/index.js";
 import { ExportsErasableStore, PgExportStore } from "../../portability/index.js";
 import { createApp } from "./app.js";
@@ -22,7 +22,10 @@ import { createApp } from "./app.js";
  * OPENAI_COMPATIBLE_BASE_URL). EMBEDDER selects the embedding model ("provider:model", default
  * openai:text-embedding-3-small; "hashing" for the offline test double), EMBEDDING_DIMENSIONS and
  * EMBEDDER_TIMEOUT_MS are optional. Changing the embedder requires `admin reindex --bank <id>` for
- * existing banks and a server restart (the server keeps the embedder it booted with).
+ * existing banks and a server restart (the server keeps the embedder it booted with). ENGINE selects
+ * the retrieval engine ("pgvector" default, "hindsight" with HINDSIGHT_BASE_URL / HINDSIGHT_API_KEY,
+ * "honcho" with HONCHO_BASE_URL / HONCHO_API_KEY; see src/retrieval/infrastructure/README.md);
+ * switching engines also needs `admin reindex --bank <id>` since each engine holds its own derived state.
  * Migrations run at boot, so the database role needs DDL rights.
  */
 const url = process.env.DATABASE_URL;
@@ -39,12 +42,14 @@ const shutdownTimeoutMs = Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 10_000);
 const pool = createPool(url);
 await migrate(pool, migrationSources);
 
-const embedder = embedderFromEnv();
-// One tiny call at boot: fail fast on a bad key or model instead of dead-lettering every event later.
-await embedder.embed(["startup probe"]);
-const engine = new PgvectorEngine(pool, embedder);
-for (const f of await engine.foreignEmbedders()) {
-  console.warn(`index has ${f.rows} row(s) from embedder "${f.embedder}" that recall ignores; run \`npm run admin -- reindex --bank <id>\` for affected banks`);
+// The embedder is pgvector's; the external engines embed on their side, so it is neither built nor probed for them.
+const engine = engineFromEnv(pool, embedderFromEnv);
+if (engine instanceof PgvectorEngine) {
+  // One tiny call at boot: fail fast on a bad key or model instead of dead-lettering every event later.
+  await engine.probeEmbedder();
+  for (const f of await engine.foreignEmbedders()) {
+    console.warn(`index has ${f.rows} row(s) from embedder "${f.embedder}" that recall ignores; run \`npm run admin -- reindex --bank <id>\` for affected banks`);
+  }
 }
 const banks = new PgBankRepository(pool);
 const facts = new PgFactRepository(pool);
@@ -137,7 +142,7 @@ const extractionTimer = setInterval(async () => {
 }, extractionPollMs);
 
 const server = serve({ fetch: app.fetch, port }, (info) => {
-  console.log(`mem REST attachment listening on http://localhost:${info.port} (embedder: ${embedder.id}, ${embedder.dimensions ?? "?"} dims, engine: ${engine.name}, extraction: per-bank)`);
+  console.log(`mem REST attachment listening on http://localhost:${info.port} (engine: ${engine.name}${engine instanceof PgvectorEngine ? `, embedder: ${engine.embedderId}, ${engine.embedderDimensions ?? "?"} dims` : ""}, extraction: per-bank)`);
 });
 
 let shuttingDown = false;

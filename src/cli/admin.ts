@@ -11,7 +11,7 @@ import { sha256 } from "../platform/hash.js";
 import { createBank, PgBankRepository, PgEpisodeRepository, PgFactRepository, PgMemoryErasure, PgOutboxRelay, PgUnitOfWork, RecordEpisodeHandler } from "../memory/index.js";
 import { EXPORT_FORMATS, ExportBankHandler, ExportsErasableStore, ImportDocumentsHandler, PgExportStore, readClaudeCodeMemory, type ExportFormat } from "../portability/index.js";
 import { ExtractionErasableStore, parseModelSpec, PgExtractionRunStore } from "../extraction/index.js";
-import { embedderFromEnv, EngineErasableStore, PgvectorEngine, type Embedder } from "../retrieval/index.js";
+import { embedderFromEnv, engineFromEnv, EngineErasableStore, PgvectorEngine, type Embedder } from "../retrieval/index.js";
 
 /**
  * Bootstrap CLI. Creates the records the REST attachment needs before a first request:
@@ -179,16 +179,18 @@ try {
     case "reindex": {
       const bankId = asBankId(need("bank"));
       const bank = (await banks.get(bankId)) ?? die(`bank ${bankId} not found`);
-      const engine = new PgvectorEngine(pool, embedderFromEnv());
+      const engine = engineFromEnv(pool, embedderFromEnv);
       const scope = { tenantId: bank.tenantId, bankId, principalId: asPrincipalId("system:admin"), capabilities: new Set<Capability>(["admin"]) };
       const facts = await new PgFactRepository(pool).listAll(scope);
       const episodes = await new PgEpisodeRepository(pool).listByBank(scope, { limit: 1_000_000 });
       const started = Date.now();
       await engine.rebuild(bankId, iterate(facts), iterate(episodes));
-      console.log(`reindexed ${bankId} with ${engine.embedderId}: ${facts.length} facts, ${episodes.length} episodes in ${Date.now() - started} ms`);
-      const remaining = await engine.staleRowCount(bankId);
-      if (remaining > 0) console.warn(`${remaining} row(s) from another embedder appeared during the rebuild: a server with a different EMBEDDER is still writing. Restart it with the same .env.`);
-      else console.log("if the server was started with a different EMBEDDER, restart it so recall uses this index");
+      console.log(`reindexed ${bankId} in ${engine.name}${engine instanceof PgvectorEngine ? ` with ${engine.embedderId}` : ""}: ${facts.length} facts, ${episodes.length} episodes in ${Date.now() - started} ms`);
+      if (engine instanceof PgvectorEngine) {
+        const remaining = await engine.staleRowCount(bankId);
+        if (remaining > 0) console.warn(`${remaining} row(s) from another embedder appeared during the rebuild: a server with a different EMBEDDER is still writing. Restart it with the same .env.`);
+        else console.log("if the server was started with a different EMBEDDER, restart it so recall uses this index");
+      } else console.log("if the server was started with a different ENGINE, restart it so recall uses this engine");
       break;
     }
     case "export":
@@ -246,19 +248,21 @@ try {
       const principalId = asPrincipalId(need("principal"));
       const principal = (await principals.get(principalId)) ?? die(`principal ${principalId} not found`);
       const scope = resolveScope(principal, bankId, new Date()) ?? die(`principal ${principalId} has no live grant on ${bankId}`);
-      if (!values.yes) die(`erase-bank deletes every fact, episode, index row, extraction run and export record of ${bankId} (subject ${bank.subjectId}) and cannot be undone; re-run with --yes`);
+      // The retrieval store purged is whichever ENGINE this shell names; a server running another engine keeps its copy.
+      const retrieval = engineFromEnv(pool, noEmbedder);
+      if (!values.yes) die(`erase-bank deletes every fact, episode, retrieval row (engine: ${retrieval.name}), extraction run and export record of ${bankId} (subject ${bank.subjectId}) and cannot be undone; re-run with --yes`);
       const memoryErasure = new PgMemoryErasure(pool);
       const handler = new EraseBankHandler(
         scopeAccessPolicy,
         memoryErasure,
         new PgErasureUnitOfWork(pool),
         // Memory first: see ErasableStore.
-        [memoryErasure, new EngineErasableStore(new PgvectorEngine(pool, noEmbedder)), new ExtractionErasableStore(new PgExtractionRunStore(pool)), new ExportsErasableStore(new PgExportStore(pool))],
+        [memoryErasure, new EngineErasableStore(retrieval), new ExtractionErasableStore(new PgExtractionRunStore(pool)), new ExportsErasableStore(new PgExportStore(pool))],
         systemClock,
         randomUUID,
         sha256,
       );
-      console.error(`erasing bank ${bankId} (subject ${bank.subjectId}) as ${principalId}`);
+      console.error(`erasing bank ${bankId} (subject ${bank.subjectId}) as ${principalId}; retrieval engine ${retrieval.name} (set ENGINE to match the server's)`);
       const r = await handler.handle(scope, bankId);
       const request = r.ok ? r.value : die(`erasure refused: ${r.error.kind}`);
       printErasure(request);

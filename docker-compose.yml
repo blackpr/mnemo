@@ -1,3 +1,10 @@
+# `docker compose up -d db` is all the memory layer itself needs. The two memory engines of the spike
+# (spike-plan-hindsight-vs-honcho.md, arms C and D) are optional profiles, so `npm run db:up` never
+# pulls them: `npm run engines:up` (both), `engines:hindsight:up`, `engines:honcho:up`. Compose reads
+# `.env` for the ${...} substitutions below; the provider keys the engines use are the same ones the
+# server uses (ANTHROPIC_API_KEY, OPENAI_API_KEY). Engine ports are bound to loopback only.
+# Host ports: 5433 Postgres, 8787 the server (npm start), 8888 Hindsight API, 9999 Hindsight UI,
+# 8010 Honcho API, 9091 Honcho deriver metrics. See .env.example for the knobs.
 services:
   db:
     image: pgvector/pgvector:pg17
@@ -16,5 +23,150 @@ services:
       timeout: 2s
       retries: 30
 
+  # Arm C. Official image (API + control-plane UI + embedded Postgres "pg0", about 3.7 GB on arm64).
+  # Extraction model and embedder are pinned to the spike's choices (Opus 5.5 for extraction like arm
+  # B, text-embedding-3-small like arms B and D); the server's own API key is on (the default is open).
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:1.1.0
+    container_name: mem-hindsight
+    profiles: ["hindsight"]
+    shm_size: 1g
+    ports:
+      - "127.0.0.1:8888:8888"
+      - "127.0.0.1:9999:9999"
+    environment:
+      HINDSIGHT_API_LLM_PROVIDER: ${HINDSIGHT_LLM_PROVIDER:-anthropic}
+      HINDSIGHT_API_LLM_MODEL: ${HINDSIGHT_LLM_MODEL:-claude-opus-5-5}
+      HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_LLM_API_KEY:-${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY (or HINDSIGHT_LLM_API_KEY) in .env}}
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: openai
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL: text-embedding-3-small
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in .env}
+      HINDSIGHT_API_TENANT_EXTENSION: hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension
+      HINDSIGHT_API_TENANT_API_KEY: ${HINDSIGHT_API_KEY:?set HINDSIGHT_API_KEY in .env (any long random string)}
+      # The per-call LLM trace (`llm-requests`, how arm C reads write tokens) keeps full prompts, and a
+      # bank delete does not remove it (checked in Hindsight's Postgres): keep Hindsight's 1-day
+      # retention (HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS, default 1) or disable it in production
+      # (HINDSIGHT_API_LLM_TRACE_ENABLED=false); the eval reads the trace right after ingestion.
+      HINDSIGHT_API_LOG_LEVEL: ${HINDSIGHT_LOG_LEVEL:-info}
+    volumes:
+      - mem-hindsight-data:/home/hindsight/.pg0
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8888/health/ready > /dev/null || python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8888/health/ready', timeout=2).read()\""]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  # Arm D. Official image, three processes: its own Postgres with pgvector (upstream init.sql creates
+  # vector, pg_trgm and btree_gin), the API, and the deriver (same image, different entrypoint; without
+  # it nothing is extracted). Auth is off upstream by default; here it is on with a JWT secret, and the
+  # admin token is minted inside the container by `npm run engines:honcho:admin-jwt`.
+  honcho-db:
+    image: pgvector/pgvector:pg17
+    container_name: mem-honcho-db
+    profiles: ["honcho"]
+    command: ["postgres", "-c", "max_connections=200"]
+    environment:
+      POSTGRES_USER: honcho
+      POSTGRES_PASSWORD: honcho
+      POSTGRES_DB: honcho
+    volumes:
+      - mem-honcho-db-data:/var/lib/postgresql/data
+      - ./docker/honcho-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U honcho -d honcho"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # Upstream's compose runs Redis and Honcho's API caches workspaces, peers and sessions with a 300 s
+  # TTL. Without a shared cache the API keeps serving a workspace the deriver has already deleted
+  # (get-or-create returns the old row, the next insert fails with 409), so the cache is on here too.
+  honcho-redis:
+    image: redis:8.2
+    container_name: mem-honcho-redis
+    profiles: ["honcho"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  honcho:
+    image: ghcr.io/plastic-labs/honcho:v3.4.1
+    container_name: mem-honcho
+    profiles: ["honcho"]
+    entrypoint: ["sh", "docker/entrypoint.sh"]
+    depends_on:
+      honcho-db:
+        condition: service_healthy
+      honcho-redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8010:8000"
+    environment: &honcho-env
+      DB_CONNECTION_URI: postgresql+psycopg://honcho:honcho@honcho-db:5432/honcho
+      AUTH_USE_AUTH: "true"
+      AUTH_JWT_SECRET: ${HONCHO_JWT_SECRET:?set HONCHO_JWT_SECRET in .env (any long random string)}
+      LLM_ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY in .env}
+      LLM_OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in .env}
+      # Every LLM feature via Anthropic directly (Honcho's default is OpenAI gpt-5.4-mini). Honcho 3.4.1
+      # cannot drive a Claude 5 model: it prefills an assistant "{" for JSON output (Claude 5 rejects
+      # prefill: HTTP 400, and the deriver still reports the work unit completed); a thinking budget
+      # turns the prefill off but then sends `thinking.type=enabled`, which Claude 5 also rejects, and
+      # the `provider_params.extra_body` passthrough cannot replace that typed SDK argument. Its model
+      # check exempts Claude 4-class names from both, so the spike's arm D extracts with Sonnet 4.5
+      # while arms B and C extract with Opus 5.5 (recorded in the results as a provider-swap finding).
+      DERIVER_MODEL_CONFIG__TRANSPORT: ${HONCHO_LLM_TRANSPORT:-anthropic}
+      DERIVER_MODEL_CONFIG__MODEL: ${HONCHO_LLM_MODEL:-claude-sonnet-4-5}
+      SUMMARY_MODEL_CONFIG__TRANSPORT: ${HONCHO_LLM_TRANSPORT:-anthropic}
+      SUMMARY_MODEL_CONFIG__MODEL: ${HONCHO_LLM_MODEL:-claude-sonnet-4-5}
+      DIALECTIC_LEVELS__MINIMAL__MODEL_CONFIG__TRANSPORT: ${HONCHO_LLM_TRANSPORT:-anthropic}
+      DIALECTIC_LEVELS__MINIMAL__MODEL_CONFIG__MODEL: ${HONCHO_LLM_MODEL:-claude-sonnet-4-5}
+      DIALECTIC_LEVELS__LOW__MODEL_CONFIG__TRANSPORT: ${HONCHO_LLM_TRANSPORT:-anthropic}
+      DIALECTIC_LEVELS__LOW__MODEL_CONFIG__MODEL: ${HONCHO_LLM_MODEL:-claude-sonnet-4-5}
+      DIALECTIC_LEVELS__MEDIUM__MODEL_CONFIG__TRANSPORT: ${HONCHO_LLM_TRANSPORT:-anthropic}
+      DIALECTIC_LEVELS__MEDIUM__MODEL_CONFIG__MODEL: ${HONCHO_LLM_MODEL:-claude-sonnet-4-5}
+      DIALECTIC_LEVELS__HIGH__MODEL_CONFIG__TRANSPORT: ${HONCHO_LLM_TRANSPORT:-anthropic}
+      DIALECTIC_LEVELS__HIGH__MODEL_CONFIG__MODEL: ${HONCHO_LLM_MODEL:-claude-sonnet-4-5}
+      DIALECTIC_LEVELS__MAX__MODEL_CONFIG__TRANSPORT: ${HONCHO_LLM_TRANSPORT:-anthropic}
+      DIALECTIC_LEVELS__MAX__MODEL_CONFIG__MODEL: ${HONCHO_LLM_MODEL:-claude-sonnet-4-5}
+      DREAM_ENABLED: "false"
+      EMBED_MESSAGES: "true"
+      EMBEDDING_MODEL_CONFIG__TRANSPORT: openai
+      EMBEDDING_MODEL_CONFIG__MODEL: text-embedding-3-small
+      EMBEDDING_VECTOR_DIMENSIONS: "1536"
+      # Small test sessions would otherwise wait for a 512-token batch or 30 minutes, and an idle
+      # deriver backs its poll off (deletions are queue jobs too): keep both short for the spike.
+      DERIVER_FLUSH_ENABLED: "true"
+      DERIVER_POLLING_SLEEP_MAX_INTERVAL_SECONDS: "2"
+      METRICS_ENABLED: "true"
+      TELEMETRY_ENABLED: "false"
+      CACHE_ENABLED: "true"
+      CACHE_URL: redis://honcho-redis:6379/0?suppress=true
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+  honcho-deriver:
+    image: ghcr.io/plastic-labs/honcho:v3.4.1
+    container_name: mem-honcho-deriver
+    profiles: ["honcho"]
+    entrypoint: ["/app/.venv/bin/python", "-m", "src.deriver"]
+    depends_on:
+      honcho:
+        condition: service_healthy
+    # The deriver's Prometheus counters (honcho_deriver_tokens_processed) are how arm D reads write tokens.
+    ports:
+      - "127.0.0.1:9091:9090"
+    environment: *honcho-env
+    restart: unless-stopped
+
 volumes:
   mem-db-data:
+  mem-hindsight-data:
+  mem-honcho-db-data:

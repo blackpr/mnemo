@@ -42,6 +42,15 @@ export class PgvectorEngine implements RetrievalEngine {
     return this.embedder.id;
   }
 
+  get embedderDimensions(): number | undefined {
+    return this.embedder.dimensions;
+  }
+
+  /** One tiny embedding call, so a bad key or model fails at boot instead of dead-lettering events later. */
+  async probeEmbedder(): Promise<void> {
+    await this.embedder.embed(["startup probe"]);
+  }
+
   async indexFact(fact: Fact): Promise<void> {
     const [vec] = await this.embedder.embed([fact.statement]);
     await this.upsert({
