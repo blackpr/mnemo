@@ -6,13 +6,14 @@
   "description": "Self-hosted, provider-agnostic memory layer: a system of record for what AI assistants know about you.",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "db:up": "docker compose up -d db",
+    "test": "node --env-file-if-exists=.env node_modules/vitest/vitest.mjs run",
+    "test:watch": "node --env-file-if-exists=.env node_modules/vitest/vitest.mjs",
+    "db:up": "docker compose up -d db && docker compose exec -T db sh -c 'until pg_isready -U mem -d mem -q; do sleep 1; done; createdb -U mem mem_test 2>/dev/null || true'",
     "db:down": "docker compose down",
-    "db:migrate": "tsx src/platform/postgres/migrate-cli.ts",
-    "start": "tsx src/attachment/rest/main.ts",
-    "admin": "tsx src/cli/admin.ts"
+    "db:migrate": "node --env-file-if-exists=.env --import tsx src/platform/postgres/migrate-cli.ts",
+    "start": "node --env-file-if-exists=.env --import tsx src/attachment/rest/main.ts",
+    "admin": "node --env-file-if-exists=.env --import tsx src/cli/admin.ts",
+    "test:live": "RUN_LIVE_TESTS=1 node --env-file-if-exists=.env node_modules/vitest/vitest.mjs run"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^4.0.87",

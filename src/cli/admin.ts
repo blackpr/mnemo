@@ -4,8 +4,9 @@ import { createPool } from "../platform/postgres/pool.js";
 import { migrate } from "../platform/postgres/migrator.js";
 import { migrationSources } from "../platform/postgres/migrations.js";
 import { generateApiKey, hashApiKey, PgApiKeyStore, PgPrincipalRepository, type Grant } from "../governance/index.js";
-import { createBank, PgBankRepository, PgOutboxRelay } from "../memory/index.js";
+import { createBank, PgBankRepository, PgEpisodeRepository, PgFactRepository, PgOutboxRelay } from "../memory/index.js";
 import { parseModelSpec, PgExtractionRunStore } from "../extraction/index.js";
+import { embedderFromEnv, PgvectorEngine } from "../retrieval/index.js";
 
 /**
  * Bootstrap CLI. Creates the records the REST attachment needs before a first request:
@@ -20,6 +21,7 @@ import { parseModelSpec, PgExtractionRunStore } from "../extraction/index.js";
  *   npm run admin -- clear-extractor --bank bank-vangelis
  *   npm run admin -- extraction-status
  *   npm run admin -- requeue-extraction
+ *   npm run admin -- reindex --bank bank-vangelis        # after changing EMBEDDER
  *
  * The API key is printed once and never stored in plaintext. Every command refuses to silently
  * change existing state: create-* fail if the id exists, grants require matching tenants.
@@ -133,6 +135,21 @@ try {
       console.log(`bank ${bankId} extraction disabled; existing facts untouched`);
       break;
     }
+    case "reindex": {
+      const bankId = asBankId(need("bank"));
+      const bank = (await banks.get(bankId)) ?? die(`bank ${bankId} not found`);
+      const engine = new PgvectorEngine(pool, embedderFromEnv());
+      const scope = { tenantId: bank.tenantId, bankId, principalId: asPrincipalId("system:admin"), capabilities: new Set<Capability>(["admin"]) };
+      const facts = await new PgFactRepository(pool).listAll(scope);
+      const episodes = await new PgEpisodeRepository(pool).listByBank(scope, { limit: 1_000_000 });
+      const started = Date.now();
+      await engine.rebuild(bankId, iterate(facts), iterate(episodes));
+      console.log(`reindexed ${bankId} with ${engine.embedderId}: ${facts.length} facts, ${episodes.length} episodes in ${Date.now() - started} ms`);
+      const remaining = await engine.staleRowCount(bankId);
+      if (remaining > 0) console.warn(`${remaining} row(s) from another embedder appeared during the rebuild: a server with a different EMBEDDER is still writing. Restart it with the same .env.`);
+      else console.log("if the server was started with a different EMBEDDER, restart it so recall uses this index");
+      break;
+    }
     case "extraction-status": {
       console.log(JSON.stringify(await new PgExtractionRunStore(pool).counts()));
       break;
@@ -149,8 +166,12 @@ try {
       break;
     }
     default:
-      die("usage: admin <create-bank|create-principal|grant|issue-key|revoke-key|set-extractor|clear-extractor|extraction-status|requeue-extraction|requeue-dead-letters> [options]");
+      die("usage: admin <create-bank|create-principal|grant|issue-key|revoke-key|set-extractor|clear-extractor|reindex|extraction-status|requeue-extraction|requeue-dead-letters> [options]");
   }
 } finally {
   await pool.end();
+}
+
+async function* iterate<T>(items: readonly T[]): AsyncIterable<T> {
+  for (const i of items) yield i;
 }

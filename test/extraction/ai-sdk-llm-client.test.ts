@@ -84,8 +84,8 @@ describe("AiSdkLlmClient", () => {
     expect(e.message).toContain("socket hang up");
   });
 
-  // Real call. Runs only when a key is present; costs a few hundred tokens.
-  const hasKey = Boolean(process.env.ANTHROPIC_API_KEY);
+  // Paid call: only with an explicit opt-in (npm run test:live) and a key.
+  const hasKey = process.env.RUN_LIVE_TESTS === "1" && Boolean(process.env.ANTHROPIC_API_KEY);
   (hasKey ? it : it.skip)("returns schema-valid structured output from the real provider", async () => {
     const real = new AiSdkLlmClient({ provider: "anthropic", model: "claude-opus-5-5", version: "smoke" }, { timeoutMs: 50_000 });
     const r = await real.completeStructured({

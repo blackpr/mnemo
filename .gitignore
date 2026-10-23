@@ -4,3 +4,4 @@ dist/
 eval/corpus/
 eval/results/
 .env
+.demo-key

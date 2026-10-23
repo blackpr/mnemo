@@ -5,7 +5,7 @@ import { PgAuditLog, scopeAccessPolicy } from "../../src/governance/index.js";
 import { systemClock } from "../../src/shared-kernel/index.js";
 import { describeWithDb, setupTestDb, type TestDb } from "../helpers/postgres.js";
 import { retrievalEngineContract } from "./retrieval-engine.contract.js";
-import { bankFixture, factFixture, scopeFor } from "../helpers/fixtures.js";
+import { bankFixture, factFixture, fromArray, scopeFor } from "../helpers/fixtures.js";
 
 describeWithDb("PgvectorEngine", () => {
   let db: TestDb;
@@ -22,6 +22,22 @@ describeWithDb("PgvectorEngine", () => {
     await engine.indexFact(factFixture(bankFixture("bank-a").id, "f1", "anything"));
     const { rows } = await db.pool.query<{ embedder: string }>("SELECT embedder FROM retrieval.pgvector_index");
     expect(rows.map((r) => r.embedder)).toEqual(["hashing-64"]);
+  });
+
+  it("recall only sees rows from the current embedder; rebuild replaces rows from a previous one", async () => {
+    const bankA = bankFixture("bank-a");
+    const old = new PgvectorEngine(db.pool, new HashingEmbedder(64));
+    const current = new PgvectorEngine(db.pool, new HashingEmbedder(256));
+    const f = factFixture(bankA.id, "f1", "the user's editor is neovim");
+    await old.indexFact(f);
+    // Different embedder (and different dimensionality): invisible, and no "different vector dimensions" error.
+    expect(await current.recall(scopeFor(bankA.id), "neovim editor", { limit: 5 })).toEqual([]);
+    expect(await current.staleRowCount(bankA.id)).toBe(1);
+    await current.rebuild(bankA.id, fromArray([f]), fromArray([]));
+    expect((await current.recall(scopeFor(bankA.id), "neovim editor", { limit: 5 })).map((h) => h.factId)).toEqual(["f1"]);
+    expect(await current.staleRowCount(bankA.id)).toBe(0);
+    const { rows } = await db.pool.query<{ embedder: string }>("SELECT DISTINCT embedder FROM retrieval.pgvector_index");
+    expect(rows.map((r) => r.embedder)).toEqual(["hashing-256"]);
   });
 
   it("end to end: RecallHandler re-reads facts under the scope and applies policy", async () => {

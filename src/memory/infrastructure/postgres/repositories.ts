@@ -134,6 +134,11 @@ export class PgFactRepository implements FactRepository {
     return rows.map(toFact);
   }
 
+  async listAll(scope: Scope): Promise<readonly Fact[]> {
+    const { rows } = await this.db.query<FactRow>("SELECT * FROM memory.facts WHERE bank_id = $1 ORDER BY valid_from ASC, id ASC", [scope.bankId]);
+    return rows.map(toFact);
+  }
+
   async existsForTrigger(scope: Scope, triggerEpisodeId: EpisodeId, writer: PrincipalId): Promise<boolean> {
     const { rows } = await this.db.query<{ one: number }>(
       `SELECT 1 AS one FROM memory.facts

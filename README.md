@@ -30,16 +30,17 @@ Cross-context imports go through the context's `index.ts` only (e.g. `../governa
 ```bash
 npm install
 npm run typecheck
-npm test                 # domain tests only; database suites are skipped
+npm test                 # without TEST_DATABASE_URL: domain tests only, database suites are skipped
 ```
 
 With a database (Docker required):
 
 ```bash
-npm run db:up            # pgvector/pgvector:pg17 on localhost:5433
-cp .env.example .env
-DATABASE_URL=postgres://mem:mem@localhost:5433/mem npm run db:migrate
-DATABASE_URL=postgres://mem:mem@localhost:5433/mem npm test   # all suites, including Postgres adapters and the pgvector engine contract
+npm run db:up            # pgvector/pgvector:pg17 on localhost:5433, databases mem (dev) and mem_test (tests)
+cp .env.example .env     # scripts load .env automatically
+npm run db:migrate
+npm test                 # all suites; database suites use TEST_DATABASE_URL (they TRUNCATE, so never the dev database)
+npm run test:live        # additionally runs the paid real-provider tests (needs the keys in .env)
 ```
 
 Run the REST attachment:
@@ -53,6 +54,8 @@ npm run admin -- issue-key --principal claude-code --label laptop   # prints the
 npm run admin -- set-extractor --bank bank-me --model anthropic:claude-opus-5-5   # optional: turn on fact extraction
 npm start                                                            # http://localhost:8787
 ```
+
+Recall uses the embedder named by `EMBEDDER` (default `openai:text-embedding-3-small`; `google:gemini-embedding-001` works too; `hashing` is the offline stand-in). After changing it run `npm run admin -- reindex --bank <id>`.
 
 Extraction needs the provider's key in the environment (`ANTHROPIC_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `OPENAI_API_KEY`, or `OPENAI_COMPATIBLE_BASE_URL` for Ollama-style endpoints) and runs in a worker loop separate from indexing (`EXTRACTION_POLL_MS`, `LLM_TIMEOUT_MS`). Without `set-extractor`, a bank stores and recalls raw episodes only (the pgvector-only arm of the spike). Only the Subject's own turns are extracted from; assistant and tool output is context.
 

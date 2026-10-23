@@ -5,7 +5,7 @@ import { migrate } from "../../platform/postgres/migrator.js";
 import { migrationSources } from "../../platform/postgres/migrations.js";
 import { PgAuditLog, PgPrincipalRepository, ScopeResolver, scopeAccessPolicy } from "../../governance/index.js";
 import { PgBankRepository, PgEpisodeRepository, PgFactRepository, PgOutboxRelay, PgUnitOfWork, WriteExtractedFactsHandler } from "../../memory/index.js";
-import { EngineMemoryFinder, HashingEmbedder, IndexingProjector, PgvectorEngine } from "../../retrieval/index.js";
+import { embedderFromEnv, EngineMemoryFinder, IndexingProjector, PgvectorEngine } from "../../retrieval/index.js";
 import { AiSdkLlmClient, LlmExtractor, PgExtractionRunStore, RetainPipeline, type Extractor } from "../../extraction/index.js";
 import { createApp } from "./app.js";
 
@@ -18,8 +18,11 @@ import { createApp } from "./app.js";
  * EXTRACTION_POLL_MS (default 1000), LLM_TIMEOUT_MS (default 120000),
  * SHUTDOWN_TIMEOUT_MS (default 10000), plus the provider keys the configured extractor models
  * need (ANTHROPIC_API_KEY, GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY,
- * OPENAI_COMPATIBLE_BASE_URL). Migrations run at boot, so the database role needs DDL rights.
- * Embedder is the offline HashingEmbedder until a production embedder is chosen in the spike.
+ * OPENAI_COMPATIBLE_BASE_URL). EMBEDDER selects the embedding model ("provider:model", default
+ * openai:text-embedding-3-small; "hashing" for the offline test double), EMBEDDING_DIMENSIONS and
+ * EMBEDDER_TIMEOUT_MS are optional. Changing the embedder requires `admin reindex --bank <id>` for
+ * existing banks and a server restart (the server keeps the embedder it booted with).
+ * Migrations run at boot, so the database role needs DDL rights.
  */
 const url = process.env.DATABASE_URL;
 if (!url) {
@@ -35,8 +38,13 @@ const shutdownTimeoutMs = Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 10_000);
 const pool = createPool(url);
 await migrate(pool, migrationSources);
 
-const embedder = new HashingEmbedder(256);
+const embedder = embedderFromEnv();
+// One tiny call at boot: fail fast on a bad key or model instead of dead-lettering every event later.
+await embedder.embed(["startup probe"]);
 const engine = new PgvectorEngine(pool, embedder);
+for (const f of await engine.foreignEmbedders()) {
+  console.warn(`index has ${f.rows} row(s) from embedder "${f.embedder}" that recall ignores; run \`npm run admin -- reindex --bank <id>\` for affected banks`);
+}
 const banks = new PgBankRepository(pool);
 const facts = new PgFactRepository(pool);
 const episodes = new PgEpisodeRepository(pool);
@@ -116,7 +124,7 @@ const extractionTimer = setInterval(async () => {
 }, extractionPollMs);
 
 const server = serve({ fetch: app.fetch, port }, (info) => {
-  console.log(`mem REST attachment listening on http://localhost:${info.port} (embedder: ${embedder.id}, engine: ${engine.name}, extraction: per-bank)`);
+  console.log(`mem REST attachment listening on http://localhost:${info.port} (embedder: ${embedder.id}, ${embedder.dimensions ?? "?"} dims, engine: ${engine.name}, extraction: per-bank)`);
 });
 
 let shuttingDown = false;

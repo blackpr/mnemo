@@ -5,11 +5,13 @@ import { migrate } from "../../src/platform/postgres/migrator.js";
 import { migrationSources } from "../../src/platform/postgres/migrations.js";
 
 /**
- * Database-backed tests run only when DATABASE_URL is set (see .env.example and
- * `npm run db:up`). Without it they are skipped, not failed, so the pure domain suite
- * stays runnable anywhere.
+ * Database-backed tests run only when TEST_DATABASE_URL is set (see .env.example and
+ * `npm run db:up`, which also creates the mem_test database). Tests TRUNCATE every table, so
+ * they must never point at the development database; DATABASE_URL is deliberately ignored.
+ * Without TEST_DATABASE_URL they are skipped, not failed, so the pure domain suite stays
+ * runnable anywhere.
  */
-export const databaseUrl = process.env.DATABASE_URL ?? process.env.TEST_DATABASE_URL;
+export const databaseUrl = process.env.TEST_DATABASE_URL;
 
 export const describeWithDb: typeof describe = (databaseUrl ? describe : describe.skip) as typeof describe;
 
@@ -20,7 +22,7 @@ export interface TestDb {
 }
 
 export async function setupTestDb(): Promise<TestDb> {
-  if (!databaseUrl) throw new Error("DATABASE_URL not set");
+  if (!databaseUrl) throw new Error("TEST_DATABASE_URL not set");
   const pool = createPool(databaseUrl, 4);
   await migrate(pool, migrationSources);
   return {

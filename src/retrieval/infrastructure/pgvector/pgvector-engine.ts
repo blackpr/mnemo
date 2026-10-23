@@ -4,6 +4,17 @@ import type { Queryable } from "../../../platform/postgres/pool.js";
 import type { Embedder } from "../../ports/embedder.js";
 import type { RankedHit, RecallOptions, RetrievalEngine } from "../../ports/retrieval-engine.js";
 
+interface Row {
+  bankId: BankId;
+  kind: "fact" | "episode";
+  refId: string;
+  text: string;
+  vector: readonly number[];
+  validFrom?: Date | undefined;
+  validTo?: Date | undefined;
+  retracted: boolean;
+}
+
 interface HitRow {
   kind: "fact" | "episode";
   ref_id: string;
@@ -14,6 +25,10 @@ interface HitRow {
  * Default engine (spike arm B): our own Postgres, pgvector cosine similarity, no LLM on the
  * write path. Holds derived state only; see rebuild(). A Bank is one Subject's store, so
  * purgeSubject deletes by bank_id and re-counts to prove zero remaining.
+ *
+ * Every row records the embedder that produced it and recall only compares rows from the
+ * current embedder, so switching embedders can never mix vector spaces (or dimensions); rows
+ * from a previous embedder are simply invisible until `rebuild` replaces them.
  */
 export class PgvectorEngine implements RetrievalEngine {
   readonly name = "pgvector";
@@ -22,6 +37,10 @@ export class PgvectorEngine implements RetrievalEngine {
     private readonly db: Queryable,
     private readonly embedder: Embedder,
   ) {}
+
+  get embedderId(): string {
+    return this.embedder.id;
+  }
 
   async indexFact(fact: Fact): Promise<void> {
     const [vec] = await this.embedder.embed([fact.statement]);
@@ -61,13 +80,14 @@ export class PgvectorEngine implements RetrievalEngine {
       `SELECT kind, ref_id, 1 - (embedding <=> $1::vector) AS score
        FROM retrieval.pgvector_index
        WHERE bank_id = $2
+         AND embedder = $6
          AND kind = ANY($3::text[])
          AND NOT retracted
          AND (valid_from IS NULL OR valid_from <= COALESCE($4::timestamptz, now()))
          AND (valid_to IS NULL OR valid_to > COALESCE($4::timestamptz, now()))
        ORDER BY embedding <=> $1::vector
        LIMIT $5`,
-      [toVectorLiteral(qvec ?? []), scope.bankId, kinds, options.asOf ?? null, options.limit],
+      [toVectorLiteral(qvec ?? []), scope.bankId, kinds, options.asOf ?? null, options.limit, this.embedder.id],
     );
     return rows.map((r) =>
       r.kind === "fact"
@@ -82,22 +102,45 @@ export class PgvectorEngine implements RetrievalEngine {
     return { deleted: del.rowCount ?? 0, remaining: Number(rows[0]?.n ?? 0) };
   }
 
-  async rebuild(bankId: BankId, facts: AsyncIterable<Fact>, episodes: AsyncIterable<Episode>): Promise<void> {
-    await this.db.query("DELETE FROM retrieval.pgvector_index WHERE bank_id = $1", [bankId]);
-    for await (const f of facts) await this.indexFact(f);
-    for await (const e of episodes) await this.indexEpisode(e);
+  /**
+   * Rebuild a bank's index for the current embedder without ever shrinking recall: rows are
+   * upserted in batches (the old-embedder row for the same fact/episode is overwritten in place),
+   * and only then are rows from other embedders deleted. Interrupted mid-way, the bank is left
+   * partly re-embedded and `staleRowCount` still reports the remainder; re-running resumes.
+   */
+  async rebuild(bankId: BankId, facts: AsyncIterable<Fact>, episodes: AsyncIterable<Episode>, batchSize = 64): Promise<void> {
+    let batch: Row[] = [];
+    const flush = async () => {
+      if (batch.length === 0) return;
+      const vectors = await this.embedder.embed(batch.map((r) => r.text));
+      for (const [i, r] of batch.entries()) await this.upsert({ ...r, vector: vectors[i] ?? [] });
+      batch = [];
+    };
+    for await (const f of facts) {
+      batch.push({ bankId, kind: "fact", refId: f.id, text: f.statement, vector: [], validFrom: f.validity.validFrom, validTo: f.validity.validTo, retracted: f.transaction.retractedAt !== undefined });
+      if (batch.length >= batchSize) await flush();
+    }
+    for await (const e of episodes) {
+      batch.push({ bankId, kind: "episode", refId: e.id, text: e.text, vector: [], validFrom: e.occurredAt, retracted: false });
+      if (batch.length >= batchSize) await flush();
+    }
+    await flush();
+    await this.db.query("DELETE FROM retrieval.pgvector_index WHERE bank_id = $1 AND embedder <> $2", [bankId, this.embedder.id]);
   }
 
-  private async upsert(row: {
-    bankId: BankId;
-    kind: "fact" | "episode";
-    refId: string;
-    text: string;
-    vector: readonly number[];
-    validFrom?: Date | undefined;
-    validTo?: Date | undefined;
-    retracted: boolean;
-  }): Promise<void> {
+  /** Rows in this bank written by a different embedder than the current one (invisible to recall until rebuilt). */
+  async staleRowCount(bankId: BankId): Promise<number> {
+    const { rows } = await this.db.query<{ n: string }>("SELECT count(*)::text AS n FROM retrieval.pgvector_index WHERE bank_id = $1 AND embedder <> $2", [bankId, this.embedder.id]);
+    return Number(rows[0]?.n ?? 0);
+  }
+
+  /** Other embedder ids present anywhere in the index, with row counts: a non-empty result means banks need `reindex` (or another writer is live). */
+  async foreignEmbedders(): Promise<readonly { readonly embedder: string; readonly rows: number }[]> {
+    const { rows } = await this.db.query<{ embedder: string; n: string }>("SELECT embedder, count(*)::text AS n FROM retrieval.pgvector_index WHERE embedder <> $1 GROUP BY embedder", [this.embedder.id]);
+    return rows.map((r) => ({ embedder: r.embedder, rows: Number(r.n) }));
+  }
+
+  private async upsert(row: Row): Promise<void> {
     await this.db.query(
       `INSERT INTO retrieval.pgvector_index (bank_id, kind, ref_id, text, embedding, embedder, valid_from, valid_to, retracted)
        VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8, $9)

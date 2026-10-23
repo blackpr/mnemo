@@ -53,6 +53,8 @@ export interface FactRepository {
   get(scope: Scope, id: FactId, opts?: { readonly forUpdate?: boolean }): Promise<Fact | undefined>;
   getMany(scope: Scope, ids: readonly FactId[]): Promise<readonly Fact[]>;
   listCurrent(scope: Scope, at?: Date): Promise<readonly Fact[]>;
+  /** Every fact in the bank, including closed and retracted ones (for index rebuilds and exports). */
+  listAll(scope: Scope): Promise<readonly Fact[]>;
   /** True if `writer` already produced facts while processing `triggerEpisodeId`. Extraction idempotency check. */
   existsForTrigger(scope: Scope, triggerEpisodeId: EpisodeId, writer: PrincipalId): Promise<boolean>;
 }

@@ -4,7 +4,10 @@ import { createGoogle } from "@ai-sdk/google";
 import { createOpenAI } from "@ai-sdk/openai";
 import type { ZodType } from "zod";
 import type { ModelRef } from "../../shared-kernel/index.js";
+import { isSupportedProvider, openAiCompatibleBaseUrl, parseModelSpec, SUPPORTED_PROVIDERS, type SupportedProvider } from "../../platform/providers.js";
 import { LlmCallError, type LlmClient, type StructuredCompletion } from "../ports/llm-client.js";
+
+export { isSupportedProvider, parseModelSpec, SUPPORTED_PROVIDERS, type SupportedProvider };
 
 /**
  * The one LLM adapter: Vercel AI SDK with provider packages, so the same code path serves
@@ -14,13 +17,6 @@ import { LlmCallError, type LlmClient, type StructuredCompletion } from "../port
  * model runs with its provider defaults (for Anthropic that means reasoning is not requested;
  * it can be enabled through providerOptions when the spike shows it helps).
  */
-export const SUPPORTED_PROVIDERS = ["anthropic", "google", "openai", "openai-compatible"] as const;
-export type SupportedProvider = (typeof SUPPORTED_PROVIDERS)[number];
-
-export function isSupportedProvider(p: string): p is SupportedProvider {
-  return (SUPPORTED_PROVIDERS as readonly string[]).includes(p);
-}
-
 export function resolveLanguageModel(ref: ModelRef, env: NodeJS.ProcessEnv = process.env): LanguageModel {
   if (!isSupportedProvider(ref.provider)) {
     throw new Error(`Unsupported LLM provider "${ref.provider}" (supported: ${SUPPORTED_PROVIDERS.join(", ")})`);
@@ -32,11 +28,8 @@ export function resolveLanguageModel(ref: ModelRef, env: NodeJS.ProcessEnv = pro
       return createGoogle()(ref.model);
     case "openai":
       return createOpenAI()(ref.model);
-    case "openai-compatible": {
-      const baseURL = env.OPENAI_COMPATIBLE_BASE_URL;
-      if (!baseURL) throw new Error("OPENAI_COMPATIBLE_BASE_URL is required for provider openai-compatible (e.g. http://localhost:11434/v1 for Ollama)");
-      return createOpenAI({ baseURL, apiKey: env.OPENAI_COMPATIBLE_API_KEY ?? "none" }).chat(ref.model);
-    }
+    case "openai-compatible":
+      return createOpenAI({ baseURL: openAiCompatibleBaseUrl(env), apiKey: env.OPENAI_COMPATIBLE_API_KEY ?? "none" }).chat(ref.model);
   }
 }
 
@@ -114,13 +107,4 @@ function finishReasonOf(fr: unknown): string {
 
 function usageOf(u: { inputTokens?: number | undefined; outputTokens?: number | undefined } | undefined, started: number) {
   return { inputTokens: u?.inputTokens ?? 0, outputTokens: u?.outputTokens ?? 0, latencyMs: Date.now() - started };
-}
-
-/** Parses "provider:model" (e.g. "anthropic:claude-opus-5-5") into a ModelRef with the given version tag. */
-export function parseModelSpec(spec: string, version = "v1"): ModelRef {
-  const idx = spec.indexOf(":");
-  if (idx <= 0 || idx === spec.length - 1) throw new Error(`Model spec must be "provider:model", got "${spec}"`);
-  const provider = spec.slice(0, idx);
-  if (!isSupportedProvider(provider)) throw new Error(`Unsupported LLM provider "${provider}" (supported: ${SUPPORTED_PROVIDERS.join(", ")})`);
-  return { provider, model: spec.slice(idx + 1), version };
 }
