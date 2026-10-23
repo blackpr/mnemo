@@ -1,0 +1,36 @@
+# Memory-engine spike (spike-plan-hindsight-vs-honcho.md). promptfoo runs the cases, calls the grader,
+# caches and records tokens and latency; the arms are thin custom providers over the REST attachment.
+#
+#   npm run eval:run        # EVAL_MAX_CONVERSATIONS=5 EVAL_MAX_QUESTIONS=20 for a smoke pass
+#   npm run eval:view
+#
+# Frozen for the spike: answering model anthropic:claude-opus-5-5 in every arm (eval/llm.ts), grader
+# model anthropic:claude-opus-5-5 with the committed prompt in grader/grader-prompt.txt.
+description: mem memory-engine spike, stage 1 (arms A full context and B pgvector)
+
+# The arms read the question from vars, not from the rendered prompt; rendering the id keeps template
+# syntax inside a question ({{ or {%) from breaking the row.
+prompts:
+  - "{{questionId}}"
+
+providers:
+  - id: file://arms/full-context.ts
+    label: A-full-context
+  - id: file://arms/pgvector.ts
+    label: B-pgvector
+
+tests: file://questions/load.ts
+
+defaultTest:
+  options:
+    # Pinned grader (same ref as GRADER_MODEL in eval/llm.ts). `thinking` is what makes promptfoo's provider omit `temperature`, which the API rejects for this model.
+    provider:
+      id: anthropic:messages:claude-opus-5-5
+      config:
+        thinking: { type: adaptive }
+        showThinking: false
+        max_tokens: 4096
+    rubricPrompt: file://grader/grader-prompt.txt
+
+evaluateOptions:
+  maxConcurrency: 2

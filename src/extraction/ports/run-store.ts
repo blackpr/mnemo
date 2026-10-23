@@ -34,6 +34,12 @@ export interface ExtractionRunOutcome {
   readonly rejected: number;
 }
 
+export interface BankRunSummary {
+  readonly counts: Readonly<Record<RunStatus, number>>;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+}
+
 export interface ExtractionRunStore {
   /** Idempotent: a row that already exists (any status) is left untouched. */
   enqueue(episodeId: EpisodeId, bankId: BankId, tenantId: TenantId, now: Date): Promise<void>;
@@ -48,6 +54,8 @@ export interface ExtractionRunStore {
   sweepStale(now: Date, opts: { readonly staleAfterMs: number; readonly maxAttempts: number }): Promise<number>;
   /** Operator action: put failed and dead rows back to pending. Returns the count. */
   requeueFailed(): Promise<number>;
+  /** One bank's queue state and write-path spend; the eval harness waits for a bank to drain and reports its ingest tokens from this. */
+  summaryByBank(bankId: BankId): Promise<BankRunSummary>;
   counts(): Promise<Readonly<Record<RunStatus, number>>>;
   /** Erasure: rows (any status) for the bank, and their removal. The ledger holds token counts and errors, never episode text, but it is per Subject. */
   countByBank(bankId: BankId): Promise<number>;

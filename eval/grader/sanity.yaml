@@ -1,0 +1,119 @@
+# Grader sanity cases (plan section 6: test the grader with deliberately wrong, hedged and near-date
+# answers before trusting it). The `echo` provider returns the canned answer verbatim and the frozen
+# grader prompt judges it. `metadata.expectGraderPass` says what the grader must decide; promptfoo's
+# `not-llm-rubric` does not invert model-graded assertions, so check-sanity.ts compares the two.
+#
+#   npm run eval:grader-sanity
+description: Frozen grader sanity (wrong, hedged, near-miss date, abstention)
+
+prompts:
+  - "{{answer}}"
+
+providers:
+  - id: echo
+    label: canned-answer
+
+defaultTest:
+  options:
+    # Pinned grader (same ref as GRADER_MODEL in eval/llm.ts). `thinking` is what makes promptfoo's provider omit `temperature`, which the API rejects for this model.
+    provider:
+      id: anthropic:messages:claude-opus-5-5
+      config:
+        thinking: { type: adaptive }
+        showThinking: false
+        max_tokens: 4096
+    rubricPrompt: file://grader-prompt.txt
+
+tests:
+  - description: correct fact (grader must pass)
+    metadata: { expectGraderPass: true }
+    vars:
+      answer: "Your dev server listens on port 8787."
+    assert:
+      - type: llm-rubric
+        value: |
+          Question: Which port does my dev server listen on?
+          Type: fact
+          Answer key: Port 8787.
+  - description: wrong fact (grader must fail)
+    metadata: { expectGraderPass: false }
+    vars:
+      answer: "Your dev server listens on port 8080."
+    assert:
+      - type: llm-rubric
+        value: |
+          Question: Which port does my dev server listen on?
+          Type: fact
+          Answer key: Port 8787.
+  - description: hedged answer that names the key among others (grader must fail)
+    metadata: { expectGraderPass: false }
+    vars:
+      answer: "It is probably 8787, though it might have been 3000 or 8080; I can't be certain from what I have."
+    assert:
+      - type: llm-rubric
+        value: |
+          Question: Which port does my dev server listen on?
+          Type: fact
+          Answer key: Port 8787.
+  - description: exact date (grader must pass)
+    metadata: { expectGraderPass: true }
+    vars:
+      answer: "You switched the repo to pnpm on 12 March 2026."
+    assert:
+      - type: llm-rubric
+        value: |
+          Question: When did I switch this repo from npm to pnpm?
+          Type: decision
+          Answer key: On 2026-03-12.
+  - description: near-miss date (grader must fail)
+    metadata: { expectGraderPass: false }
+    vars:
+      answer: "You switched the repo to pnpm on 12 April 2026."
+    assert:
+      - type: llm-rubric
+        value: |
+          Question: When did I switch this repo from npm to pnpm?
+          Type: decision
+          Answer key: On 2026-03-12.
+  - description: correct abstention on a negative question (grader must pass)
+    metadata: { expectGraderPass: true }
+    vars:
+      answer: "I don't have any information about which editor you use; it never came up in our conversations."
+    assert:
+      - type: llm-rubric
+        value: |
+          Question: Which code editor do I use?
+          Type: negative
+          Answer key: Not in the conversation: the user's editor is never mentioned.
+  - description: confident fabrication on a negative question (grader must fail)
+    metadata: { expectGraderPass: false }
+    vars:
+      answer: "You use VS Code with the Vim extension."
+    assert:
+      - type: llm-rubric
+        value: |
+          Question: Which code editor do I use?
+          Type: negative
+          Answer key: Not in the conversation: the user's editor is never mentioned.
+  - description: temporal answer with the state at the asked time (grader must pass)
+    metadata: { expectGraderPass: true }
+    vars:
+      answer: "At that point you were still on npm; you moved to pnpm on 1 July."
+    assert:
+      - type: llm-rubric
+        value: |
+          Question: Which package manager was I using for this repo in mid-June 2026?
+          Type: temporal
+          As of: 2026-06-15T00:00:00.000Z
+          Answer key: npm (the repo switched to pnpm on 2026-07-01).
+  - description: temporal answer giving the latest state instead (grader must fail)
+    metadata: { expectGraderPass: false }
+    vars:
+      answer: "You were using pnpm."
+    assert:
+      - type: llm-rubric
+        value: |
+          Question: Which package manager was I using for this repo in mid-June 2026?
+          Type: temporal
+          As of: 2026-06-15T00:00:00.000Z
+          Answer key: npm (the repo switched to pnpm on 2026-07-01).

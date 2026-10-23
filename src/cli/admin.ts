@@ -24,7 +24,7 @@ import { embedderFromEnv, EngineErasableStore, PgvectorEngine, type Embedder } f
  *   npm run admin -- requeue-dead-letters
  *   npm run admin -- set-extractor --bank bank-vangelis --model anthropic:claude-opus-5-5
  *   npm run admin -- clear-extractor --bank bank-vangelis
- *   npm run admin -- extraction-status
+ *   npm run admin -- extraction-status [--bank bank-vangelis]   # queue counts; with --bank also the bank's extraction token spend
  *   npm run admin -- requeue-extraction
  *   npm run admin -- reindex --bank bank-vangelis        # after changing EMBEDDER
  *   npm run admin -- export --bank bank-vangelis --out exports/bank-vangelis.jsonl [--format jsonl|markdown]
@@ -285,7 +285,8 @@ try {
       break;
     }
     case "extraction-status": {
-      console.log(JSON.stringify(await new PgExtractionRunStore(pool).counts()));
+      const store = new PgExtractionRunStore(pool);
+      console.log(JSON.stringify(values.bank ? { bank: values.bank, ...(await store.summaryByBank(asBankId(values.bank))) } : await store.counts()));
       break;
     }
     case "requeue-extraction": {

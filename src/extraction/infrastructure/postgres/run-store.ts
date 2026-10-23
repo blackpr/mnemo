@@ -1,7 +1,7 @@
 import type { BankId, EpisodeId, ModelRef, TenantId } from "../../../shared-kernel/index.js";
 import type { Queryable } from "../../../platform/postgres/pool.js";
 import type { ExtractionUsage } from "../../ports/extractor.js";
-import type { ClaimedRun, ExtractionRunOutcome, ExtractionRunStore, RunStatus } from "../../ports/run-store.js";
+import type { BankRunSummary, ClaimedRun, ExtractionRunOutcome, ExtractionRunStore, RunStatus } from "../../ports/run-store.js";
 
 export class PgExtractionRunStore implements ExtractionRunStore {
   constructor(private readonly db: Queryable) {}
@@ -83,6 +83,23 @@ export class PgExtractionRunStore implements ExtractionRunStore {
     const out: Record<RunStatus, number> = { pending: 0, running: 0, done: 0, failed: 0, dead: 0, skipped: 0 };
     for (const r of rows) out[r.status] = Number(r.n);
     return out;
+  }
+
+  async summaryByBank(bankId: BankId): Promise<BankRunSummary> {
+    const { rows } = await this.db.query<{ status: RunStatus; n: string; input_tokens: string; output_tokens: string }>(
+      `SELECT status, count(*)::text AS n, coalesce(sum(input_tokens), 0)::text AS input_tokens, coalesce(sum(output_tokens), 0)::text AS output_tokens
+       FROM extraction.runs WHERE bank_id = $1 GROUP BY status`,
+      [bankId],
+    );
+    const counts: Record<RunStatus, number> = { pending: 0, running: 0, done: 0, failed: 0, dead: 0, skipped: 0 };
+    let inputTokens = 0;
+    let outputTokens = 0;
+    for (const r of rows) {
+      counts[r.status] = Number(r.n);
+      inputTokens += Number(r.input_tokens);
+      outputTokens += Number(r.output_tokens);
+    }
+    return { counts, inputTokens, outputTokens };
   }
 
   async countByBank(bankId: BankId): Promise<number> {

@@ -1,0 +1,19 @@
+You are grading an AI assistant's answer to a question about a user's own past conversations with AI tools. You are given the question, its type, the expected answer (the answer key, written by a human from the conversation), and the assistant's answer. Decide whether the assistant's answer is correct.
+
+Rules:
+1. Correct means the answer conveys the same fact, decision, preference or timing as the answer key. Wording, order, and extra detail that does not contradict the key do not matter.
+2. Hedged answers fail. If the assistant lists several candidates, says it is unsure between options, or wraps the key in "possibly", "I think it may have been" or similar, it fails even when the key is among the candidates. One committed answer with a brief caveat about its source is fine.
+3. Dates, numbers, names and versions must match at the precision the question asks for. A near miss (a different month, off by a year, a neighbouring version or port number) fails.
+4. Type "negative": the answer key states that the conversations hold no answer. The assistant passes only if it says it does not have that information (or that the conversations do not cover it) and does not invent specifics. Any confident, specific answer fails, however plausible.
+5. Type "temporal": the answer must give the state at the "As of" time named in the rubric, not the latest state. Mentioning the later change as well is fine.
+6. Judge content only, never style, length or formatting. Do not use your own knowledge of the world to fill gaps: the answer key is the only reference.
+
+Respond with a JSON object and nothing else: {"reason": "<one or two sentences>", "pass": true or false, "score": 1 or 0}
+
+<rubric>
+{{ rubric }}
+</rubric>
+
+<answer>
+{{ output }}
+</answer>

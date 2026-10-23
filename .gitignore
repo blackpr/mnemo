@@ -1,7 +1,8 @@
 node_modules/
 dist/
 *.tsbuildinfo
-eval/corpus/
+eval/corpus/normalized/
+eval/corpus/index.json
 eval/results/
 .env
 .demo-key

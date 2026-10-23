@@ -13,7 +13,13 @@
     "db:migrate": "node --env-file-if-exists=.env --import tsx src/platform/postgres/migrate-cli.ts",
     "start": "node --env-file-if-exists=.env --import tsx src/attachment/rest/main.ts",
     "admin": "node --env-file-if-exists=.env --import tsx src/cli/admin.ts",
-    "test:live": "RUN_LIVE_TESTS=1 node --env-file-if-exists=.env node_modules/vitest/vitest.mjs run"
+    "test:live": "RUN_LIVE_TESTS=1 node --env-file-if-exists=.env node_modules/vitest/vitest.mjs run",
+    "eval:build-corpus": "node --import tsx eval/corpus/build.ts",
+    "eval:draft-questions": "node --env-file-if-exists=.env --import tsx eval/questions/draft.ts",
+    "eval:grader-sanity": "PROMPTFOO_DISABLE_TELEMETRY=1 node --env-file-if-exists=.env --import tsx node_modules/promptfoo/dist/src/entrypoint.js eval -c eval/grader/sanity.yaml -o eval/results/grader-sanity.json --no-progress-bar; node --import tsx eval/grader/check-sanity.ts eval/results/grader-sanity.json",
+    "eval:run": "PROMPTFOO_DISABLE_TELEMETRY=1 node --env-file-if-exists=.env --import tsx node_modules/promptfoo/dist/src/entrypoint.js eval -c eval/promptfooconfig.yaml -o eval/results/latest.json --no-progress-bar",
+    "eval:summary": "node --import tsx eval/stats/summarize.ts eval/results/latest.json",
+    "eval:view": "PROMPTFOO_DISABLE_TELEMETRY=1 node --env-file-if-exists=.env --import tsx node_modules/promptfoo/dist/src/entrypoint.js view -y"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^4.0.87",
@@ -33,6 +39,7 @@
     "@types/pg": "^8.23.1",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
+    "promptfoo": "^0.120.19",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3",
     "vitest": "^3.2.4"
