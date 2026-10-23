@@ -215,7 +215,12 @@ describeWithDb("REST attachment", () => {
     const fact = await json<{ id: string }>(await post(`/v1/banks/${bankA.id}/facts`, rwKey, { statement: "the sky is green", sourceEpisodeIds: [ep] }));
     await drain();
     // Simulate index lag: retract in the system of record without the projector seeing it.
-    await db.pool.query("UPDATE memory.facts SET retracted_at = now(), valid_to = now() WHERE id = $1", [fact.id]);
+    // The fact's own timestamps came from the Node clock a moment ago; clamp so Postgres now()
+    // can never land before them and trip the valid_from <= valid_to / recorded_at <= retracted_at checks.
+    await db.pool.query(
+      "UPDATE memory.facts SET retracted_at = GREATEST(now(), recorded_at), valid_to = GREATEST(now(), valid_from) WHERE id = $1",
+      [fact.id],
+    );
     const recalled = await json<{ facts: unknown[] }>(await post(`/v1/banks/${bankA.id}/recall`, rwKey, { query: "sky green" }));
     expect(recalled.facts).toEqual([]);
     expect((await post(`/v1/banks/${bankA.id}/facts/${fact.id}/confirm`, rwKey, {})).status).toBe(409);
