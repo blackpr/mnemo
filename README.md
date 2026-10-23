@@ -18,7 +18,8 @@ src/retrieval       RetrievalEngine port; adapters pgvector / Hindsight / Honcho
 src/extraction      Extractor and LlmClient ports; RetainPipeline
 src/attachment      REST, MCP, Anthropic memory tool, (later) OpenAI proxy
 src/portability     export / import / render
-test/<context>      fast unit tests for domain code (no IO)
+src/platform        shared infrastructure utilities (Postgres pool, transactions, migrator); not a bounded context
+test/<context>      unit tests for domain code (no IO) and Postgres-backed adapter tests (skipped without DATABASE_URL)
 eval/               the spike: question set, grader prompt, arm adapters for an existing eval framework (no runner of our own)
 ```
 
@@ -29,7 +30,16 @@ Cross-context imports go through the context's `index.ts` only (e.g. `../governa
 ```bash
 npm install
 npm run typecheck
-npm test
+npm test                 # domain tests only; database suites are skipped
 ```
 
-Domain code (`src/*/domain`) has no IO and is covered by fast unit tests. Infrastructure adapters get contract tests against real Postgres and engines.
+With a database (Docker required):
+
+```bash
+npm run db:up            # pgvector/pgvector:pg17 on localhost:5433
+cp .env.example .env
+DATABASE_URL=postgres://mem:mem@localhost:5433/mem npm run db:migrate
+DATABASE_URL=postgres://mem:mem@localhost:5433/mem npm test   # all suites, including Postgres adapters and the pgvector engine contract
+```
+
+Domain code (`src/*/domain`) has no IO and is covered by fast unit tests. Infrastructure adapters are covered by contract tests against a real Postgres; `test/retrieval/retrieval-engine.contract.ts` is the contract every engine adapter (pgvector, Hindsight, Honcho) must pass.

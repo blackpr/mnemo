@@ -6,3 +6,4 @@ export * from "./domain/write-policy.js";
 export * from "./ports/repositories.js";
 export * from "./application/record-episode.js";
 export * from "./application/recall.js";
+export * from "./infrastructure/postgres/index.js";

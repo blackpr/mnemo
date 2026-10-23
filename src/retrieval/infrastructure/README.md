@@ -1,7 +1,7 @@
 # Retrieval adapters
 
-Each adapter implements `RetrievalEngine` and must pass the shared contract test in
-`test/retrieval/retrieval-engine.contract.ts` (to be written with the first adapter):
+Each adapter implements `RetrievalEngine` and must pass the shared contract in
+`test/retrieval/retrieval-engine.contract.ts`:
 
 - indexes a fact, recalls it by a paraphrase
 - stops returning a fact after `retractFact`
@@ -14,7 +14,8 @@ Planned adapters:
 
 | Adapter | Spike arm | Notes |
 |---|---|---|
-| `pgvector-engine.ts` | B | Table `retrieval.pgvector_index` in our own Postgres. Default engine. |
+| `pgvector/pgvector-engine.ts` | B | **Implemented.** Table `retrieval.pgvector_index` in our own Postgres, cosine distance, embedder id recorded per row. Embedding column has no fixed dimension yet; once the embedder is chosen a migration sets `vector(N)` and adds an HNSW index. |
+| `hashing-embedder.ts` | B (tests/dev) | **Implemented.** Deterministic bag-of-words `Embedder` for contract tests and offline dev. Production embedders (OpenAI, Gemini, Ollama) to add behind the same port. |
 | `hindsight-engine.ts` | C | Maps Bank to a Hindsight bank; anti-corruption layer around its REST API; records their memory ids against our fact ids for retraction and purge. |
 | `honcho-engine.ts` | D | Maps Bank to a Honcho workspace + peer; same pattern. Honcho runs extraction itself: for the spike we feed it Episodes and let the adapter translate its derived "representations" to hits on our Episode ids. |
 

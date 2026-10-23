@@ -1,0 +1,20 @@
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    container_name: mem-db
+    environment:
+      POSTGRES_USER: mem
+      POSTGRES_PASSWORD: mem
+      POSTGRES_DB: mem
+    ports:
+      - "5433:5432"
+    volumes:
+      - mem-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mem -d mem"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+volumes:
+  mem-db-data:

@@ -165,12 +165,16 @@ Dependency rules: `domain ← application ← infrastructure`; `ports` are decla
 
 ## 5. Persistence (one Postgres, one schema per context)
 
-- `memory.banks`, `memory.episodes` (append-only, no UPDATE grant for the app role), `memory.facts` (bi-temporal columns, `supersedes_id`), `memory.outbox`
-- `governance.principals`, `governance.grants`, `governance.erasure_requests`, `governance.audit_log` (hash chain column, trigger-protected)
-- `retrieval.pgvector_index` (our default engine), plus external engines' own storage
-- `portability.exports` (manifest of produced exports, for receipts)
+- `memory.banks`, `memory.episodes` (append-only: a trigger refuses UPDATE, and DELETE unless the session flag `mem.erasure = 'on'` is set by the Erasure workflow), `memory.facts` (bi-temporal columns, `supersedes_id` / `superseded_by_id`, CHECK that provenance has at least one source episode, DELETE refused outside erasure), `memory.outbox`
+- `governance.principals`, `governance.grants`, `governance.erasure_requests`, `governance.audit_log` (hash chain columns, immutable by trigger)
+- `retrieval.pgvector_index` (our default engine; derived state, no foreign keys to `memory.*` so it can be dropped and rebuilt), plus external engines' own storage
+- `portability.exports` (manifest of produced exports, for receipts) — not yet created
 
-Row-level security on `memory.*` keyed by `bank_id` as a second line of defence behind application policy. Migrations per schema, owned by the context.
+Migrations are plain SQL files owned by each context (`src/<context>/infrastructure/**/migrations/*.sql`), applied in context order by `src/platform/postgres/migrator.ts` under an advisory lock and recorded in `public.schema_migrations`. `npm run db:migrate` applies them; tests apply them on setup.
+
+`src/platform/` holds infrastructure utilities shared by several contexts (Postgres pool, transaction helper, migrator). It is not a bounded context and contains no domain logic.
+
+Every repository read filters by `scope.bankId` in SQL as a second line of defence behind Governance's `AccessPolicy`, which the application layer applies first. Row-level security keyed by `bank_id` is a later hardening step.
 
 ## 6. Request flows
 
@@ -191,10 +195,10 @@ Row-level security on `memory.*` keyed by `bank_id` as a second line of defence 
 
 ## 8. Build order
 
-1. Shared kernel + Memory domain with unit tests (no IO). Invariants 1-6 as tests.
-2. Governance domain: `Scope`, `AccessPolicy`, `ErasureRequest` state machine, hash-chained audit entries. Unit tests.
-3. Postgres adapters for both, outbox relay, migrations. Contract tests.
-4. Retrieval: `PgvectorEngine`. This is spike arm B.
+1. Shared kernel + Memory domain with unit tests (no IO). Invariants 1-6 as tests. **Done.**
+2. Governance domain: `Scope`, `AccessPolicy`, `ErasureRequest` state machine, hash-chained audit entries. Unit tests. **Done** (Postgres repositories for Governance still to add).
+3. Postgres adapters for Memory, unit of work, outbox relay, migrations for all three schemas. Contract tests. **Done.**
+4. Retrieval: `PgvectorEngine` behind the `RetrievalEngine` port, `HashingEmbedder` for offline tests, `EngineFactFinder` adapter into Memory's recall. This is spike arm B. **Done** (production embedder adapter still to add).
 5. Extraction: one LLM adapter behind `LlmClient`, `RetainPipeline`. Record `ModelRef`.
 6. Attachment: REST first (the eval arm adapters need it), then MCP, then the Anthropic memory-tool handler.
 7. `HindsightEngine` and `HonchoEngine` adapters (spike arms C and D) using the same `RetrievalEngine` port and the same contract tests.
