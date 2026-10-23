@@ -292,7 +292,10 @@ describeWithDb("EraseBank", () => {
     // Simulate: the workflow has reached `inventoried`, the operator abandons, the workflow's next save arrives.
     const inFlight = requestErasure({ id: randomUUID(), tenantId: tenant, bankId: bankA.id, subjectId: bankA.subjectId, requestedBy: alice, requestedAt: new Date() });
     await requests.create(inFlight);
-    const abandon = new AbandonErasureHandler(scopeAccessPolicy, requests, uow, systemClock, 0);
+    // Backdate the row so it is stale under the default grace period. (`updated_at` is written with Postgres
+    // now() while the handler compares against the Node clock; a zero grace period would flake on clock order.)
+    await db.pool.query("UPDATE governance.erasure_requests SET updated_at = now() - interval '1 hour' WHERE id = $1", [inFlight.id]);
+    const abandon = new AbandonErasureHandler(scopeAccessPolicy, requests, uow, systemClock);
     expect((await abandon.handle(eraser(bankA.id), bankA.id, inFlight.id, "gone")).ok).toBe(true);
     const late = recordInventory(inFlight, [{ store: "memory.facts", countBefore: 1 }]);
     if (!late.ok) throw new Error("setup");
