@@ -59,6 +59,10 @@ Recall uses the embedder named by `EMBEDDER` (default `openai:text-embedding-3-s
 
 Extraction needs the provider's key in the environment (`ANTHROPIC_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `OPENAI_API_KEY`, or `OPENAI_COMPATIBLE_BASE_URL` for Ollama-style endpoints) and runs in a worker loop separate from indexing (`EXTRACTION_POLL_MS`, `LLM_TIMEOUT_MS`). Without `set-extractor`, a bank stores and recalls raw episodes only (the pgvector-only arm of the spike). Only the Subject's own turns are extracted from; assistant and tool output is context.
 
-See `src/attachment/README.md` for the routes.
+See `src/attachment/README.md` for the routes. Connect Claude Code to the same bank over MCP:
+
+```bash
+claude mcp add --transport http --scope user mem http://localhost:8787/v1/banks/bank-me/mcp --header "Authorization: Bearer <the key printed above>"
+```
 
 Domain code (`src/*/domain`) has no IO and is covered by fast unit tests. Infrastructure adapters are covered by contract tests against a real Postgres; `test/retrieval/retrieval-engine.contract.ts` is the contract every engine adapter (pgvector, Hindsight, Honcho) must pass.

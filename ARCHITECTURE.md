@@ -111,7 +111,7 @@ Indexes Facts and Episodes for recall. Pure derived state.
 
 Protocol adapters that translate to application commands and queries. No domain model.
 
-- `mcp/`: remote streamable-HTTP MCP server with OAuth; tools `recall`, `retain`, `list_facts`, `confirm`, `dispute`, `export`. Resource URIs expose Facts read-only.
+- `mcp/`: Streamable HTTP MCP server (stateless, one server per request bound to the resolved Scope) behind the same bearer API keys and middleware as REST; tools `recall`, `retain`, `list_facts`, `confirm_fact`, `dispute_fact` over the same handlers. **Done.** OAuth, an `export` tool and resource URIs are deferred.
 - `anthropic-memory-tool/`: handler for the client-side memory tool's file operations, backed by the Bank (a virtual `/memories` tree rendered from Facts; writes become Episodes).
 - `rest/`: same commands for SDKs and the eval arm adapters.
 - Later: `openai-proxy/` (OpenAI-compatible endpoint that injects recall and retains turns transparently).
@@ -200,7 +200,7 @@ Every repository read filters by `scope.bankId` in SQL as a second line of defen
 3. Postgres adapters for Memory, unit of work, outbox relay, migrations for all three schemas. Contract tests. **Done.**
 4. Retrieval: `PgvectorEngine` behind the `RetrievalEngine` port, `HashingEmbedder` for offline tests, `AiSdkEmbedder` for production (OpenAI, Google, OpenAI-compatible; configured by `EMBEDDER`), `EngineMemoryFinder` adapter into Memory's recall. Rows record their embedder; recall filters by it; `admin reindex` rebuilds a bank after a switch. This is spike arm B. **Done.**
 5. Extraction: one LLM adapter behind `LlmClient` (Vercel AI SDK: Anthropic, Google, OpenAI, OpenAI-compatible), `LlmExtractor` with a versioned prompt and structured output, `RetainPipeline` off the outbox with an idempotency claim per episode and a per-episode token/latency ledger (`extraction.runs`), `WriteExtractedFactsHandler` in Memory applying WritePolicy + ConflictResolver (supersede or record-as-historical). **Done.** Extraction is per bank: `admin set-extractor --bank <id> --model provider:model`.
-6. Attachment: REST first (the eval arm adapters need it), then MCP, then the Anthropic memory-tool handler. **REST done**: scope resolution via API keys, retain, recall (facts and episodes), assert/list/get/confirm/dispute, audit on every served read and write, outbox relay + `IndexingProjector` in the same process, admin CLI for bootstrap.
+6. Attachment: REST first (the eval arm adapters need it), then MCP, then the Anthropic memory-tool handler. **REST and MCP done**: scope resolution via API keys, retain, recall (facts and episodes), assert/list/get/confirm/dispute, audit on every served read and write, outbox relay + `IndexingProjector` in the same process, admin CLI for bootstrap.
 7. `HindsightEngine` and `HonchoEngine` adapters (spike arms C and D) using the same `RetrievalEngine` port and the same contract tests.
 8. Portability: JSONL/Markdown export, Claude Code memory-dir import.
 9. Wire the four arms into the chosen eval framework through the REST attachment and run the spike.

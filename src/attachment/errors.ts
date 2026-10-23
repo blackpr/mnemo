@@ -1,4 +1,7 @@
 import type { ContentfulStatusCode } from "hono/utils/http-status";
+import type { AppError } from "./handlers.js";
+
+export type { AppError };
 
 /**
  * Maps application-layer Result errors to HTTP. Attachment owns this table; the application
@@ -8,8 +11,6 @@ export interface HttpError {
   readonly status: ContentfulStatusCode;
   readonly body: { readonly error: string; readonly detail?: unknown };
 }
-
-export type AppError = { readonly kind: string };
 
 export function toHttpError(err: AppError): HttpError {
   const error = err as AppError & Record<string, unknown>;

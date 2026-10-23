@@ -1,51 +1,30 @@
 import { randomUUID } from "node:crypto";
 import { Hono, type Context } from "hono";
+import { StreamableHTTPTransport } from "@hono/mcp";
+import { HTTPException } from "hono/http-exception";
 import type { ZodType } from "zod";
-import { asBankId, asEpisodeId, asFactId, type BankId, type Clock, type Scope } from "../../shared-kernel/index.js";
-import type { AccessPolicy, AuditLogStore, ScopeResolver } from "../../governance/index.js";
-import {
-  AssertFactHandler,
-  GetFactHandler,
-  ListFactsHandler,
-  RecallHandler,
-  RecordEpisodeHandler,
-  SetConfirmationHandler,
-  type Episode,
-  type Fact,
-  type UnitOfWork,
-  type EpisodeRepository,
-  type FactRepository,
-  type MemoryFinder,
-} from "../../memory/index.js";
-import { toHttpError, type AppError } from "./errors.js";
+import { asBankId, asEpisodeId, asFactId, type BankId, type Scope } from "../../shared-kernel/index.js";
+import { auditDenial, buildHandlers, type AppError, type AttachmentDeps } from "../handlers.js";
+import { createMcpServer } from "../mcp/server.js";
+import { serializeEpisode, serializeFact } from "../serialize.js";
+import { toHttpError } from "../errors.js";
 import { assertFactBody, listFactsQuery, recallBody, retainBody } from "./schemas.js";
 
 /**
  * REST attachment. Thin: resolve Scope, validate input, call one application handler, map the
  * result. No domain logic lives here. Application handlers write their own audit entries
  * (inside the transaction for writes); the attachment only audits denials it sees first.
+ * The MCP attachment is mounted on the same app under /v1/banks/:bankId/mcp and shares the
+ * auth middleware and handlers.
  */
-export interface RestDeps {
-  readonly scopes: ScopeResolver;
-  readonly access: AccessPolicy;
-  readonly audit: AuditLogStore;
-  readonly clock: Clock;
-  readonly uow: UnitOfWork;
-  readonly facts: FactRepository;
-  readonly episodes: EpisodeRepository;
-  readonly finder: MemoryFinder;
-}
+export type RestDeps = AttachmentDeps;
 
 type Env = { Variables: { scope: Scope; bankId: BankId } };
 
 export function createApp(deps: RestDeps): Hono<Env> {
   const app = new Hono<Env>();
-  const recordEpisode = new RecordEpisodeHandler(deps.uow, deps.access, deps.clock);
-  const recall = new RecallHandler(deps.finder, deps.facts, deps.episodes, deps.access, deps.audit, deps.clock);
-  const assertFactH = new AssertFactHandler(deps.uow, deps.access, deps.clock);
-  const listFacts = new ListFactsHandler(deps.facts, deps.access, deps.audit, deps.clock);
-  const getFact = new GetFactHandler(deps.facts, deps.access, deps.audit, deps.clock);
-  const setConfirmation = new SetConfirmationHandler(deps.uow, deps.access, deps.clock);
+  const handlers = buildHandlers(deps);
+  const { recordEpisode, recall, assertFact: assertFactH, listFacts, getFact, setConfirmation } = handlers;
 
   app.get("/healthz", (c) => c.json({ ok: true }));
 
@@ -71,6 +50,26 @@ export function createApp(deps: RestDeps): Hono<Env> {
     c.set("scope", resolved.value);
     c.set("bankId", bankId);
     await next();
+  });
+
+  // MCP (Streamable HTTP, stateless): one server per request, bound to the resolved Scope.
+  // Stateless means no server-to-client stream: GET (SSE) and DELETE (session) are not offered.
+  app.all("/v1/banks/:bankId/mcp", async (c) => {
+    if (c.req.method !== "POST") {
+      return c.json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null }, 405, { Allow: "POST" });
+    }
+    const server = createMcpServer(deps, handlers, c.get("scope"), c.get("bankId"));
+    const transport = new StreamableHTTPTransport({ enableJsonResponse: true });
+    await server.connect(transport);
+    try {
+      return (await transport.handleRequest(c)) ?? c.json({ error: "not_found" }, 404);
+    } catch (e) {
+      // The transport reports protocol errors (406/415/400/404) as HTTPExceptions with JSON-RPC bodies.
+      if (e instanceof HTTPException) return e.getResponse();
+      throw e;
+    } finally {
+      server.close().catch(() => {});
+    }
   });
 
   // Retain: record an Episode. Extraction/indexing follow asynchronously via the outbox.
@@ -188,40 +187,9 @@ async function parseJson<T>(c: Context, schema: ZodType<T>): Promise<{ ok: true;
 }
 
 async function fail(c: Context, error: AppError, scope: Scope, bankId: BankId, deps: RestDeps): Promise<Response> {
-  if (error.kind === "AccessDenied") {
-    const required = String((error as AppError & { required?: unknown }).required);
-    await deps.audit.append({ tenantId: scope.tenantId, bankId, principalId: scope.principalId, action: "access.denied", details: { required }, at: deps.clock.now() });
-  }
+  await auditDenial(deps, scope, bankId, error);
   const { status, body } = toHttpError(error);
   return c.json(body, status);
 }
 
-export function serializeFact(f: Fact) {
-  return {
-    id: f.id,
-    bankId: f.bankId,
-    statement: f.statement,
-    predicate: f.predicate ?? null,
-    validity: { validFrom: f.validity.validFrom.toISOString(), validTo: f.validity.validTo?.toISOString() ?? null },
-    transaction: { recordedAt: f.transaction.recordedAt.toISOString(), retractedAt: f.transaction.retractedAt?.toISOString() ?? null },
-    provenance: f.provenance,
-    supersedes: f.supersedes ?? null,
-    supersededBy: f.supersededBy ?? null,
-    invalidation: f.invalidation ? { ...f.invalidation, at: f.invalidation.at.toISOString() } : null,
-  };
-}
-
-export function serializeEpisode(e: Episode) {
-  return {
-    id: e.id,
-    bankId: e.bankId,
-    kind: e.kind,
-    source: e.source,
-    role: e.role ?? null,
-    text: e.text,
-    occurredAt: e.occurredAt.toISOString(),
-    recordedAt: e.recordedAt.toISOString(),
-    recordedBy: e.recordedBy,
-    externalRef: e.externalRef ?? null,
-  };
-}
+export { serializeEpisode, serializeFact };

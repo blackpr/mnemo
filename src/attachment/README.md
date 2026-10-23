@@ -32,3 +32,15 @@ All bank-scoped routes take `Authorization: Bearer mem_...`. Errors: 400 invalid
 | POST | `/v1/banks/:bankId/facts/:factId/dispute` | write | mark provenance disputed |
 
 Bootstrap with the admin CLI (`npm run admin -- create-bank | create-principal | grant | issue-key`). The server process also runs two background loops. The outbox relay (every `OUTBOX_POLL_MS`) indexes episodes and facts and enqueues extraction work. The extraction worker (every `EXTRACTION_POLL_MS`) turns queued episodes into facts for banks with `set-extractor`, calling the model with a hard `LLM_TIMEOUT_MS`; a changed state supersedes the old fact, which stays recallable for its past interval via `asOf`, and a contradiction retracts it. `npm run admin -- extraction-status` shows queue counts; `requeue-extraction` retries failed and dead runs. A failed event retries with exponential backoff (1s, 2s, 4s, ... capped at 5 min) and is dead-lettered after 5 attempts (`memory.outbox.failed_at`), logged, and never blocks the queue; `npm run admin -- requeue-dead-letters` puts dead letters back.
+
+## MCP
+
+Endpoint: `POST /v1/banks/:bankId/mcp` (Streamable HTTP, stateless, JSON responses), same bearer API key and the same grants as REST. Each request builds an MCP server bound to the resolved Scope, so a key can only ever reach the bank in the URL. Tools call the exact same application handlers as REST and are audited identically; `retain` creates an episode (facts are extracted by the worker), `recall`/`list_facts` are read-only, `confirm_fact`/`dispute_fact` change provenance state. There is deliberately no `assert_fact` tool: models should retain the user's words and let extraction decide, not write facts directly.
+
+Connect Claude Code (user scope, so it works in every project):
+
+```bash
+claude mcp add --transport http --scope user mem http://localhost:8787/v1/banks/<bankId>/mcp --header "Authorization: Bearer mem_..."
+```
+
+Then `claude mcp list` should show `mem: ... - ✓ Connected`. Inside Claude Code, `/mcp` shows the five tools; the server's instructions tell the model to `recall` before answering questions about the user and to `retain` durable statements. Cursor, VS Code and Gemini CLI take the same URL and header in their MCP settings.
