@@ -178,16 +178,16 @@ Every repository read filters by `scope.bankId` in SQL as a second line of defen
 
 ## 6. Request flows
 
-**Retain** (write): Attachment → `RecordEpisode` command → Governance `canWrite` → `Episode` persisted + `EpisodeRecorded` to outbox (one transaction) → return. Async: outbox relay → Extraction `RetainPipeline` → candidates → `WritePolicy` (contradiction check, then dedupe) → `ConflictResolver` → `AssertFact` / `SupersedeFact` → `FactAsserted` → Retrieval indexes.
+**Retain** (write): Attachment → `RecordEpisode` command → Governance `canWrite` → bank tenant must equal scope tenant → `Episode` persisted + `EpisodeRecorded` to outbox + `episode.recorded` audit entry (one transaction) → return. Async: outbox relay → Extraction `RetainPipeline` → candidates → `WritePolicy` (contradiction check, then dedupe) → `ConflictResolver` → `AssertFact` / `SupersedeFact` → `FactAsserted` → Retrieval indexes.
 
-**Recall** (read): Attachment → `Recall` query with `Scope` → Governance `canRead` → `RetrievalEngine.recall` → Fact ids → `FactRepository.getMany(scope, ids)` (policy applied again) → response with provenance and validity → `RecallServed` audit entry (ids only).
+**Recall** (read): Attachment → `Recall` query with `Scope` → Governance `canRead` → `RetrievalEngine.recall` → Fact and Episode ids → `FactRepository.getMany(scope, ids)` / `EpisodeRepository.get(scope, id)` (policy applied again) → response with provenance and validity → `recall.served` audit entry (ids only). Application handlers write the audit entries themselves: for writes inside the unit-of-work transaction (entry and change commit or roll back together), for reads right after the read. The attachment only audits capability denials.
 
 **Erase**: Attachment → `RequestErasure` → Governance aggregate `ErasureRequest` → audit entry first → inventory (facts, episodes, engine stores, caches) → delete everywhere → verify zero hits per store → receipt (hash, counts, timestamps) → `ErasureReceiptIssued`.
 
 ## 7. What we deliberately do not do (yet)
 
 - No microservices, no monorepo. One repo, one package, one deployable. Contexts are folders.
-- No event bus. Outbox table and a relay loop. Upgrade only if a second deployable needs the events.
+- No event bus. Outbox table and a relay loop (per-event savepoints, attempt counting, dead-letter after 5 failures). Upgrade only if a second deployable needs the events.
 - No CQRS read models. Postgres queries are enough at our scale; add when a recall path proves slow.
 - No event sourcing of aggregates. The Episode log is append-only by nature; Facts are state with history via bi-temporal columns. That gives us replay without the ceremony.
 - No decay or eviction by default. Only Erasure removes data. Decay becomes a configurable Bank policy when state-change tracking exists.
@@ -196,11 +196,11 @@ Every repository read filters by `scope.bankId` in SQL as a second line of defen
 ## 8. Build order
 
 1. Shared kernel + Memory domain with unit tests (no IO). Invariants 1-6 as tests. **Done.**
-2. Governance domain: `Scope`, `AccessPolicy`, `ErasureRequest` state machine, hash-chained audit entries. Unit tests. **Done** (Postgres repositories for Governance still to add).
+2. Governance domain: `Scope`, `AccessPolicy`, `ErasureRequest` state machine, hash-chained audit entries. Unit tests. **Done.** Postgres repositories for principals, API keys and the audit log (per-tenant advisory lock, canonical JSON hashing) **done**; erasure persistence still to add.
 3. Postgres adapters for Memory, unit of work, outbox relay, migrations for all three schemas. Contract tests. **Done.**
 4. Retrieval: `PgvectorEngine` behind the `RetrievalEngine` port, `HashingEmbedder` for offline tests, `EngineFactFinder` adapter into Memory's recall. This is spike arm B. **Done** (production embedder adapter still to add).
 5. Extraction: one LLM adapter behind `LlmClient`, `RetainPipeline`. Record `ModelRef`.
-6. Attachment: REST first (the eval arm adapters need it), then MCP, then the Anthropic memory-tool handler.
+6. Attachment: REST first (the eval arm adapters need it), then MCP, then the Anthropic memory-tool handler. **REST done**: scope resolution via API keys, retain, recall (facts and episodes), assert/list/get/confirm/dispute, audit on every served read and write, outbox relay + `IndexingProjector` in the same process, admin CLI for bootstrap.
 7. `HindsightEngine` and `HonchoEngine` adapters (spike arms C and D) using the same `RetrievalEngine` port and the same contract tests.
 8. Portability: JSONL/Markdown export, Claude Code memory-dir import.
 9. Wire the four arms into the chosen eval framework through the REST attachment and run the spike.

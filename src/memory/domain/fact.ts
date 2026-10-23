@@ -114,10 +114,13 @@ export function invalidate(fact: Fact, reason: InvalidationReason, now: Date, no
   );
 }
 
-export function confirm(fact: Fact): Fact {
-  return Object.freeze({ ...fact, provenance: { ...fact.provenance, confirmation: "confirmed" as const } });
+/** Confirmation state changes only; refused on retracted facts, which are history, not belief. */
+export function confirm(fact: Fact): Result<Fact, FactError> {
+  if (fact.transaction.retractedAt !== undefined) return err({ kind: "AlreadyRetracted", factId: fact.id });
+  return ok(Object.freeze({ ...fact, provenance: { ...fact.provenance, confirmation: "confirmed" as const } }));
 }
 
-export function dispute(fact: Fact): Fact {
-  return Object.freeze({ ...fact, provenance: { ...fact.provenance, confirmation: "disputed" as const } });
+export function dispute(fact: Fact): Result<Fact, FactError> {
+  if (fact.transaction.retractedAt !== undefined) return err({ kind: "AlreadyRetracted", factId: fact.id });
+  return ok(Object.freeze({ ...fact, provenance: { ...fact.provenance, confirmation: "disputed" as const } }));
 }

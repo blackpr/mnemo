@@ -1,9 +1,9 @@
-import type { BankId, DomainEvent, EpisodeId, FactId, Scope } from "../../../shared-kernel/index.js";
+import type { BankId, DomainEvent, EpisodeId, FactId, Scope, TenantId } from "../../../shared-kernel/index.js";
 import type { Queryable } from "../../../platform/postgres/pool.js";
 import type { Bank } from "../../domain/bank.js";
 import type { Episode } from "../../domain/episode.js";
 import type { Fact } from "../../domain/fact.js";
-import type { BankRepository, EpisodeRepository, FactRepository, Outbox } from "../../ports/repositories.js";
+import { DuplicateEpisodeError, DuplicateFactError, type BankRepository, type EpisodeRepository, type FactRepository, type Outbox } from "../../ports/repositories.js";
 import { factToParams, toBank, toEpisode, toFact, type BankRow, type EpisodeRow, type FactRow } from "./rows.js";
 
 /**
@@ -13,13 +13,6 @@ import { factToParams, toBank, toEpisode, toFact, type BankRow, type EpisodeRow,
  * unit-of-work transaction.
  */
 
-export class DuplicateEpisodeError extends Error {
-  constructor(readonly episodeId: EpisodeId) {
-    super(`Episode ${episodeId} (or its externalRef) already exists`);
-    this.name = "DuplicateEpisodeError";
-  }
-}
-
 export class PgBankRepository implements BankRepository {
   constructor(private readonly db: Queryable) {}
 
@@ -28,13 +21,27 @@ export class PgBankRepository implements BankRepository {
     return rows[0] ? toBank(rows[0]) : undefined;
   }
 
-  async save(bank: Bank): Promise<void> {
+  async tenantOf(bankId: BankId): Promise<TenantId | undefined> {
+    const { rows } = await this.db.query<{ tenant_id: string }>("SELECT tenant_id FROM memory.banks WHERE id = $1", [bankId]);
+    return rows[0] ? (rows[0].tenant_id as TenantId) : undefined;
+  }
+
+  async create(bank: Bank): Promise<void> {
     await this.db.query(
-      `INSERT INTO memory.banks (id, tenant_id, subject_id, status, policy, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, policy = EXCLUDED.policy`,
+      `INSERT INTO memory.banks (id, tenant_id, subject_id, status, policy, created_at) VALUES ($1, $2, $3, $4, $5, $6)`,
       [bank.id, bank.tenantId, bank.subjectId, bank.status, JSON.stringify(bank.policy), bank.createdAt],
     );
+  }
+
+  async update(bank: Bank): Promise<void> {
+    const r = await this.db.query("UPDATE memory.banks SET status = $2, policy = $3 WHERE id = $1 AND tenant_id = $4 AND subject_id = $5", [
+      bank.id,
+      bank.status,
+      JSON.stringify(bank.policy),
+      bank.tenantId,
+      bank.subjectId,
+    ]);
+    if (r.rowCount === 0) throw new Error(`Bank ${bank.id} not found (or tenant/subject mismatch)`);
   }
 }
 
@@ -59,6 +66,12 @@ export class PgEpisodeRepository implements EpisodeRepository {
     return rows[0] ? toEpisode(rows[0]) : undefined;
   }
 
+  async getMany(scope: Scope, ids: readonly EpisodeId[]): Promise<readonly Episode[]> {
+    if (ids.length === 0) return [];
+    const { rows } = await this.db.query<EpisodeRow>("SELECT * FROM memory.episodes WHERE bank_id = $1 AND id = ANY($2::text[])", [scope.bankId, ids]);
+    return rows.map(toEpisode);
+  }
+
   async listByBank(scope: Scope, opts: { readonly after?: Date; readonly limit?: number } = {}): Promise<readonly Episode[]> {
     const { rows } = await this.db.query<EpisodeRow>(
       `SELECT * FROM memory.episodes
@@ -75,12 +88,17 @@ export class PgFactRepository implements FactRepository {
   constructor(private readonly db: Queryable) {}
 
   async insert(f: Fact): Promise<void> {
-    await this.db.query(
-      `INSERT INTO memory.facts
-         (id, bank_id, statement, predicate, valid_from, valid_to, recorded_at, retracted_at, provenance, supersedes_id, superseded_by_id, invalidation)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-      factToParams(f),
-    );
+    try {
+      await this.db.query(
+        `INSERT INTO memory.facts
+           (id, bank_id, statement, predicate, valid_from, valid_to, recorded_at, retracted_at, provenance, supersedes_id, superseded_by_id, invalidation)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        factToParams(f),
+      );
+    } catch (err) {
+      if (isUniqueViolation(err)) throw new DuplicateFactError(f.id);
+      throw err;
+    }
   }
 
   async update(f: Fact): Promise<void> {
@@ -94,8 +112,8 @@ export class PgFactRepository implements FactRepository {
     if (rowCount === 0) throw new Error(`Fact ${f.id} not found in bank ${f.bankId}`);
   }
 
-  async get(scope: Scope, id: FactId): Promise<Fact | undefined> {
-    const { rows } = await this.db.query<FactRow>("SELECT * FROM memory.facts WHERE bank_id = $1 AND id = $2", [scope.bankId, id]);
+  async get(scope: Scope, id: FactId, opts: { readonly forUpdate?: boolean } = {}): Promise<Fact | undefined> {
+    const { rows } = await this.db.query<FactRow>(`SELECT * FROM memory.facts WHERE bank_id = $1 AND id = $2${opts.forUpdate ? " FOR UPDATE" : ""}`, [scope.bankId, id]);
     return rows[0] ? toFact(rows[0]) : undefined;
   }
 

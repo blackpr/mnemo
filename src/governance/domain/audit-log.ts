@@ -13,6 +13,10 @@ export type AuditAction =
   | "fact.asserted"
   | "fact.superseded"
   | "fact.invalidated"
+  | "fact.confirmed"
+  | "fact.disputed"
+  | "facts.listed"
+  | "fact.read"
   | "access.denied"
   | "erasure.requested"
   | "erasure.deleted"
@@ -38,6 +42,40 @@ export type Hasher = (input: string) => string;
 
 export const GENESIS_HASH = "0".repeat(64);
 
+/**
+ * Canonical JSON: keys sorted recursively, no whitespace. Required because the stored form
+ * (Postgres jsonb) does not preserve key order, so hashing JSON.stringify output directly
+ * would break verification after a round trip.
+ */
+export function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj)
+    .filter((k) => obj[k] !== undefined)
+    .sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`).join(",")}}`;
+}
+
+/**
+ * The exact bytes that an entry's hash covers. Explicit field list, so adding fields is a
+ * deliberate choice. `details` goes through a JSON round trip first so that live values
+ * (Date, undefined in arrays) hash exactly as they will after being stored as jsonb.
+ */
+export function hashBody(e: Omit<AuditEntry, "hash">): string {
+  const details: unknown = JSON.parse(JSON.stringify(e.details));
+  return canonicalJson({
+    seq: e.seq,
+    prevHash: e.prevHash,
+    tenantId: e.tenantId,
+    bankId: e.bankId ?? null,
+    principalId: e.principalId,
+    action: e.action,
+    details,
+    at: e.at.toISOString(),
+  });
+}
+
 export function appendEntry(
   prev: AuditEntry | undefined,
   input: Omit<AuditEntry, "seq" | "prevHash" | "hash">,
@@ -45,23 +83,18 @@ export function appendEntry(
 ): AuditEntry {
   const seq = prev ? prev.seq + 1 : 0;
   const prevHash = prev ? prev.hash : GENESIS_HASH;
-  const body = JSON.stringify({ seq, prevHash, ...input, at: input.at.toISOString() });
-  return Object.freeze({ ...input, seq, prevHash, hash: hash(body) });
+  const unhashed = { ...input, seq, prevHash };
+  return Object.freeze({ ...unhashed, hash: hash(hashBody(unhashed)) });
 }
 
 /** Verify a chain of entries; returns the first broken seq or undefined if intact. */
 export function verifyChain(entries: readonly AuditEntry[], hash: Hasher): number | undefined {
   let prevHash = GENESIS_HASH;
+  let expectedSeq = 0;
   for (const e of entries) {
-    const { hash: expected, prevHash: _p, ...rest } = e;
-    const body = JSON.stringify({ seq: rest.seq, prevHash, ...stripSeq(rest), at: e.at.toISOString() });
-    if (e.prevHash !== prevHash || hash(body) !== expected) return e.seq;
+    if (e.seq !== expectedSeq || e.prevHash !== prevHash || hash(hashBody(e)) !== e.hash) return e.seq;
     prevHash = e.hash;
+    expectedSeq++;
   }
   return undefined;
-}
-
-function stripSeq<T extends { seq: number }>(o: T): Omit<T, "seq"> {
-  const { seq: _s, ...rest } = o;
-  return rest;
 }

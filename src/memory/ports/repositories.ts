@@ -1,4 +1,5 @@
 import type { BankId, DomainEvent, EpisodeId, FactId, Scope } from "../../shared-kernel/index.js";
+import type { AuditLogStore } from "../../governance/index.js";
 import type { Bank } from "../domain/bank.js";
 import type { Episode } from "../domain/episode.js";
 import type { Fact } from "../domain/fact.js";
@@ -9,23 +10,45 @@ import type { Fact } from "../domain/fact.js";
  * row-level filtering as a second line of defence behind Governance policy.
  */
 
+/** Thrown by EpisodeRepository.append when the id or (bank, externalRef) already exists. Part of the port contract. */
+export class DuplicateEpisodeError extends Error {
+  constructor(readonly episodeId: EpisodeId) {
+    super(`Episode ${episodeId} (or its externalRef) already exists`);
+    this.name = "DuplicateEpisodeError";
+  }
+}
+
+/** Thrown by FactRepository.insert when the id already exists. Part of the port contract. */
+export class DuplicateFactError extends Error {
+  constructor(readonly factId: FactId) {
+    super(`Fact ${factId} already exists`);
+    this.name = "DuplicateFactError";
+  }
+}
+
 export interface BankRepository {
   get(bankId: BankId): Promise<Bank | undefined>;
-  save(bank: Bank): Promise<void>;
+  /** Insert only; a Bank's identity never changes hands. Throws if the id exists. */
+  create(bank: Bank): Promise<void>;
+  /** Update status/policy of an existing bank. */
+  update(bank: Bank): Promise<void>;
 }
 
 export interface EpisodeRepository {
-  /** Append only. Must reject a second write with the same id or externalRef (idempotency). */
+  /** Append only. Throws DuplicateEpisodeError on a second write with the same id or externalRef. */
   append(episode: Episode): Promise<void>;
   get(scope: Scope, id: EpisodeId): Promise<Episode | undefined>;
+  getMany(scope: Scope, ids: readonly EpisodeId[]): Promise<readonly Episode[]>;
   listByBank(scope: Scope, opts?: { readonly after?: Date; readonly limit?: number }): Promise<readonly Episode[]>;
 }
 
 export interface FactRepository {
+  /** Throws DuplicateFactError if the id exists. */
   insert(fact: Fact): Promise<void>;
   /** Replace by id; used for supersession/invalidation/confirmation state changes. */
   update(fact: Fact): Promise<void>;
-  get(scope: Scope, id: FactId): Promise<Fact | undefined>;
+  /** `forUpdate` locks the row for the rest of the transaction; use before read-modify-write. */
+  get(scope: Scope, id: FactId, opts?: { readonly forUpdate?: boolean }): Promise<Fact | undefined>;
   getMany(scope: Scope, ids: readonly FactId[]): Promise<readonly Fact[]>;
   listCurrent(scope: Scope, at?: Date): Promise<readonly Fact[]>;
 }
@@ -35,7 +58,16 @@ export interface Outbox {
   publish(events: readonly DomainEvent[]): Promise<void>;
 }
 
-/** Unit of work: groups repository writes and outbox publish into one transaction. */
+export interface TransactionalRepositories {
+  readonly banks: BankRepository;
+  readonly episodes: EpisodeRepository;
+  readonly facts: FactRepository;
+  readonly outbox: Outbox;
+  /** Audit entries written here commit or roll back together with the state change. */
+  readonly audit: AuditLogStore;
+}
+
+/** Unit of work: groups repository writes, outbox publish and audit append into one transaction. */
 export interface UnitOfWork {
-  run<T>(work: (tx: { banks: BankRepository; episodes: EpisodeRepository; facts: FactRepository; outbox: Outbox }) => Promise<T>): Promise<T>;
+  run<T>(work: (tx: TransactionalRepositories) => Promise<T>): Promise<T>;
 }

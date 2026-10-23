@@ -42,4 +42,17 @@ DATABASE_URL=postgres://mem:mem@localhost:5433/mem npm run db:migrate
 DATABASE_URL=postgres://mem:mem@localhost:5433/mem npm test   # all suites, including Postgres adapters and the pgvector engine contract
 ```
 
+Run the REST attachment:
+
+```bash
+export DATABASE_URL=postgres://mem:mem@localhost:5433/mem
+npm run admin -- create-bank --id bank-me --tenant t1 --subject me
+npm run admin -- create-principal --id claude-code --tenant t1 --kind agent --name "Claude Code"
+npm run admin -- grant --principal claude-code --bank bank-me --caps read,write
+npm run admin -- issue-key --principal claude-code --label laptop   # prints the API key once
+npm start                                                            # http://localhost:8787
+```
+
+See `src/attachment/README.md` for the routes.
+
 Domain code (`src/*/domain`) has no IO and is covered by fast unit tests. Infrastructure adapters are covered by contract tests against a real Postgres; `test/retrieval/retrieval-engine.contract.ts` is the contract every engine adapter (pgvector, Hindsight, Honcho) must pass.

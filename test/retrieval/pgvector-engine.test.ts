@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
-import { HashingEmbedder, PgvectorEngine, EngineFactFinder } from "../../src/retrieval/index.js";
-import { PgBankRepository, PgFactRepository, RecallHandler } from "../../src/memory/index.js";
-import { scopeAccessPolicy } from "../../src/governance/index.js";
+import { HashingEmbedder, PgvectorEngine, EngineMemoryFinder } from "../../src/retrieval/index.js";
+import { PgBankRepository, PgEpisodeRepository, PgFactRepository, RecallHandler } from "../../src/memory/index.js";
+import { PgAuditLog, scopeAccessPolicy } from "../../src/governance/index.js";
+import { systemClock } from "../../src/shared-kernel/index.js";
 import { describeWithDb, setupTestDb, type TestDb } from "../helpers/postgres.js";
 import { retrievalEngineContract } from "./retrieval-engine.contract.js";
 import { bankFixture, factFixture, scopeFor } from "../helpers/fixtures.js";
@@ -27,8 +28,8 @@ describeWithDb("PgvectorEngine", () => {
     const bankA = bankFixture("bank-a");
     const bankB = bankFixture("bank-b");
     const banks = new PgBankRepository(db.pool);
-    await banks.save(bankA);
-    await banks.save(bankB);
+    await banks.create(bankA);
+    await banks.create(bankB);
     const facts = new PgFactRepository(db.pool);
     const engine = new PgvectorEngine(db.pool, new HashingEmbedder(256));
 
@@ -38,9 +39,9 @@ describeWithDb("PgvectorEngine", () => {
     // Poisoned index row pointing at a fact that does not exist in the system of record:
     await engine.indexFact(factFixture(bankA.id, "ghost", "the user's editor is emacs"));
 
-    const recall = new RecallHandler(new EngineFactFinder(engine), facts, scopeAccessPolicy);
+    const recall = new RecallHandler(new EngineMemoryFinder(engine), facts, new PgEpisodeRepository(db.pool), scopeAccessPolicy, new PgAuditLog(db.pool), systemClock);
 
-    const ok = await recall.handle(scopeFor(bankA.id, ["read"]), bankA.id, "which editor", 5);
+    const ok = await recall.handle(scopeFor(bankA.id, ["read"]), { bankId: bankA.id, query: "which editor", limit: 5 });
     expect(ok.ok).toBe(true);
     if (ok.ok) {
       // Only facts present in memory.facts come back; the ghost index row is dropped.
@@ -48,10 +49,10 @@ describeWithDb("PgvectorEngine", () => {
       expect(ok.value.facts[0]?.provenance.sourceEpisodeIds).toEqual(["ep-1"]);
     }
 
-    const denied = await recall.handle(scopeFor(bankA.id, ["write"]), bankA.id, "which editor", 5);
+    const denied = await recall.handle(scopeFor(bankA.id, ["write"]), { bankId: bankA.id, query: "which editor", limit: 5 });
     expect(denied.ok).toBe(false);
 
-    const wrongBank = await recall.handle(scopeFor(bankB.id, ["read"]), bankA.id, "which editor", 5);
+    const wrongBank = await recall.handle(scopeFor(bankB.id, ["read"]), { bankId: bankA.id, query: "which editor", limit: 5 });
     expect(wrongBank.ok).toBe(false);
   });
 });
