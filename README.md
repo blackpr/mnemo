@@ -2,6 +2,7 @@
 
 Self-hosted, provider-agnostic memory layer: a system of record for what AI assistants know about you, shared across Claude, Gemini, OpenAI and coding agents.
 
+- `STATUS.md` — where things stand, how to run, pitfalls, next steps (read first)
 - `ARCHITECTURE.md` — the domain-driven design: ubiquitous language, bounded contexts, invariants, ports, build order
 - `spike-plan-hindsight-vs-honcho.md` — two-week engine selection spike
 - `Self hosted AI memory layer landscape.md` and `research_notes/` — the research behind both
