@@ -120,26 +120,27 @@ conversation; 3 keys corrected, 2 questions reworded, 0 dropped; `answer-key-log
 `auditedBy: "human"` is reserved for it and `EVAL_REQUIRE_AUDITED=human` selects only those. The drafted type balance is
 uneven (fact 18, decision 9, temporal 5, preference 4, negative 4) and is reported per type.
 
-## Resuming the stage 2 run
+## Resuming an interrupted run
 
-The 2026-10-23 four-arm run stopped after one conversation when the Anthropic account ran out of
-credit (`eval/RESULTS.md`). Once the account has credit again (about 5 to 6 USD is needed), with the
-server (`npm start`) and the engines (`npm run engines:up`) running:
+A run that dies half-way (the 2026-10-23 stage 2 run did, when the Anthropic account ran out of
+credit) is resumed with the same command once the cause is fixed, with the server (`npm start`)
+and the engines (`npm run engines:up`) running:
 
 ```bash
 EVAL_REQUIRE_AUDITED=1 npm run eval:run
 ```
 
-Everything already done is reused: answers and grades of the 42 completed rows come from promptfoo's
-cache, arm B's banks and arm C's `eval-bbd0145d` bank are recorded, arm C resumes `eval-696cce29`
-(Hindsight skips unchanged documents) and arm D's two recorded workspaces are kept; only the missing
-ingestions and rows spend money. Then `npm run eval:summary`, `npm run eval:ci`, and replace the
-partial section at the top of `eval/RESULTS.md` and the table in `spike-results.md`. If a run dies
-again, arm D refuses a workspace that exists without a record (messages have no idempotency key);
-delete its session and workspace as the error says, and the record entry if any.
+Everything already done is reused: answers and grades of completed rows come from promptfoo's
+cache, arm B's banks and arm C's and D's recorded banks and workspaces are skipped, arm C resumes a
+Hindsight bank that exists without a record (Hindsight skips unchanged documents), and only the
+missing ingestions and rows spend money. Arm D refuses a workspace that exists without a record
+(messages have no idempotency key); delete its session and workspace as the error says. promptfoo
+records a provider failure as a row with `error`; `eval:summary` and `eval:ci` exclude such rows and
+print them as "not run". If Hindsight's `pending_consolidation` stops moving (an in-flight operation
+is orphaned when its container is replaced), cancel the operation and re-trigger consolidation via
+its API (`research_notes/hindsight-2026-10-23.md`).
 
-Known limits of the harness as of stage 2: promptfoo records a provider failure as a row with
-`error`; `eval:summary` and `eval:ci` exclude those rows and print them as "not run"; promptfoo's `not-llm-rubric`
+Known limits of the harness as of stage 2: promptfoo's `not-llm-rubric`
 does not invert model-graded assertions, hence `check-sanity.ts`; promptfoo's built-in Anthropic
 provider only omits `temperature` (rejected by the API for this model) when `thinking` is configured,
 which the configs do; importing `cache` from the `promptfoo` package inside a provider gives a second

@@ -52,3 +52,10 @@ records both and the table uses the trace total.
 - `verbatim` keeps prompt caching warm (2.5k of 2.6k input tokens cached per item).
 - Consolidation into observations runs in the background after a synchronous retain; "bank
   finished" is `stats.pending_operations == 0 && pending_consolidation == 0`.
+- **Recreating the container orphans in-flight consolidation.** A consolidation operation that was
+  `processing` when the container was replaced (new worker id) stays `processing` forever, the next
+  one stays `pending` behind it (`WORKER_STATS ... pending=1 ... assigned=0` with all slots free), and
+  `pending_consolidation` never drains: arm C then waits for its drain timeout. The docs' advice to
+  set a stable `HINDSIGHT_API_WORKER_ID` is about this. Recovery is through the API:
+  `DELETE .../operations/{id}` for both, `POST .../consolidation/recover` for memories whose
+  consolidation failed permanently, `POST .../consolidate` to run it again.

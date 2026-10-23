@@ -81,7 +81,8 @@ async function deriverTokens(): Promise<Record<string, { input: number; output: 
     const side = labels.token_type === "output" ? "output" : "input";
     // `component` splits input into prompt/messages and output into output_total and finer parts; count the totals only,
     // and say so when Honcho publishes a component this parser does not know (it would otherwise be dropped silently).
-    const known = side === "input" ? ["prompt", "messages"] : ["output_total"];
+    // Input components seen so far: prompt, messages (ingestion), previous_summary (summary); output_total is the output sum.
+    const known = side === "input" ? ["prompt", "messages", "previous_summary"] : ["output_total"];
     if (!known.includes(labels.component ?? "")) {
       if (side === "output" && !/^output_/.test(labels.component ?? "")) unknown.add(`${side}:${labels.component}`);
       if (side === "input") unknown.add(`${side}:${labels.component}`);
