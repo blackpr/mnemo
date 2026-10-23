@@ -1,0 +1,17 @@
+{
+  "name": "mem",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Self-hosted, provider-agnostic memory layer: a system of record for what AI assistants know about you.",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}
