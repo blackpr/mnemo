@@ -22,7 +22,8 @@ export type AuditAction =
   | "erasure.requested"
   | "erasure.deleted"
   | "erasure.verified"
-  | "erasure.receipted"
+  | "erasure.receipt_issued"
+  | "erasure.failed"
   | "history.redacted"
   | "export.produced";
 

@@ -48,4 +48,14 @@ export class PgExportStore implements ExportStore {
     const { rows } = await this.db.query<Row>("SELECT * FROM portability.exports WHERE bank_id = $1 AND tenant_id = $2 ORDER BY produced_at DESC, id DESC LIMIT $3", [scope.bankId, scope.tenantId, opts.limit ?? 100]);
     return rows.map(toRow);
   }
+
+  async countByBank(bankId: BankId): Promise<number> {
+    const { rows } = await this.db.query<{ n: string }>("SELECT count(*)::text AS n FROM portability.exports WHERE bank_id = $1", [bankId]);
+    return Number(rows[0]?.n ?? 0);
+  }
+
+  async purgeBank(bankId: BankId): Promise<number> {
+    const r = await this.db.query("DELETE FROM portability.exports WHERE bank_id = $1", [bankId]);
+    return r.rowCount ?? 0;
+  }
 }

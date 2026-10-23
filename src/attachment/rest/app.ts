@@ -6,10 +6,10 @@ import type { ZodType } from "zod";
 import { asBankId, asEpisodeId, asFactId, type BankId, type Scope } from "../../shared-kernel/index.js";
 import { auditDenial, buildHandlers, type AppError, type AttachmentDeps } from "../handlers.js";
 import { createMcpServer } from "../mcp/server.js";
-import { serializeEpisode, serializeFact } from "../serialize.js";
+import { serializeEpisode, serializeErasure, serializeFact } from "../serialize.js";
 import { toHttpError } from "../errors.js";
 import { fileExtensionOf } from "../../portability/index.js";
-import { assertFactBody, exportQuery, listFactsQuery, recallBody, retainBody } from "./schemas.js";
+import { assertFactBody, erasureIdParam, exportQuery, listFactsQuery, recallBody, retainBody } from "./schemas.js";
 
 /**
  * REST attachment. Thin: resolve Scope, validate input, call one application handler, map the
@@ -25,7 +25,7 @@ type Env = { Variables: { scope: Scope; bankId: BankId } };
 export function createApp(deps: RestDeps): Hono<Env> {
   const app = new Hono<Env>();
   const handlers = buildHandlers(deps);
-  const { recordEpisode, recall, assertFact: assertFactH, listFacts, getFact, setConfirmation, exportBank } = handlers;
+  const { recordEpisode, recall, assertFact: assertFactH, listFacts, getFact, setConfirmation, exportBank, eraseBank, getErasure } = handlers;
 
   app.get("/healthz", (c) => c.json({ ok: true }));
 
@@ -175,6 +175,30 @@ export function createApp(deps: RestDeps): Hono<Env> {
       "content-disposition": `attachment; filename="${safeName}-${stamp}.${fileExtensionOf(r.value.format)}"`,
       "x-mem-export-id": r.value.exportId,
     });
+  });
+
+  // Erasure: the one destructive operation. `erase` capability; runs the whole workflow (inventory, purge
+  // every store, verify, receipt) before answering, so the response already carries the outcome. The
+  // request record exists either way: 201 when `receipted`, 500 `erasure_failed` (with the record, so the
+  // id can be looked up and the bank retried) when `failed`. No body is read.
+  // Deliberately absent from MCP: an agent should never be able to erase its Subject's memory.
+  app.post("/v1/banks/:bankId/erasure", async (c) => {
+    const scope = c.get("scope");
+    const bankId = c.get("bankId");
+    const r = await eraseBank.handle(scope, bankId);
+    if (!r.ok) return fail(c, r.error, scope, bankId, deps);
+    const body = serializeErasure(r.value);
+    return r.value.state === "receipted" ? c.json(body, 201) : c.json({ error: "erasure_failed", request: body }, 500);
+  });
+
+  app.get("/v1/banks/:bankId/erasure/:id", async (c) => {
+    const id = erasureIdParam.safeParse(c.req.param("id"));
+    if (!id.success) return c.json({ error: "erasure_not_found", detail: { requestId: c.req.param("id") } }, 404);
+    const scope = c.get("scope");
+    const bankId = c.get("bankId");
+    const r = await getErasure.handle(scope, bankId, id.data);
+    if (!r.ok) return fail(c, r.error, scope, bankId, deps);
+    return c.json(serializeErasure(r.value));
   });
 
   app.onError((err, c) => {

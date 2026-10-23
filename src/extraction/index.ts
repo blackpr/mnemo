@@ -7,3 +7,4 @@ export * from "./application/llm-extractor.js";
 export * from "./application/retain-pipeline.js";
 export * from "./infrastructure/postgres/run-store.js";
 export * from "./infrastructure/ai-sdk-llm-client.js";
+export * from "./application/extraction-erasable-store.js";

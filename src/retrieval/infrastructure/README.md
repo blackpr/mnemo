@@ -7,7 +7,7 @@ Each adapter implements `RetrievalEngine` and must pass the shared contract in
 - stops returning a fact after `retractFact`
 - respects `asOf` for point-in-time recall
 - never returns hits from another bank under a scope bound to this one
-- `purgeSubject` returns `remaining: 0` and a follow-up recall returns nothing
+- `purgeBank` returns `remaining: 0`, `countBank` reports the rows before and zero after, and a follow-up recall returns nothing
 - `rebuild` restores recall after the engine's storage is wiped
 
 Planned adapters:

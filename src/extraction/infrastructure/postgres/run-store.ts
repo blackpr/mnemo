@@ -84,4 +84,14 @@ export class PgExtractionRunStore implements ExtractionRunStore {
     for (const r of rows) out[r.status] = Number(r.n);
     return out;
   }
+
+  async countByBank(bankId: BankId): Promise<number> {
+    const { rows } = await this.db.query<{ n: string }>("SELECT count(*)::text AS n FROM extraction.runs WHERE bank_id = $1", [bankId]);
+    return Number(rows[0]?.n ?? 0);
+  }
+
+  async purgeBank(bankId: BankId): Promise<number> {
+    const r = await this.db.query("DELETE FROM extraction.runs WHERE bank_id = $1", [bankId]);
+    return r.rowCount ?? 0;
+  }
 }

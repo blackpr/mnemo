@@ -26,6 +26,13 @@ export function toHttpError(err: AppError): HttpError {
       return { status: 404, body: { error: "fact_not_found", detail: { factId: error["factId"] } } };
     case "EpisodeNotFound":
       return { status: 422, body: { error: "episode_not_found", detail: { episodeId: error["episodeId"] } } };
+    case "ErasureNotFound":
+      return { status: 404, body: { error: "erasure_not_found", detail: { requestId: error["requestId"] } } };
+    case "ErasureInFlight":
+      return { status: 409, body: { error: "erasure_in_flight" } };
+    case "ErasureTerminal":
+    case "ErasureStillRunning":
+      return { status: 409, body: { error: "erasure_not_abandonable", detail: error } };
     case "BankNotWritable":
       return { status: 409, body: { error: "bank_not_writable" } };
     case "DuplicateEpisode":

@@ -8,6 +8,7 @@ import { createApp } from "../../src/attachment/rest/app.js";
 import { PgExportStore } from "../../src/portability/index.js";
 import { describeWithDb, setupTestDb, type TestDb } from "../helpers/postgres.js";
 import { bankFixture, tenant } from "../helpers/fixtures.js";
+import { erasureDeps } from "../helpers/erasure.js";
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
@@ -27,6 +28,8 @@ describeWithDb("REST attachment", () => {
   const get = (path: string, key: string) => app.request(path, { headers: headers(key) });
   const json = async <T,>(res: Response): Promise<T> => (await res.json()) as T;
   const drain = () => relay.drainAll((events) => projector.handle(events));
+  // Table names are test constants, never input.
+  const rowsIn = async (table: string) => (await db.pool.query(`SELECT 1 FROM ${table} WHERE bank_id = $1`, [bankA.id])).rows;
   const retain = async (key: string, bank: string, text: string, extra: Record<string, unknown> = {}) => {
     const res = await post(`/v1/banks/${bank}/episodes`, key, { source: "test", text, ...extra });
     expect(res.status).toBe(201);
@@ -51,6 +54,7 @@ describeWithDb("REST attachment", () => {
       episodes,
       finder: new EngineMemoryFinder(engine),
       exports: new PgExportStore(db.pool),
+      erasure: erasureDeps(db.pool, engine),
     });
   });
   afterAll(async () => db.close());
@@ -252,6 +256,80 @@ describeWithDb("REST attachment", () => {
     expect(recorded.some((e) => e.id === exportId && e.principalId === "ro")).toBe(true);
     const audit = await new PgAuditLog(db.pool).list(tenant);
     expect(audit.map((a) => a.action)).toEqual(["episode.recorded", "fact.asserted", "export.produced", "export.produced", "access.denied"]);
+  });
+
+  it("erasure: needs the erase capability, runs to a receipt, is readable afterwards; a stuck request is 409", async () => {
+    const principals = new PgPrincipalRepository(db.pool);
+    const keys = new PgApiKeyStore(db.pool);
+    const issue = async (id: string, bankId: string) => {
+      await principals.save({ id: asPrincipalId(id), tenantId: tenant, kind: "human", displayName: id, grants: [{ bankId: bankId as never, capabilities: new Set(["erase"]), grantedAt: new Date() }] });
+      const k = generateApiKey();
+      await keys.issue(asPrincipalId(id), k.hash, "t");
+      return k.token;
+    };
+    const eraserKey = await issue("eraser", bankA.id);
+    const eraserBKey = await issue("eraser-b", bankB.id);
+
+    const ep = await retain(rwKey, bankA.id, "the user lives in Lisbon");
+    await post(`/v1/banks/${bankA.id}/facts`, rwKey, { statement: "the user lives in Lisbon", sourceEpisodeIds: [ep] });
+    await drain();
+
+    // read+write is not enough; neither is read. Both denials are audited.
+    expect((await post(`/v1/banks/${bankA.id}/erasure`, rwKey, {})).status).toBe(403);
+    expect((await post(`/v1/banks/${bankA.id}/erasure`, roKey, {})).status).toBe(403);
+    expect((await rowsIn("memory.facts")).length).toBe(1);
+
+    const res = await app.request(`/v1/banks/${bankA.id}/erasure`, { method: "POST", headers: { authorization: `Bearer ${eraserKey}` } });
+    expect(res.status).toBe(201);
+    const body = await json<{ id: string; state: string; stores: { store: string; countBefore: number; deleted: number; hitsAfter: number }[]; receipt: { digest: string; deletions: unknown[] } | null; failure: string | null }>(res);
+    expect(body.state).toBe("receipted");
+    expect(body.failure).toBeNull();
+    expect(body.receipt?.digest).toMatch(/^[0-9a-f]{64}$/);
+    expect(Object.fromEntries(body.stores.map((s) => [s.store, [s.countBefore, s.deleted, s.hitsAfter]]))).toEqual({
+      "memory.facts": [1, 1, 0],
+      "memory.episodes": [1, 1, 0],
+      "memory.outbox": [2, 2, 0],
+      "retrieval.pgvector": [2, 2, 0],
+      "extraction.runs": [0, 0, 0],
+      "portability.exports": [0, 0, 0],
+    });
+    expect(await rowsIn("memory.facts")).toEqual([]);
+    expect(await rowsIn("retrieval.pgvector_index")).toEqual([]);
+
+    // Status: same evidence back; only with erase; unknown or malformed ids are 404; the other bank cannot see it.
+    const got = await app.request(`/v1/banks/${bankA.id}/erasure/${body.id}`, { headers: { authorization: `Bearer ${eraserKey}` } });
+    expect(got.status).toBe(200);
+    expect(await json(got)).toEqual(body);
+    expect((await get(`/v1/banks/${bankA.id}/erasure/${body.id}`, roKey)).status).toBe(403);
+    expect((await app.request(`/v1/banks/${bankA.id}/erasure/not-a-uuid`, { headers: { authorization: `Bearer ${eraserKey}` } })).status).toBe(404);
+    expect((await app.request(`/v1/banks/${bankA.id}/erasure/00000000-0000-4000-8000-000000000000`, { headers: { authorization: `Bearer ${eraserKey}` } })).status).toBe(404);
+    expect((await get(`/v1/banks/${bankB.id}/erasure/${body.id}`, bothKey)).status).toBe(403);
+    expect((await get(`/v1/banks/${bankB.id}/erasure/${body.id}`, eraserBKey)).status).toBe(404);
+
+    // A request left in flight (as after a crash) makes a new one 409 until an operator abandons it.
+    await db.pool.query("INSERT INTO governance.erasure_requests (id, tenant_id, bank_id, subject_id, requested_by, requested_at, state) VALUES ($1, $2, $3, $4, 'eraser-b', now(), 'inventoried')", [
+      "11111111-1111-4111-8111-111111111111", tenant, bankB.id, bankB.subjectId,
+    ]);
+    const stuck = await app.request(`/v1/banks/${bankB.id}/erasure`, { method: "POST", headers: { authorization: `Bearer ${eraserBKey}` } });
+    expect(stuck.status).toBe(409);
+    expect((await json<{ error: string }>(stuck)).error).toBe("erasure_in_flight");
+
+    // The bank is a tombstone: writes and exports are refused, recall is empty, the audit chain carries the receipt digest.
+    expect((await post(`/v1/banks/${bankA.id}/episodes`, rwKey, { source: "test", text: "after erasure" })).status).toBe(409);
+    expect((await get(`/v1/banks/${bankA.id}/export`, roKey)).status).toBe(409);
+    expect(await rowsIn("portability.exports")).toEqual([]);
+    const recalled = await json<{ facts: unknown[]; episodes: unknown[] }>(await post(`/v1/banks/${bankA.id}/recall`, roKey, { query: "Lisbon", includeEpisodes: true }));
+    expect(recalled).toEqual({ facts: [], episodes: [] });
+    const audit = await new PgAuditLog(db.pool).list(tenant);
+    expect(verifyChain(audit, sha256)).toBeUndefined();
+    expect(audit.filter((a) => a.action.startsWith("erasure.")).map((a) => [a.action, a.principalId])).toEqual([
+      ["erasure.requested", "eraser"],
+      ["erasure.deleted", "eraser"],
+      ["erasure.verified", "eraser"],
+      ["erasure.receipt_issued", "eraser"],
+    ]);
+    expect(audit.find((a) => a.action === "erasure.receipt_issued")?.details["digest"]).toBe(body.receipt?.digest);
+    expect(audit.filter((a) => a.action === "access.denied").map((a) => a.principalId)).toEqual(["rw", "ro", "ro", "both"]);
   });
 
   it("projector is idempotent under redelivery", async () => {

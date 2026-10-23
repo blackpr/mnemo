@@ -18,7 +18,7 @@ Rules:
 
 ## REST API (v1)
 
-All bank-scoped routes take `Authorization: Bearer mem_...`. Errors: 400 invalid body, 401 bad key, 403 no grant, missing capability or tenant mismatch, 404 bank/fact/unknown path, 409 duplicate episode or fact / confirm on a retracted fact, 422 unknown source episode.
+All bank-scoped routes take `Authorization: Bearer mem_...`. Errors: 400 invalid body, 401 bad key, 403 no grant, missing capability or tenant mismatch, 404 bank/fact/erasure request/unknown path, 409 duplicate episode or fact / confirm on a retracted fact / write or export on a frozen, erasing or erased bank / erasure already in flight, 422 unknown source episode.
 
 | Method | Path | Capability | Does |
 |---|---|---|---|
@@ -31,12 +31,14 @@ All bank-scoped routes take `Authorization: Bearer mem_...`. Errors: 400 invalid
 | POST | `/v1/banks/:bankId/facts/:factId/confirm` | write | mark provenance confirmed |
 | POST | `/v1/banks/:bankId/facts/:factId/dispute` | write | mark provenance disputed |
 | GET | `/v1/banks/:bankId/export?format=jsonl\|markdown` | read | the whole bank (closed and retracted facts included) as a download; recorded in `portability.exports` and audited `export.produced` (see `src/portability/README.md`) |
+| POST | `/v1/banks/:bankId/erasure` | erase | run the Erasure workflow to completion (audit entry first, freeze the bank, inventory, purge every store, re-count, receipt) → 201 request `{id, state: "receipted", stores[{store, countBefore, deleted, hitsAfter}], receipt{digest, issuedAt, deletions, stores}, failure: null}`, or 500 `{error: "erasure_failed", request}` with the same record in state `failed` (the bank stays frozen; POST again to retry; `admin erasure-abandon` unblocks a request a crash left in flight, which otherwise answers 409). The bank ends as a tombstone (`erased`): no more writes, empty recall. Irreversible. |
+| GET | `/v1/banks/:bankId/erasure/:id` | erase | the same record later; 404 for ids of other banks or tenants |
 
 Bootstrap with the admin CLI (`npm run admin -- create-bank | create-principal | grant | issue-key`). The server process also runs two background loops. The outbox relay (every `OUTBOX_POLL_MS`) indexes episodes and facts and enqueues extraction work. The extraction worker (every `EXTRACTION_POLL_MS`) turns queued episodes into facts for banks with `set-extractor`, calling the model with a hard `LLM_TIMEOUT_MS`; a changed state supersedes the old fact, which stays recallable for its past interval via `asOf`, and a contradiction retracts it. `npm run admin -- extraction-status` shows queue counts; `requeue-extraction` retries failed and dead runs. A failed event retries with exponential backoff (1s, 2s, 4s, ... capped at 5 min) and is dead-lettered after 5 attempts (`memory.outbox.failed_at`), logged, and never blocks the queue; `npm run admin -- requeue-dead-letters` puts dead letters back.
 
 ## MCP
 
-Endpoint: `POST /v1/banks/:bankId/mcp` (Streamable HTTP, stateless, JSON responses), same bearer API key and the same grants as REST. Each request builds an MCP server bound to the resolved Scope, so a key can only ever reach the bank in the URL. Tools call the exact same application handlers as REST and are audited identically; `retain` creates an episode (facts are extracted by the worker), `recall`/`list_facts` are read-only, `confirm_fact`/`dispute_fact` change provenance state. There is deliberately no `assert_fact` tool: models should retain the user's words and let extraction decide, not write facts directly.
+Endpoint: `POST /v1/banks/:bankId/mcp` (Streamable HTTP, stateless, JSON responses), same bearer API key and the same grants as REST. Each request builds an MCP server bound to the resolved Scope, so a key can only ever reach the bank in the URL. Tools call the exact same application handlers as REST and are audited identically; `retain` creates an episode (facts are extracted by the worker), `recall`/`list_facts` are read-only, `confirm_fact`/`dispute_fact` change provenance state. There is deliberately no `assert_fact` tool: models should retain the user's words and let extraction decide, not write facts directly. There is no erasure tool either: a compliance deletion is a human decision made over REST or `admin erase-bank`, never something an agent can trigger with the Subject's own key.
 
 Connect Claude Code (user scope, so it works in every project):
 

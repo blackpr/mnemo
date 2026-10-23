@@ -39,6 +39,9 @@ export const exportQuery = z.object({
   format: z.enum(["jsonl", "markdown"]).default("jsonl"),
 });
 
+/** Erasure request ids are server-generated UUIDs; anything else is a 404 without touching the database. */
+export const erasureIdParam = z.uuid();
+
 export type RetainBody = z.infer<typeof retainBody>;
 export type RecallBody = z.infer<typeof recallBody>;
 export type AssertFactBody = z.infer<typeof assertFactBody>;

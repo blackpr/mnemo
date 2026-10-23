@@ -20,4 +20,7 @@ export interface ExportStore {
   record(row: ExportRecordRow): Promise<void>;
   /** Scoped like every other read: filtered by the scope's bank and tenant in the adapter. */
   listByBank(scope: Scope, opts?: { readonly limit?: number }): Promise<readonly ExportRecordRow[]>;
+  /** Erasure: the ledger is per Subject too, so it goes with the bank (the audit log keeps the export entries). */
+  countByBank(bankId: BankId): Promise<number>;
+  purgeBank(bankId: BankId): Promise<number>;
 }

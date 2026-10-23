@@ -6,3 +6,4 @@ export * from "./application/export-bank.js";
 export * from "./application/import-documents.js";
 export * from "./infrastructure/postgres/export-store.js";
 export { readClaudeCodeMemory, type ReadOptions } from "./infrastructure/claude-code/memory-dir-reader.js";
+export * from "./application/exports-erasable-store.js";

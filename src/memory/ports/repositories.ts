@@ -27,7 +27,12 @@ export class DuplicateFactError extends Error {
 }
 
 export interface BankRepository {
-  get(bankId: BankId): Promise<Bank | undefined>;
+  /**
+   * `lock: "share"` (writers, inside their transaction) and `lock: "update"` (the erasure freeze) make the
+   * bank status check and the write it guards one atomic unit: a writer that read `active` holds the row
+   * until it commits, and the freeze waits for it, so nothing can be written after verification.
+   */
+  get(bankId: BankId, opts?: { readonly lock?: "share" | "update" }): Promise<Bank | undefined>;
   /** Insert only; a Bank's identity never changes hands. Throws if the id exists. */
   create(bank: Bank): Promise<void>;
   /** Update status/policy of an existing bank. */

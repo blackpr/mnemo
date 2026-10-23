@@ -2,12 +2,12 @@ import { createHash, randomUUID } from "node:crypto";
 import type { BankId, Clock, Result, Scope } from "../../shared-kernel/index.js";
 import { err, ok } from "../../shared-kernel/index.js";
 import type { AccessDenied, AccessPolicy, AuditLogStore } from "../../governance/index.js";
-import type { BankRepository, FactRepository } from "../../memory/index.js";
+import { canAcceptWrites, type BankRepository, type FactRepository } from "../../memory/index.js";
 import { BANK_EXPORT_SCHEMA, buildBankExport } from "../domain/bank-export.js";
 import { contentTypeOf, renderClaudePaste, renderGeminiPaste, renderJsonl, renderMarkdown, type ExportFormat } from "../domain/render.js";
 import type { ExportStore } from "../ports/export-store.js";
 
-export type ExportBankError = AccessDenied | { readonly kind: "BankNotFound" };
+export type ExportBankError = AccessDenied | { readonly kind: "BankNotFound" } | { readonly kind: "BankNotWritable" };
 
 export interface ExportBankInput {
   readonly bankId: BankId;
@@ -49,6 +49,8 @@ export class ExportBankHandler {
     const bank = await this.banks.get(input.bankId);
     if (!bank) return err({ kind: "BankNotFound" } as const);
     if (bank.tenantId !== scope.tenantId) return err({ kind: "AccessDenied", bankId: input.bankId, required: "read" } as const);
+    // The ledger row is a per-Subject write: a frozen, erasing or erased bank takes none (an erased bank has nothing to export anyway).
+    if (!canAcceptWrites(bank)) return err({ kind: "BankNotWritable" } as const);
 
     const producedAt = this.clock.now();
     const facts = await this.facts.listAll(scope);

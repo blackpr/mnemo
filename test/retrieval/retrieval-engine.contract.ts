@@ -11,7 +11,6 @@ import { episodeFixture, factFixture, fromArray, scopeFor } from "../helpers/fix
 export function retrievalEngineContract(make: () => Promise<RetrievalEngine> | RetrievalEngine): void {
   const bankA = asBankId("bank-a");
   const bankB = asBankId("bank-b");
-  const subjectA = "subject-bank-a";
 
   it("indexes a fact and recalls it by a paraphrase as the top hit", async () => {
     const engine = await make();
@@ -54,17 +53,23 @@ export function retrievalEngineContract(make: () => Promise<RetrievalEngine> | R
     expect(hits.every((h) => h.factId === "fa")).toBe(true);
   });
 
-  it("purgeSubject leaves zero remaining and recall returns nothing", async () => {
+  it("erasure: countBank inventories the bank, purgeBank leaves zero remaining, recall returns nothing, other banks untouched", async () => {
     const engine = await make();
     await engine.indexFact(factFixture(bankA, "f1", "the user's editor is neovim"));
     await engine.indexEpisode(episodeFixture(bankA, "e1", "I switched to neovim last week"));
     await engine.indexFact(factFixture(bankB, "fb", "untouched bank B fact"));
+    expect(await engine.countBank(bankA)).toBe(2);
+    expect(await engine.countBank(bankB)).toBe(1);
 
-    const result = await engine.purgeSubject(bankA, subjectA as never);
+    const result = await engine.purgeBank(bankA);
     expect(result.deleted).toBe(2);
     expect(result.remaining).toBe(0);
+    expect(await engine.countBank(bankA)).toBe(0);
     expect(await engine.recall(scopeFor(bankA), "neovim editor", { limit: 10, includeEpisodes: true })).toEqual([]);
+    expect(await engine.countBank(bankB)).toBe(1);
     expect((await engine.recall(scopeFor(bankB), "bank B fact", { limit: 10 })).length).toBe(1);
+    // Purging an empty bank is a no-op that still proves zero.
+    expect(await engine.purgeBank(bankA)).toEqual({ deleted: 0, remaining: 0 });
   });
 
   it("rebuild restores recall from the system of record", async () => {

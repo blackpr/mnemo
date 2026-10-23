@@ -77,7 +77,7 @@ export class WriteExtractedFactsHandler {
     if (!allowed.ok) return allowed;
 
     return this.uow.run(async (tx) => {
-      const bank = await tx.banks.get(input.bankId);
+      const bank = await tx.banks.get(input.bankId, { lock: "share" });
       if (!bank) return err({ kind: "BankNotFound" } as const);
       if (bank.tenantId !== scope.tenantId) return err({ kind: "AccessDenied", bankId: input.bankId, required: "write" } as const);
       if (!canAcceptWrites(bank)) return err({ kind: "BankNotWritable" } as const);

@@ -3,11 +3,11 @@ import { systemClock, type ModelRef } from "../../shared-kernel/index.js";
 import { createPool } from "../../platform/postgres/pool.js";
 import { migrate } from "../../platform/postgres/migrator.js";
 import { migrationSources } from "../../platform/postgres/migrations.js";
-import { PgAuditLog, PgPrincipalRepository, ScopeResolver, scopeAccessPolicy } from "../../governance/index.js";
-import { PgBankRepository, PgEpisodeRepository, PgFactRepository, PgOutboxRelay, PgUnitOfWork, WriteExtractedFactsHandler } from "../../memory/index.js";
-import { embedderFromEnv, EngineMemoryFinder, IndexingProjector, PgvectorEngine } from "../../retrieval/index.js";
-import { AiSdkLlmClient, LlmExtractor, PgExtractionRunStore, RetainPipeline, type Extractor } from "../../extraction/index.js";
-import { PgExportStore } from "../../portability/index.js";
+import { PgAuditLog, PgErasureRequestRepository, PgErasureUnitOfWork, PgPrincipalRepository, ScopeResolver, scopeAccessPolicy } from "../../governance/index.js";
+import { PgBankRepository, PgEpisodeRepository, PgFactRepository, PgMemoryErasure, PgOutboxRelay, PgUnitOfWork, WriteExtractedFactsHandler } from "../../memory/index.js";
+import { embedderFromEnv, EngineErasableStore, EngineMemoryFinder, IndexingProjector, PgvectorEngine } from "../../retrieval/index.js";
+import { AiSdkLlmClient, ExtractionErasableStore, LlmExtractor, PgExtractionRunStore, RetainPipeline, type Extractor } from "../../extraction/index.js";
+import { ExportsErasableStore, PgExportStore } from "../../portability/index.js";
 import { createApp } from "./app.js";
 
 /**
@@ -50,6 +50,9 @@ const banks = new PgBankRepository(pool);
 const facts = new PgFactRepository(pool);
 const episodes = new PgEpisodeRepository(pool);
 const uow = new PgUnitOfWork(pool);
+const runs = new PgExtractionRunStore(pool);
+const exports = new PgExportStore(pool);
+const memoryErasure = new PgMemoryErasure(pool);
 
 const app = createApp({
   scopes: new ScopeResolver(new PgPrincipalRepository(pool), banks, systemClock),
@@ -61,7 +64,14 @@ const app = createApp({
   facts,
   episodes,
   finder: new EngineMemoryFinder(engine),
-  exports: new PgExportStore(pool),
+  exports,
+  // Every store that holds Subject data, Memory first. A new store (engine adapter, cache) must be listed here or erasure cannot prove it empty.
+  erasure: {
+    bank: memoryErasure,
+    requests: new PgErasureRequestRepository(pool),
+    uow: new PgErasureUnitOfWork(pool),
+    stores: [memoryErasure, new EngineErasableStore(engine), new ExtractionErasableStore(runs), new ExportsErasableStore(exports)],
+  },
 });
 
 // Extractors are created lazily per configured model and cached for the process lifetime.
@@ -82,7 +92,7 @@ const pipeline = new RetainPipeline({
   banks,
   episodes,
   facts,
-  runs: new PgExtractionRunStore(pool),
+  runs,
   extractorFor,
   write: new WriteExtractedFactsHandler(uow, scopeAccessPolicy, systemClock),
   clock: systemClock,

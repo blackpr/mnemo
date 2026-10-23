@@ -1,4 +1,4 @@
-import type { BankId, EpisodeId, FactId, Scope, SubjectId } from "../../../shared-kernel/index.js";
+import type { BankId, EpisodeId, FactId, Scope } from "../../../shared-kernel/index.js";
 import type { Episode, Fact } from "../../../memory/index.js";
 import type { Queryable } from "../../../platform/postgres/pool.js";
 import type { Embedder } from "../../ports/embedder.js";
@@ -24,7 +24,7 @@ interface HitRow {
 /**
  * Default engine (spike arm B): our own Postgres, pgvector cosine similarity, no LLM on the
  * write path. Holds derived state only; see rebuild(). A Bank is one Subject's store, so
- * purgeSubject deletes by bank_id and re-counts to prove zero remaining.
+ * purgeBank deletes by bank_id and re-counts to prove zero remaining.
  *
  * Every row records the embedder that produced it and recall only compares rows from the
  * current embedder, so switching embedders can never mix vector spaces (or dimensions); rows
@@ -96,10 +96,14 @@ export class PgvectorEngine implements RetrievalEngine {
     );
   }
 
-  async purgeSubject(bankId: BankId, _subjectId: SubjectId): Promise<{ readonly deleted: number; readonly remaining: number }> {
-    const del = await this.db.query("DELETE FROM retrieval.pgvector_index WHERE bank_id = $1", [bankId]);
+  async countBank(bankId: BankId): Promise<number> {
     const { rows } = await this.db.query<{ n: string }>("SELECT count(*)::text AS n FROM retrieval.pgvector_index WHERE bank_id = $1", [bankId]);
-    return { deleted: del.rowCount ?? 0, remaining: Number(rows[0]?.n ?? 0) };
+    return Number(rows[0]?.n ?? 0);
+  }
+
+  async purgeBank(bankId: BankId): Promise<{ readonly deleted: number; readonly remaining: number }> {
+    const del = await this.db.query("DELETE FROM retrieval.pgvector_index WHERE bank_id = $1", [bankId]);
+    return { deleted: del.rowCount ?? 0, remaining: await this.countBank(bankId) };
   }
 
   /**

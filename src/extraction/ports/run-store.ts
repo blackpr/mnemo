@@ -49,4 +49,7 @@ export interface ExtractionRunStore {
   /** Operator action: put failed and dead rows back to pending. Returns the count. */
   requeueFailed(): Promise<number>;
   counts(): Promise<Readonly<Record<RunStatus, number>>>;
+  /** Erasure: rows (any status) for the bank, and their removal. The ledger holds token counts and errors, never episode text, but it is per Subject. */
+  countByBank(bankId: BankId): Promise<number>;
+  purgeBank(bankId: BankId): Promise<number>;
 }

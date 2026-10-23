@@ -51,3 +51,17 @@ export function createBank(
 }
 
 export const canAcceptWrites = (bank: Bank): boolean => bank.status === "active";
+
+/**
+ * Erasure (Governance drives it; Memory owns the Bank's status). `erasing` refuses writes for
+ * the duration of the workflow; `erased` is the tombstone that keeps the id from ever being
+ * reused. An erased bank may be erased again: the pass re-proves zero rows and issues a fresh receipt.
+ * A `frozen` bank goes through the same states; the freeze is not restored afterwards (it is erased).
+ */
+export function beginErasure(bank: Bank): Bank {
+  return Object.freeze({ ...bank, status: "erasing" as const });
+}
+
+export function markErased(bank: Bank): Bank {
+  return Object.freeze({ ...bank, status: "erased" as const });
+}

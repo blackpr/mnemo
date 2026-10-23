@@ -16,8 +16,9 @@ import { factToParams, toBank, toEpisode, toFact, type BankRow, type EpisodeRow,
 export class PgBankRepository implements BankRepository {
   constructor(private readonly db: Queryable) {}
 
-  async get(bankId: BankId): Promise<Bank | undefined> {
-    const { rows } = await this.db.query<BankRow>("SELECT * FROM memory.banks WHERE id = $1", [bankId]);
+  async get(bankId: BankId, opts: { readonly lock?: "share" | "update" } = {}): Promise<Bank | undefined> {
+    const lock = opts.lock === "share" ? " FOR SHARE" : opts.lock === "update" ? " FOR UPDATE" : "";
+    const { rows } = await this.db.query<BankRow>(`SELECT * FROM memory.banks WHERE id = $1${lock}`, [bankId]);
     return rows[0] ? toBank(rows[0]) : undefined;
   }
 

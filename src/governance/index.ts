@@ -6,3 +6,5 @@ export * from "./application/api-key.js";
 export * from "./ports/repositories.js";
 export * from "./application/scope-resolver.js";
 export * from "./infrastructure/postgres/repositories.js";
+export * from "./application/erase-bank.js";
+export * from "./infrastructure/postgres/erasure-repository.js";
