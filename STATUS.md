@@ -2,7 +2,7 @@
 
 Last updated 2026-10-23. Read this first when resuming work. `ARCHITECTURE.md` is the design; this file is where things stand.
 
-## What exists (all committed, 142 tests passing on `npm test`)
+## What exists (all committed, 151 tests passing on `npm test`)
 
 | Area | State |
 |---|---|
@@ -14,6 +14,7 @@ Last updated 2026-10-23. Read this first when resuming work. `ARCHITECTURE.md` i
 | Attachments | REST (`/v1/banks/:bankId/...`) and MCP (`/v1/banks/:bankId/mcp`, stateless Streamable HTTP) over the same handlers and audit |
 | Portability | `BankExport` v1 (JSONL with tombstones, deterministic Markdown by topic, JSON Schema `src/portability/schema/bank-export.v1.json`), export ledger `portability.exports` + `export.produced` audit, REST `GET /v1/banks/:bankId/export?format=jsonl\|markdown`; Claude Code memory-dir importer (gray-matter, idempotent via path+digest externalRef, episodes only); Claude/Gemini paste renderers. See `src/portability/README.md` |
 | Tooling | `admin` CLI (banks, principals, grants, keys, extractor, reindex, queues, `export`, `import-claude-code`, `render-import`, `erase-bank`, `erasure-status`, `erasure-abandon`), `eval/demo-extraction.sh`, `docker-compose.yml` (dev DB `mem`, test DB `mem_test`) |
+| Eval harness (spike stage 1) | promptfoo 0.120.x runs the cases: `eval/promptfooconfig.yaml`, corpus builder over `~/.claude/projects/*/*.jsonl` (human turns + assistant text only, secrets/emails/home paths redacted, this repo's sessions excluded), zod question schema + drafter (40 candidates, all `audited: false`) + `answer-key-log.md`, frozen grader prompt (`eval/grader/grader-prompt.txt`, 9 sanity verdicts checked by `check-sanity.ts`), arm A full context and arm B pgvector-over-REST as custom providers, `eval/stats/summarize.ts` for the section-6 table, `admin extraction-status --bank` (per-bank drain check and write-token ledger). Smoke run in `eval/RESULTS.md`; arms C and D are stage 2. See `eval/README.md` |
 
 Verified live on 2026-10-23: Claude Opus 5.5 extraction, OpenAI `text-embedding-3-small` recall, Claude Code connected over MCP (`claude mcp list` shows `mem ✔ Connected`), a retain over MCP extracted into a fact. Also on 2026-10-23: all three portability admin commands and the REST export against `bank-demo`; four real memory files from `~/.claude/projects/-Users-blackpr-code-local-vector-search/memory` imported and extracted into facts (bank-demo now holds those too). Erasure verified live on 2026-10-23 against a throwaway bank `bank-erase-check` (tenant `t-erase`, now an `erased` tombstone): retain, recall, `POST /erasure` to a receipt, `GET /erasure/:id`, empty recall and `409 bank_not_writable` afterwards, `admin erasure-status`, and a second `admin erase-bank` re-proving zero. bank-demo untouched (30 facts).
 
@@ -24,6 +25,7 @@ npm run db:up && npm run db:migrate
 npm start                      # REST + MCP on :8787, relay loop, extraction worker; loads .env
 npm run admin -- <command>     # see src/cli/admin.ts header for the bootstrap sequence
 ./eval/demo-extraction.sh      # needs a running server and .demo-key
+npm run eval:build-corpus && npm run eval:grader-sanity   # then EVAL_MAX_CONVERSATIONS=5 EVAL_MAX_QUESTIONS=20 EVAL_MAX_PER_CONVERSATION=5 npm run eval:run; npm run eval:summary
 npm test                       # unit + Postgres suites on mem_test; npm run test:live adds paid provider tests
 ```
 
@@ -43,6 +45,10 @@ npm test                       # unit + Postgres suites on mem_test; npm run tes
 - `governance.erasure_requests` was created in migration 0001; 0004 only adds columns and the in-flight index. The receipt digest is over canonical JSON (sorted keys) for the same jsonb key-order reason as the audit hash; `verifyReceipt` recomputes it.
 - Erasure is synchronous on the request path (fine at current bank sizes). A store adapter must return the same store names from `count` and `purge`; a name that appears in the inventory but not in the re-count fails the request closed.
 - Any new store that holds Subject data (an engine adapter, a cache) must be added to the `erasure.stores` list in `src/attachment/rest/main.ts`, `src/cli/admin.ts` and `test/helpers/erasure.ts`, or erasure cannot prove it empty.
+- Promptfoo's built-in Anthropic provider sends `temperature: 0` unless `thinking` is configured; the API rejects `temperature` for claude-opus-5-5 (400). Both eval configs set `thinking: { type: adaptive }` on the grader provider for that reason.
+- Promptfoo's `not-llm-rubric` does not invert model-graded assertions (the handler ignores `inverse`); the grader sanity cases carry `metadata.expectGraderPass` and `eval/grader/check-sanity.ts` compares verdicts.
+- The Claude desktop app's auto-mode classifier refuses shell commands that print transcript text from `~/.claude/projects` or write scripts mentioning it via heredoc; the corpus builder prints statistics only and the eval files were written with the editor tools.
+- Claude Code writes a resumed or forked session as a new JSONL that repeats the earlier messages; two corpus conversations (3a6c5eae, b4dc1b1e) overlap, so some drafted questions are near-duplicates. Dedupe by message uuid is a stage 2 corpus task.
 
 ## Working agreements (from the user)
 
@@ -59,9 +65,10 @@ npm test                       # unit + Postgres suites on mem_test; npm run tes
 - MCP: DNS-rebinding protection off (bearer key makes it moot on localhost); no `assert_fact` or erase tool by design.
 - Erasure (left after two review rounds): synchronous (a very large bank would hold the HTTP request open; make it a job with the request id as the handle); API keys and grants on an erased bank are not revoked (hardening item); the `erasing` freeze is never lifted on failure, so a bank stays unwritable until a retry succeeds (intended; no unfreeze command); a request left in flight by a crash is only recovered by `erasure-abandon` (no automatic sweep); a retry's receipt does not reference the failed request whose deletions it completes (evidence for one erasure can span two request rows, joined through the audit chain); `PgBankRepository.update` writes status and policy together, so an admin `set-extractor` racing an erasure can be reverted (pre-existing pattern for every bank update); the export status check is not under the bank lock the writers take (a tiny window for a ledger row to land during the freeze; verification would then fail closed and the retry cleans it up); the receipt is verifiable with `verifyReceipt` but no CLI command does it yet.
 - Portability: export ledger row and audit entry are two transactions (audit first, so a failure between them over-reports); symlinked memory files are skipped by the reader (`isFile()` is false); no MCP `export` tool yet (README lists it); the other import adapters (claude.ai export, Gemini Takeout, ChatGPT ZIP) are not built; id generation lives in the application layer rather than the attachment, unlike Memory.
+- Eval (stage 1): no cluster-robust CI / MDD script yet (not meaningful at smoke size); corpus is 4 conversations / 29k tokens from one tool (the plan wants 20-40 from two tools: add claude.ai, Gemini exports); questions drafted by the answering model and unaudited (several `fact` keys rest on assistant statements, drafted `asOf` values are UTC while question text may say local time); arm A sees all turns for temporal questions (as-of by instruction only); arm B with no extraction (the plan's floor, `EVAL_B_EXTRACTOR=none`) is implemented but not yet run; `eval-*` banks are left in the dev DB after a run (erase with `admin erase-bank`); embedding tokens are not metered anywhere; a fixed wait after extraction drains stands in for a per-bank outbox count (add one to `admin extraction-status --bank`); a failed ingestion is retried by every later row of that conversation; the three transcript secret patterns added in `eval/corpus/normalize.ts` (`mem_` keys, bearer tokens, URL passwords) belong in `SECRET_PATTERNS` in `write-extracted-facts.ts` too so extraction refuses them; `extraction.runs` keeps only the last attempt's usage, so retried runs under-report write cost.
 
 ## Suggested next steps, in order
 
-1. The spike (`spike-plan-hindsight-vs-honcho.md`): wire the four arms into promptfoo through REST; Hindsight and Honcho adapters must pass `test/retrieval/retrieval-engine.contract.ts` (including the `countBank` / `purgeBank` case).
+1. Spike stage 2 (`spike-plan-hindsight-vs-honcho.md`): audit the 40 drafted questions (mark `audited: true`, log drops), grow the corpus (claude.ai and Gemini exports, dedupe forked sessions), add arms C (Hindsight) and D (Honcho) as `eval/arms/*.ts` providers plus `RetrievalEngine` adapters that pass `test/retrieval/retrieval-engine.contract.ts` (including `countBank` / `purgeBank`), add the CI/MDD script, run with `EVAL_REQUIRE_AUDITED=1`, write `spike-results.md`.
 2. Hardening: HNSW index migration, revoke API keys and grants on erasure, `admin verify-receipt`, rate limits on attachments.
 3. Erasure as a background job for large banks (same request record, `202` with the id).

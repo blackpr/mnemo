@@ -131,7 +131,7 @@ We do **not** build an evaluation framework. Existing ones already do datasets, 
 - one thin adapter per arm (full context, pgvector, Hindsight, Honcho) that calls our REST attachment or the `RetrievalEngine` port
 - a short script for the statistics the framework does not compute: cluster-robust 95% CI by conversation and the minimum detectable difference
 
-Framework choice: `promptfoo` fits the TypeScript stack (custom JS providers, model-graded assertions, per-case latency and token capture). `Inspect AI` is the Python alternative. Confirm current features on day 1 of the spike and pick one; do not write a runner.
+Framework: `promptfoo` (chosen on spike day 1, 2026-10-23; 0.120.x as a devDependency). It supplies custom TypeScript providers for the arms, `llm-rubric` grading with our committed grader prompt, a disk cache used by both the arms' answering calls and the grader, and token and latency capture per result. Two things it did not supply live in `eval/`: a verdict check for the grader sanity cases (its `not-llm-rubric` does not invert model-graded assertions) and the plan's section-6 table (`eval/stats/summarize.ts`). See `eval/README.md`.
 
 `eval/` depends on the same ports as production and is never imported by `src/`.
 
@@ -203,6 +203,6 @@ Every repository read filters by `scope.bankId` in SQL as a second line of defen
 6. Attachment: REST first (the eval arm adapters need it), then MCP, then the Anthropic memory-tool handler. **REST and MCP done**: scope resolution via API keys, retain, recall (facts and episodes), assert/list/get/confirm/dispute, audit on every served read and write, outbox relay + `IndexingProjector` in the same process, admin CLI for bootstrap.
 7. `HindsightEngine` and `HonchoEngine` adapters (spike arms C and D) using the same `RetrievalEngine` port and the same contract tests.
 8. Portability: JSONL/Markdown export, Claude Code memory-dir import.
-9. Wire the four arms into the chosen eval framework through the REST attachment and run the spike.
+9. Wire the four arms into the chosen eval framework through the REST attachment and run the spike. **Stage 1 done** (2026-10-23): promptfoo harness, corpus builder over the local Claude Code transcripts (redacted, this repo's own sessions excluded), 40 drafted questions awaiting human audit, frozen grader prompt with sanity cases, arms A (full context) and B (pgvector through REST, per-conversation `eval-*` banks) and a smoke run recorded in `eval/RESULTS.md`. Stage 2: arms C and D (the step 7 adapters), the cluster-robust CI / MDD script, and the decision run over the audited question set.
 
 Steps 1-4 and 9 are what the two-week spike needs. The DDD structure is not extra work for the spike; it is what makes arms B, C and D swappable behind one port.
