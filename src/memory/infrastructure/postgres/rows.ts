@@ -11,6 +11,7 @@ export interface BankRow {
   subject_id: string;
   status: BankStatus;
   policy: BankPolicy;
+  engine: string;
   created_at: Date;
 }
 
@@ -21,6 +22,7 @@ export const toBank = (r: BankRow): Bank =>
     subjectId: r.subject_id as SubjectId,
     status: r.status,
     policy: r.policy,
+    engine: r.engine,
     createdAt: r.created_at,
   });
 

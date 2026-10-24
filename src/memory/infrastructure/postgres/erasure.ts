@@ -19,26 +19,29 @@ import { PgBankRepository } from "./repositories.js";
 export class PgMemoryErasure implements ErasableStore, ErasureBankGateway {
   constructor(private readonly pool: pg.Pool) {}
 
-  async describe(bankId: BankId): Promise<{ readonly tenantId: TenantId; readonly subjectId: SubjectId } | undefined> {
+  async describe(bankId: BankId): Promise<{ readonly tenantId: TenantId; readonly subjectId: SubjectId; readonly engine: string } | undefined> {
     const bank = await new PgBankRepository(this.pool).get(bankId);
-    return bank ? { tenantId: bank.tenantId, subjectId: bank.subjectId } : undefined;
+    return bank ? { tenantId: bank.tenantId, subjectId: bank.subjectId, engine: bank.engine } : undefined;
   }
 
   /** Locks the bank row, so the freeze waits for every writer that already passed its status check and later writers see `erasing`. */
-  beginErasure(bankId: BankId): Promise<void> {
-    return this.transition(bankId, beginErasure);
+  async beginErasure(bankId: BankId): Promise<{ readonly engine: string }> {
+    const frozen = await this.transition(bankId, beginErasure);
+    return { engine: frozen.engine };
   }
 
-  completeErasure(bankId: BankId): Promise<void> {
-    return this.transition(bankId, markErased);
+  async completeErasure(bankId: BankId): Promise<void> {
+    await this.transition(bankId, markErased);
   }
 
-  private transition(bankId: BankId, next: (bank: Bank) => Bank): Promise<void> {
+  private transition(bankId: BankId, next: (bank: Bank) => Bank): Promise<Bank> {
     return withTransaction(this.pool, async (client) => {
       const banks = new PgBankRepository(client);
       const bank = await banks.get(bankId, { lock: "update" });
       if (!bank) throw new Error(`Bank ${bankId} not found`);
-      await banks.update(next(bank));
+      const after = next(bank);
+      await banks.update(after);
+      return after;
     });
   }
 

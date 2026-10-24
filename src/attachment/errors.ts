@@ -30,6 +30,9 @@ export function toHttpError(err: AppError): HttpError {
       return { status: 404, body: { error: "erasure_not_found", detail: { requestId: error["requestId"] } } };
     case "ErasureInFlight":
       return { status: 409, body: { error: "erasure_in_flight" } };
+    case "EngineMismatch":
+      // A server-side wiring fault the caller cannot fix; which engines are deployed stays out of the response.
+      return { status: 409, body: { error: "engine_mismatch" } };
     case "ErasureTerminal":
     case "ErasureStillRunning":
       return { status: 409, body: { error: "erasure_not_abandonable", detail: error } };

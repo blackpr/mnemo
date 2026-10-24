@@ -13,7 +13,21 @@ export interface Bank {
   readonly subjectId: SubjectId;
   readonly status: BankStatus;
   readonly policy: BankPolicy;
+  /**
+   * The retrieval engine that holds this bank's derived index ("pgvector", "hindsight", "honcho"; Retrieval
+   * owns the names, Memory only records the string). Set at creation to the server's engine, changed by
+   * `admin reindex` when it moves the bank, so erasure can purge the engine that actually holds the bank.
+   */
+  readonly engine: string;
   readonly createdAt: Date;
+}
+
+/** Used by `createBank`'s default and the test fixtures; production callers pass the server's engine name explicitly. */
+export const DEFAULT_ENGINE = "pgvector";
+/** Lower-case identifier; Retrieval owns the actual names, Memory only refuses garbage that would make every erasure fail. */
+const ENGINE_NAME = /^[a-z][a-z0-9_-]*$/;
+function assertEngineName(engine: string): void {
+  if (!ENGINE_NAME.test(engine)) throw new Error(`invalid retrieval engine name "${engine}"`);
 }
 
 export interface BankPolicy {
@@ -39,15 +53,24 @@ export function createBank(
   subjectId: SubjectId,
   createdAt: Date,
   policy: Partial<Omit<BankPolicy, "decayEnabled">> = {},
+  engine: string = DEFAULT_ENGINE,
 ): Bank {
+  assertEngineName(engine);
   return Object.freeze({
     id,
     tenantId,
     subjectId,
     status: "active" as const,
     policy: { ...defaultBankPolicy, ...policy, decayEnabled: false as const },
+    engine,
     createdAt,
   });
+}
+
+/** The bank's index now lives in another engine (`admin reindex` moved it). Only meaningful once the previous engine's copy is purged. */
+export function switchEngine(bank: Bank, engine: string): Bank {
+  assertEngineName(engine);
+  return Object.freeze({ ...bank, engine });
 }
 
 export const canAcceptWrites = (bank: Bank): boolean => bank.status === "active";

@@ -16,7 +16,12 @@ import {
 } from "../domain/erasure-request.js";
 import { ErasureInFlightError, ErasureNotInFlightError, type ErasableStore, type ErasureBankGateway, type ErasureRequestRepository, type ErasureUnitOfWork } from "../ports/repositories.js";
 
-export type EraseBankError = AccessDenied | { readonly kind: "BankNotFound" } | { readonly kind: "ErasureInFlight"; readonly bankId: BankId };
+export type EraseBankError =
+  | AccessDenied
+  | { readonly kind: "BankNotFound" }
+  | { readonly kind: "ErasureInFlight"; readonly bankId: BankId }
+  /** The bank records its index in a retrieval engine none of the wired stores purges: refused before anything is written. */
+  | { readonly kind: "EngineMismatch"; readonly bankEngine: string; readonly serverEngines: readonly string[] };
 
 export type ErasureStatusError = AccessDenied | { readonly kind: "ErasureNotFound"; readonly requestId: string };
 
@@ -26,7 +31,10 @@ const TERMINAL = new Set(["receipted", "failed"]);
  * Erase a Bank: the one operation that removes data from the system of record.
  *
  * Order of events (ARCHITECTURE.md 2.2 and 6):
- *   1. `erase` capability on the bank, bank exists in the scope's tenant.
+ *   1. `erase` capability on the bank, bank exists in the scope's tenant, and the bank's recorded retrieval
+ *      engine is one a wired store purges (`ErasableStore.engine`); otherwise `EngineMismatch`, so an erasure
+ *      can never purge the wrong engine and receipt a bank whose index lives elsewhere. The engine is read
+ *      again under the freeze's row lock (step 3): a bank moved between the check and the freeze fails.
  *   2. In one transaction: the request row is created (`requested`; the database refuses a second
  *      in-flight one for the bank) and the `erasure.requested` audit entry is written. If the audit
  *      write fails, the request row rolls back with it and nothing has been touched.
@@ -54,12 +62,18 @@ export class EraseBankHandler {
     private readonly hash: Hasher,
   ) {}
 
+  /** The engines the wired stores purge, taken from the stores themselves so the check can never disagree with what is purged. */
+  private get engines(): readonly string[] {
+    return this.stores.flatMap((s) => (s.engine !== undefined ? [s.engine] : []));
+  }
+
   async handle(scope: Scope, bankId: BankId): Promise<Result<ErasureRequest, EraseBankError>> {
     const allowed = this.access.canErase(scope, bankId);
     if (!allowed.ok) return allowed;
     const bank = await this.bank.describe(bankId);
     if (!bank) return err({ kind: "BankNotFound" } as const);
     if (bank.tenantId !== scope.tenantId) return err({ kind: "AccessDenied", bankId, required: "erase" } as const);
+    if (!this.engines.includes(bank.engine)) return err({ kind: "EngineMismatch", bankEngine: bank.engine, serverEngines: this.engines } as const);
 
     const request = requestErasure({ id: this.newId(), tenantId: scope.tenantId, bankId, subjectId: bank.subjectId, requestedBy: scope.principalId, requestedAt: this.clock.now() });
     try {
@@ -95,7 +109,9 @@ export class EraseBankHandler {
   private async erase(initial: ErasureRequest, scope: Scope, track: (r: ErasureRequest) => void, at: (step: string) => void): Promise<ErasureRequest> {
     const bankId = initial.bankId;
     at("freeze");
-    await this.bank.beginErasure(bankId);
+    const frozen = await this.bank.beginErasure(bankId);
+    // Re-read under the row lock: a `reindex` that moved the bank between the pre-check and the freeze must not be purged from the wrong engine.
+    if (!this.engines.includes(frozen.engine)) throw new EngineMismatchError(frozen.engine, this.engines);
 
     at("inventory");
     const inventory: StoreInventory[] = [];
@@ -237,6 +253,14 @@ export class AbandonErasureHandler {
       await tx.audit.append({ tenantId: scope.tenantId, bankId, principalId: scope.principalId, action: "erasure.failed", details: { requestId, kind: "Abandoned", from: request.state }, at: this.clock.now() });
     });
     return ok(failed);
+  }
+}
+
+/** The bank's recorded engine changed between the pre-check and the freeze. Its `name` is the error kind the audit log gets. */
+class EngineMismatchError extends Error {
+  constructor(bankEngine: string, serverEngines: readonly string[]) {
+    super(`bank records engine "${bankEngine}", wired stores purge ${serverEngines.join(", ") || "none"}`);
+    this.name = "EngineMismatch";
   }
 }
 

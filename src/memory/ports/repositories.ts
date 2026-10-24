@@ -35,7 +35,7 @@ export interface BankRepository {
   get(bankId: BankId, opts?: { readonly lock?: "share" | "update" }): Promise<Bank | undefined>;
   /** Insert only; a Bank's identity never changes hands. Throws if the id exists. */
   create(bank: Bank): Promise<void>;
-  /** Update status/policy of an existing bank. */
+  /** Update status, policy and engine of an existing bank. */
   update(bank: Bank): Promise<void>;
 }
 

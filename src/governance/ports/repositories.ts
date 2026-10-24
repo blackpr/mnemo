@@ -82,6 +82,12 @@ export interface ErasableStore {
    * is allowed: the workflow's own entries (`requested`, `deleted`, `receipt_issued`, ...) cannot be forged this way.
    */
   readonly auditPurgeAs?: Extract<AuditAction, "erasure.access_revoked">;
+  /**
+   * For a retrieval engine's store: the engine's name ("pgvector", "hindsight", "honcho"). The workflow refuses a bank
+   * whose recorded engine is not one of the wired engine stores', before and again after the freeze, so an erasure can
+   * never purge the wrong engine and receipt a bank whose index lives elsewhere.
+   */
+  readonly engine?: string;
   /** Store names must be stable and distinct per adapter. Memory must be listed first in the workflow: it removes the outbox events whose consumers (indexing, extraction) write into the stores purged after it. */
   count(bankId: BankId): Promise<Readonly<Record<string, number>>>;
   /** Delete everything the store holds for the bank; returns rows deleted per store name. */
@@ -90,9 +96,10 @@ export interface ErasableStore {
 
 /** What Governance needs from Memory about the Bank being erased. Implemented by Memory. */
 export interface ErasureBankGateway {
-  describe(bankId: BankId): Promise<{ readonly tenantId: TenantId; readonly subjectId: SubjectId } | undefined>;
-  /** Freeze the bank for the duration of the workflow: no writes are accepted while an erasure is in flight. */
-  beginErasure(bankId: BankId): Promise<void>;
+  /** `engine` is the retrieval engine the bank records as holding its index; the workflow refuses to run against another. */
+  describe(bankId: BankId): Promise<{ readonly tenantId: TenantId; readonly subjectId: SubjectId; readonly engine: string } | undefined>;
+  /** Freeze the bank for the duration of the workflow: no writes are accepted while an erasure is in flight. Returns the bank as frozen (its recorded engine is re-checked under the lock). */
+  beginErasure(bankId: BankId): Promise<{ readonly engine: string }>;
   /** The bank row stays as a tombstone (status `erased`); the id is never reused. */
   completeErasure(bankId: BankId): Promise<void>;
 }

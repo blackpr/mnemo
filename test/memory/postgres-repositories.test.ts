@@ -2,6 +2,7 @@ import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { asBankId, asEpisodeId, asFactId, systemClock } from "../../src/shared-kernel/index.js";
 import { PgAuditLog, scopeAccessPolicy } from "../../src/governance/index.js";
 import {
+  createBank,
   DuplicateEpisodeError,
   DuplicateFactError,
   PgBankRepository,
@@ -11,6 +12,7 @@ import {
   PgUnitOfWork,
   RecordEpisodeHandler,
   supersede,
+  switchEngine,
 } from "../../src/memory/index.js";
 import { describeWithDb, setupTestDb, type TestDb } from "../helpers/postgres.js";
 import { bankFixture, episodeFixture, factFixture, scopeFor, tenant } from "../helpers/fixtures.js";
@@ -31,12 +33,18 @@ describeWithDb("Memory Postgres adapters", () => {
     await banks.create(bankB);
   });
 
-  it("round-trips a bank; create refuses duplicates; update changes status only", async () => {
+  it("round-trips a bank (engine included); create refuses duplicates; update changes status, policy and engine", async () => {
     const banks = new PgBankRepository(db.pool);
     expect(await banks.get(bankA.id)).toEqual(bankA);
+    expect(bankA.engine).toBe("pgvector");
     await expect(banks.create(bankA)).rejects.toThrow();
     await banks.update({ ...bankA, status: "frozen" });
     expect((await banks.get(bankA.id))?.status).toBe("frozen");
+    await banks.update(switchEngine({ ...bankA, status: "frozen" }, "honcho"));
+    expect((await banks.get(bankA.id))).toMatchObject({ status: "frozen", engine: "honcho" });
+    expect(createBank(asBankId("bank-h"), bankA.tenantId, bankA.subjectId, new Date(), {}, "hindsight").engine).toBe("hindsight");
+    expect(() => switchEngine(bankA, "")).toThrow(/engine name/);
+    await expect(db.pool.query("UPDATE memory.banks SET engine = '' WHERE id = $1", [bankA.id])).rejects.toThrow(/banks_engine_name/);
   });
 
   it("episodes are append-only: duplicates rejected, UPDATE refused by the database", async () => {

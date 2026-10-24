@@ -28,8 +28,11 @@ import { ADDRESS_LIMIT_FACTOR, createApp, DEFAULT_RATE_LIMIT_PER_MINUTE } from "
  * optional. Changing the embedder requires `admin reindex --bank <id>` for existing banks and a
  * server restart (the server keeps the embedder it booted with). ENGINE selects
  * the retrieval engine ("pgvector" default, "hindsight" with HINDSIGHT_BASE_URL / HINDSIGHT_API_KEY,
- * "honcho" with HONCHO_BASE_URL / HONCHO_API_KEY; see src/retrieval/infrastructure/README.md);
- * switching engines also needs `admin reindex --bank <id>` since each engine holds its own derived state.
+ * "honcho" with HONCHO_BASE_URL / HONCHO_API_KEY; see src/retrieval/infrastructure/README.md). Each bank
+ * records the engine that holds its index; `admin reindex --bank <id>` under the new ENGINE moves a bank (purges
+ * the previous engine's copy, records the engine, rebuilds), and erasure refuses a bank recorded in an engine this
+ * process does not purge. Restart the server with the new ENGINE right after moving its banks: the projector
+ * writes into the server's engine whatever the bank records, and reindex refuses to finish while it does.
  * Migrations run at boot, so the database role needs DDL rights.
  */
 const url = process.env.DATABASE_URL;
@@ -86,6 +89,13 @@ if (engine instanceof PgvectorEngine) {
   }
 }
 const banks = new PgBankRepository(pool);
+// Banks whose recorded engine is not this server's: the projector will not index them where they live, and their
+// erasure will be refused with engine_mismatch. Happens after a change of ENGINE without `admin reindex`, or after
+// migration memory/0004 on a deployment that never ran pgvector.
+{
+  const { rows } = await pool.query<{ id: string; engine: string }>("SELECT id, engine FROM memory.banks WHERE engine <> $1 AND status <> 'erased' ORDER BY id LIMIT 20", [engine.name]);
+  if (rows.length > 0) console.warn(`${rows.length}${rows.length === 20 ? "+" : ""} bank(s) record another engine than this server's ${engine.name}: ${rows.map((r) => `${r.id} (${r.engine})`).join(", ")}; run \`npm run admin -- reindex --bank <id>\` under ENGINE=${engine.name} to move them, or start the server with their engine`);
+}
 const facts = new PgFactRepository(pool);
 const episodes = new PgEpisodeRepository(pool);
 const uow = new PgUnitOfWork(pool);

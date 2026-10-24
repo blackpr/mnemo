@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { asPrincipalId, systemClock } from "../../src/shared-kernel/index.js";
 import { generateApiKey, PgApiKeyStore, PgAuditLog, PgErasureRequestRepository, PgPrincipalRepository, ScopeResolver, scopeAccessPolicy, verifyChain, type Principal } from "../../src/governance/index.js";
-import { PgBankRepository, PgEpisodeRepository, PgFactRepository, PgOutboxRelay, PgUnitOfWork } from "../../src/memory/index.js";
+import { PgBankRepository, PgEpisodeRepository, PgFactRepository, PgOutboxRelay, PgUnitOfWork, switchEngine } from "../../src/memory/index.js";
 import { EngineMemoryFinder, HashingEmbedder, IndexingProjector, PgvectorEngine } from "../../src/retrieval/index.js";
 import { createApp } from "../../src/attachment/rest/app.js";
 import { serializeErasure } from "../../src/attachment/serialize.js";
@@ -401,6 +401,23 @@ describeWithDb("REST attachment", () => {
     // An explicit 0 for the address ceiling means none, not "nothing allowed".
     const noCeiling = createApp(deps, { rateLimitPerMinute: 3, rateLimitPerAddressPerMinute: 0 });
     for (let i = 0; i < 5; i++) expect((await noCeiling.request(`/v1/banks/${bankA.id}/facts`, { headers: { authorization: fresh() } }, from("10.0.0.1"))).status).toBe(401);
+  });
+
+  it("erasure of a bank recorded in another engine is 409 engine_mismatch and touches nothing", async () => {
+    const principals = new PgPrincipalRepository(db.pool);
+    const keys = new PgApiKeyStore(db.pool);
+    await principals.save({ id: asPrincipalId("eraser"), tenantId: tenant, kind: "human", displayName: "eraser", grants: [{ bankId: bankA.id, capabilities: new Set(["erase"]), grantedAt: new Date() }] });
+    const k = generateApiKey();
+    await keys.issue(asPrincipalId("eraser"), k.hash, "t");
+    const banks = new PgBankRepository(db.pool);
+    await banks.update(switchEngine((await banks.get(bankA.id))!, "hindsight"));
+    await retain(rwKey, bankA.id, "still here");
+    const res = await app.request(`/v1/banks/${bankA.id}/erasure`, { method: "POST", headers: { authorization: `Bearer ${k.token}` } });
+    expect(res.status).toBe(409);
+    expect(await json(res)).toEqual({ error: "engine_mismatch" });
+    expect((await rowsIn("memory.episodes")).length).toBe(1);
+    expect((await banks.get(bankA.id))?.status).toBe("active");
+    expect((await db.pool.query("SELECT 1 FROM governance.erasure_requests")).rowCount).toBe(0);
   });
 
   it("projector is idempotent under redelivery", async () => {

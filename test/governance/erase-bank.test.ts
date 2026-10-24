@@ -25,7 +25,7 @@ import {
   type ErasureUnitOfWork,
 } from "../../src/governance/index.js";
 import { sha256 } from "../../src/platform/hash.js";
-import { AssertFactHandler, PgBankRepository, PgEpisodeRepository, PgFactRepository, PgMemoryErasure, PgOutboxRelay, PgUnitOfWork, RecallHandler, RecordEpisodeHandler } from "../../src/memory/index.js";
+import { AssertFactHandler, PgBankRepository, PgEpisodeRepository, PgFactRepository, PgMemoryErasure, PgOutboxRelay, PgUnitOfWork, RecallHandler, RecordEpisodeHandler, switchEngine } from "../../src/memory/index.js";
 import { EngineErasableStore, EngineMemoryFinder, HashingEmbedder, IndexingProjector, PgvectorEngine } from "../../src/retrieval/index.js";
 import { ExtractionErasableStore, PgExtractionRunStore } from "../../src/extraction/index.js";
 import { ExportsErasableStore, PgExportStore } from "../../src/portability/index.js";
@@ -389,6 +389,36 @@ describeWithDb("EraseBank", () => {
     const asAdmin = await handler().handle(eraser(bankA.id, new Set(["admin"])), bankA.id);
     expect(asAdmin.ok && asAdmin.value.state).toBe("receipted");
     expect(asAdmin.ok && asAdmin.value.requestedBy).toBe(asPrincipalId("alice"));
+  });
+
+  it("refuses a bank whose recorded engine no wired store purges, before anything is written; the engine is re-checked under the freeze", async () => {
+    const banks = new PgBankRepository(db.pool);
+    expect(await memory.describe(bankA.id)).toEqual({ tenantId: tenant, subjectId: bankA.subjectId, engine: "pgvector" });
+    await banks.update(switchEngine((await banks.get(bankA.id))!, "honcho"));
+    const before = await rowsFor(db, bankA.id);
+    const r = await handler().handle(eraser(bankA.id), bankA.id);
+    expect(r).toEqual({ ok: false, error: { kind: "EngineMismatch", bankEngine: "honcho", serverEngines: ["pgvector"] } });
+    expect(await requestsOf(bankA.id)).toEqual([]);
+    expect(await rowsFor(db, bankA.id)).toEqual(before);
+    expect((await banks.get(bankA.id))?.status).toBe("active");
+    expect((await audit.list(tenant)).some((e) => e.action.startsWith("erasure."))).toBe(false);
+
+    // The bank moves between the pre-check and the freeze (a concurrent reindex): the freeze's locked re-read catches it and the request fails.
+    await banks.update(switchEngine((await banks.get(bankA.id))!, "pgvector"));
+    const racing = { ...memory, describe: memory.describe.bind(memory), completeErasure: memory.completeErasure.bind(memory), count: memory.count.bind(memory), purge: memory.purge.bind(memory),
+      beginErasure: async (id: BankId) => { await banks.update(switchEngine((await banks.get(id))!, "honcho")); return memory.beginErasure(id); } };
+    const raced = await new EraseBankHandler(scopeAccessPolicy, racing, uow, stores, systemClock, randomUUID, sha256).handle(eraser(bankA.id), bankA.id);
+    expect(raced.ok && raced.value.state).toBe("failed");
+    expect(raced.ok && raced.value.failure).toBe("freeze failed (EngineMismatch)");
+    expect(raced.ok && raced.value.deletions).toEqual([]);
+    expect((await rowsFor(db, bankA.id))["memory.facts"]).toBe(1);
+    expect((await audit.list(tenant)).filter((e) => e.action.startsWith("erasure.")).map((e) => [e.action, e.details["kind"]])).toEqual([["erasure.requested", undefined], ["erasure.failed", "EngineMismatch"]]);
+
+    // A process whose wired engine store is the one the bank records is accepted: the engine name comes from the store itself, never from a parallel setting.
+    const honcho: ErasableStore = { engine: "honcho", count: async () => ({ "retrieval.honcho": 0 }), purge: async () => ({ "retrieval.honcho": 0 }) };
+    const ok = await handler({ stores: [memory, honcho, ...stores.slice(2)] }).handle(eraser(bankA.id), bankA.id);
+    expect(ok.ok && ok.value.state).toBe("receipted");
+    expect(ok.ok && ok.value.inventory.map((i) => i.store)).toContain("retrieval.honcho");
   });
 
   it("the append-only triggers still refuse deletes outside the erasure transaction", async () => {

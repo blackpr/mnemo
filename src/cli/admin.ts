@@ -2,13 +2,13 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { asBankId, asPrincipalId, asSubjectId, asTenantId, systemClock, type BankId, type Capability, type Scope } from "../shared-kernel/index.js";
-import { createPool, type Pool } from "../platform/postgres/pool.js";
+import { createPool, withTransaction, type Pool } from "../platform/postgres/pool.js";
 import { migrate } from "../platform/postgres/migrator.js";
 import { migrationSources } from "../platform/postgres/migrations.js";
 import { randomUUID } from "node:crypto";
 import { AbandonErasureHandler, EraseBankHandler, type ErasureRequest, generateApiKey, hashApiKey, PgAccessRevocation, PgApiKeyStore, PgAuditLog, PgErasureRequestRepository, PgErasureUnitOfWork, PgPrincipalRepository, resolveScope, scopeAccessPolicy, VerifyReceiptHandler, type ErasableStore, type Grant } from "../governance/index.js";
 import { sha256 } from "../platform/hash.js";
-import { createBank, PgBankRepository, PgEpisodeRepository, PgFactRepository, PgMemoryErasure, PgOutboxRelay, PgUnitOfWork, RecordEpisodeHandler } from "../memory/index.js";
+import { createBank, PgBankRepository, PgEpisodeRepository, PgFactRepository, PgMemoryErasure, PgOutboxRelay, PgUnitOfWork, RecordEpisodeHandler, switchEngine } from "../memory/index.js";
 import { EXPORT_FORMATS, ExportBankHandler, ExportsErasableStore, ImportDocumentsHandler, PgExportStore, readClaudeCodeMemory, type ExportFormat } from "../portability/index.js";
 import { ExtractionErasableStore, parseModelSpec, PgExtractionRunStore } from "../extraction/index.js";
 import { assertPinnableDimensions, embedderFromEnv, embeddingDimensionsFromEnv, engineFromEnv, engineNameFromEnv, EngineErasableStore, foreignRows, PgvectorEngine, pinIndexDimensions, readPinnedIndex, type Embedder, type RetrievalEngine } from "../retrieval/index.js";
@@ -27,7 +27,7 @@ import { assertPinnableDimensions, embedderFromEnv, embeddingDimensionsFromEnv, 
  *   npm run admin -- extraction-status [--bank bank-vangelis]   # queue counts; with --bank also the bank's extraction token spend
  *   npm run admin -- requeue-extraction
  *   npm run admin -- pin-dimensions [--yes]              # once per database: type the index column to EMBEDDING_DIMENSIONS and build the HNSW index (locks the table; stop the server on a large index)
- *   npm run admin -- reindex --bank bank-vangelis        # after changing EMBEDDER
+ *   npm run admin -- reindex --bank bank-vangelis        # after changing EMBEDDER, or to move the bank to this shell's ENGINE (purges the previous engine's copy first; needs the previous engine's *_BASE_URL / *_API_KEY still set; restart the server with the new ENGINE right after)
  *   npm run admin -- export --bank bank-vangelis --out exports/bank-vangelis.jsonl [--format jsonl|markdown]
  *   npm run admin -- import-claude-code --bank bank-vangelis --dir ~/.claude/projects/<project>/memory
  *   npm run admin -- render-import --bank bank-vangelis --target claude|gemini [--out <path>]
@@ -40,7 +40,8 @@ import { assertPinnableDimensions, embedderFromEnv, embeddingDimensionsFromEnv, 
  * bank); exports are recorded in portability.exports and audited like any other read.
  * Erasure is different: it acts as a named principal that must hold `erase` (or `admin`) on the
  * bank, so the audit chain records who asked, and the CLI cannot bypass the policy the REST
- * attachment applies. It is synchronous and irreversible (hence --yes); the receipt digest is printed at
+ * attachment applies. ENGINE must name the engine the bank records (the one that holds its index):
+ * the CLI refuses early, and the workflow refuses again before and under the freeze. It is synchronous and irreversible (hence --yes); the receipt digest is printed at
  * the end. Erasure also removes every grant on the bank and revokes the API keys of principals that
  * held grants on no other bank (the requesting principal included, if it was dedicated to the bank);
  * that store runs last, so a data-store failure leaves the requester able to retry. If the request
@@ -124,9 +125,10 @@ try {
     case "create-bank": {
       const id = asBankId(need("id"));
       if (await banks.get(id)) die(`bank ${id} already exists; refusing to modify it`);
-      const bank = createBank(id, asTenantId(need("tenant")), asSubjectId(need("subject")), new Date());
+      // The bank records which engine holds its index (this shell's ENGINE, the server's); `reindex` moves it, erasure checks it.
+      const bank = createBank(id, asTenantId(need("tenant")), asSubjectId(need("subject")), new Date(), {}, engineNameFromEnv());
       await banks.create(bank);
-      console.log(`bank ${bank.id} created for subject ${bank.subjectId} in tenant ${bank.tenantId}`);
+      console.log(`bank ${bank.id} created for subject ${bank.subjectId} in tenant ${bank.tenantId}; retrieval engine ${bank.engine}`);
       break;
     }
     case "create-principal": {
@@ -228,12 +230,35 @@ try {
         const dims = engine.embedderDimensions ?? embeddingDimensionsFromEnv();
         if (pinned && pinned.dimensions !== dims) die(`index is pinned to ${pinned.dimensions} dimensions but ${engine.embedderId} is configured for ${dims}; run \`admin pin-dimensions --yes\` first (it deletes the rows of the previous embedder), then reindex every bank`);
       }
-      const scope = { tenantId: bank.tenantId, bankId, principalId: asPrincipalId("system:admin"), capabilities: new Set<Capability>(["admin"]) };
+      if (bank.status === "erased") die(`bank ${bankId} is erased; there is nothing to rebuild`);
+      if (bank.status === "erasing") die(`bank ${bankId} is being erased; nothing to rebuild until it is erased (an abandoned erasure leaves it erasing: run erase-bank again)`);
+      const previous = bank.engine !== engine.name ? engineFromEnv(pool, noEmbedder, { ...process.env, ENGINE: bank.engine }) : undefined;
+      if (previous) {
+        // Moving a bank between engines: purge the copy the bank leaves behind first (otherwise an erasure, which purges
+        // only the recorded engine, could miss it), record the new engine under the row lock (so a freeze that landed
+        // meanwhile is seen, not overwritten), then rebuild. A crash after the record leaves a bank that says "new engine"
+        // with a partial index there and nothing in the old one; re-running reindex finishes it.
+        const purged = await previous.purgeBank(bankId);
+        if (purged.remaining > 0) die(`${purged.remaining} row(s) of ${bankId} remain in ${previous.name} after purge (for Honcho: its deriver may still be deleting; retry); refusing to switch engines`);
+        await withTransaction(pool, async (client) => {
+          const locked = new PgBankRepository(client);
+          const fresh = (await locked.get(bankId, { lock: "update" })) ?? die(`bank ${bankId} vanished`);
+          if (fresh.status !== "active" && fresh.status !== "frozen") die(`bank ${bankId} became ${fresh.status} during the move: an erasure owns it now; nothing more to do (its ${previous.name} copy is already purged, which the erasure re-counts as zero)`);
+          await locked.update(switchEngine(fresh, engine.name));
+        });
+        console.log(`moved ${bankId} from ${previous.name} (${purged.deleted} row(s) purged) to ${engine.name}`);
+      }
+      const scope = adminScope(bankId, bank.tenantId);
       const facts = await new PgFactRepository(pool).listAll(scope);
       const episodes = await new PgEpisodeRepository(pool).listByBank(scope, { limit: 1_000_000 });
       const started = Date.now();
       await engine.rebuild(bankId, iterate(facts), iterate(episodes));
       console.log(`reindexed ${bankId} in ${engine.name}${engine instanceof PgvectorEngine ? ` with ${engine.embedderId}` : ""}: ${facts.length} facts, ${episodes.length} episodes in ${Date.now() - started} ms`);
+      if (previous) {
+        // A server still running the previous engine keeps projecting into it; those rows would survive the bank's erasure.
+        const reappeared = await previous.countBank(bankId);
+        if (reappeared > 0) die(`${reappeared} row(s) of ${bankId} reappeared in ${previous.name} during the rebuild: a server with ENGINE=${previous.name} is still writing. Restart it with ENGINE=${engine.name}, then run reindex again`);
+      }
       if (engine instanceof PgvectorEngine) {
         const remaining = await engine.staleRowCount(bankId);
         if (remaining > 0) console.warn(`${remaining} row(s) from another embedder appeared during the rebuild: a server with a different EMBEDDER is still writing. Restart it with the same .env.`);
@@ -296,12 +321,14 @@ try {
       const principalId = asPrincipalId(need("principal"));
       const principal = (await principals.get(principalId)) ?? die(`principal ${principalId} not found`);
       const scope = resolveScope(principal, bankId, new Date()) ?? die(`principal ${principalId} has no live grant on ${bankId}`);
-      // The retrieval store purged is whichever ENGINE this shell names; a server running another engine keeps its copy.
+      // The bank records the engine that holds its index; this shell's ENGINE must name the same one (the handler refuses otherwise).
+      const shellEngine = engineNameFromEnv();
+      if (bank.engine !== shellEngine) die(`bank ${bankId} records its index in engine "${bank.engine}" but ENGINE is "${shellEngine}"; set ENGINE=${bank.engine} (with that engine's URL and key) so the erasure purges the store that actually holds the bank`);
       const retrieval = engineFromEnv(pool, noEmbedder);
       if (!values.yes) die(`erase-bank deletes every fact, episode, retrieval row (engine: ${retrieval.name}), extraction run and export record of ${bankId} (subject ${bank.subjectId}), removes every grant on it and revokes the keys of principals granted on it alone; it cannot be undone; re-run with --yes`);
       const memoryErasure = new PgMemoryErasure(pool);
       const handler = new EraseBankHandler(scopeAccessPolicy, memoryErasure, new PgErasureUnitOfWork(pool), erasableStores(pool, memoryErasure, retrieval), systemClock, randomUUID, sha256);
-      console.error(`erasing bank ${bankId} (subject ${bank.subjectId}) as ${principalId}; retrieval engine ${retrieval.name} (set ENGINE to match the server's)`);
+      console.error(`erasing bank ${bankId} (subject ${bank.subjectId}) as ${principalId}; retrieval engine ${retrieval.name} (the one the bank records)`);
       const r = await handler.handle(scope, bankId);
       const request = r.ok ? r.value : die(`erasure refused: ${r.error.kind}`);
       printErasure(request);
@@ -314,8 +341,14 @@ try {
       break;
     }
     case "verify-receipt": {
-      // Same store list as erase-bank, so a store the receipt names is re-queried by the adapter that purged it.
-      const retrieval = engineFromEnv(pool, noEmbedder);
+      // Same store list as erase-bank, with the engine the receipt itself names (`retrieval.<engine>`), so the store the
+      // receipt lists is re-queried by the adapter that purged it even if the bank was moved since; a receipt without such
+      // a store falls back to the bank's recorded engine, then to this shell's ENGINE (the bank row is a tombstone that
+      // only hand-written SQL removes).
+      const requestRow = (await new PgErasureRequestRepository(pool).get(need("id"))) ?? die(`erasure request ${values.id} not found`);
+      const receiptedEngine = requestRow.receipt?.stores.map((s) => /^retrieval\.(.+)$/.exec(s.store)?.[1]).find((e) => e !== undefined);
+      const engineName = receiptedEngine ?? (await banks.get(requestRow.bankId))?.engine ?? engineNameFromEnv();
+      const retrieval = engineFromEnv(pool, noEmbedder, { ...process.env, ENGINE: engineName });
       const handler = new VerifyReceiptHandler(new PgErasureRequestRepository(pool), new PgAuditLog(pool), erasableStores(pool, new PgMemoryErasure(pool), retrieval), sha256);
       const r = await handler.handle(need("id"));
       const v = r.ok

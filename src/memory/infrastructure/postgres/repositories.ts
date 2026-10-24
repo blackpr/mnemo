@@ -29,18 +29,19 @@ export class PgBankRepository implements BankRepository {
 
   async create(bank: Bank): Promise<void> {
     await this.db.query(
-      `INSERT INTO memory.banks (id, tenant_id, subject_id, status, policy, created_at) VALUES ($1, $2, $3, $4, $5, $6)`,
-      [bank.id, bank.tenantId, bank.subjectId, bank.status, JSON.stringify(bank.policy), bank.createdAt],
+      `INSERT INTO memory.banks (id, tenant_id, subject_id, status, policy, engine, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [bank.id, bank.tenantId, bank.subjectId, bank.status, JSON.stringify(bank.policy), bank.engine, bank.createdAt],
     );
   }
 
   async update(bank: Bank): Promise<void> {
-    const r = await this.db.query("UPDATE memory.banks SET status = $2, policy = $3 WHERE id = $1 AND tenant_id = $4 AND subject_id = $5", [
+    const r = await this.db.query("UPDATE memory.banks SET status = $2, policy = $3, engine = $6 WHERE id = $1 AND tenant_id = $4 AND subject_id = $5", [
       bank.id,
       bank.status,
       JSON.stringify(bank.policy),
       bank.tenantId,
       bank.subjectId,
+      bank.engine,
     ]);
     if (r.rowCount === 0) throw new Error(`Bank ${bank.id} not found (or tenant/subject mismatch)`);
   }
