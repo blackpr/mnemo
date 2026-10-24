@@ -14,10 +14,17 @@ export type EngineName = (typeof ENGINE_NAMES)[number];
  * (HINDSIGHT_BASE_URL, HINDSIGHT_API_KEY) or `honcho` (HONCHO_BASE_URL, HONCHO_API_KEY). The two
  * external engines embed on their own side, so the embedder (or its factory, which is then never
  * called) is only used for pgvector. Optional ENGINE_NAMESPACE (default `mem-`) prefixes the bank /
- * workspace names inside the engine.
+ * workspace names inside the engine. `engineNameFromEnv` is the validated name alone, for callers
+ * that record or compare it without needing the adapter's URLs or keys.
  */
-export function engineFromEnv(db: Queryable, embedder: Embedder | (() => Embedder), env: NodeJS.ProcessEnv = process.env): RetrievalEngine {
+export function engineNameFromEnv(env: NodeJS.ProcessEnv = process.env): EngineName {
   const name = env.ENGINE ?? "pgvector";
+  if (!(ENGINE_NAMES as readonly string[]).includes(name)) throw new Error(`ENGINE must be one of ${ENGINE_NAMES.join(", ")}; got "${name}"`);
+  return name as EngineName;
+}
+
+export function engineFromEnv(db: Queryable, embedder: Embedder | (() => Embedder), env: NodeJS.ProcessEnv = process.env): RetrievalEngine {
+  const name = engineNameFromEnv(env);
   const prefix = env.ENGINE_NAMESPACE ?? "mem-";
   switch (name) {
     case "pgvector":
@@ -26,8 +33,6 @@ export function engineFromEnv(db: Queryable, embedder: Embedder | (() => Embedde
       return new HindsightEngine({ baseUrl: required(env, "HINDSIGHT_BASE_URL"), bankPrefix: prefix, ...optional(env, "HINDSIGHT_API_KEY", "apiKey") });
     case "honcho":
       return new HonchoEngine({ baseUrl: required(env, "HONCHO_BASE_URL"), workspacePrefix: prefix, ...optional(env, "HONCHO_API_KEY", "apiKey") });
-    default:
-      throw new Error(`ENGINE must be one of ${ENGINE_NAMES.join(", ")}; got "${name}"`);
   }
 }
 

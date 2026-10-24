@@ -12,7 +12,18 @@ export type Pool = pg.Pool;
 export type PoolClient = pg.PoolClient;
 
 export function createPool(connectionString: string, max = 10): pg.Pool {
-  return new pg.Pool({ connectionString, max });
+  const pool = new pg.Pool({ connectionString, max });
+  // pgvector (>= 0.8): with an HNSW index, a filtered nearest-neighbour query (recall filters by bank,
+  // embedder, kind, retraction and validity after the index scan) would otherwise stop at the first
+  // hnsw.ef_search candidates and return fewer rows than exist. Iterative scans keep walking the graph
+  // until LIMIT is met (bounded by hnsw.max_scan_tuples, default 20000). Set per connection: it needs
+  // no privilege, applies to every session of this process, and on a database without pgvector it is
+  // an inert placeholder GUC. `relaxed_order` may return rows slightly out of distance order; the
+  // pgvector engine sorts its hits.
+  pool.on("connect", (client) => {
+    client.query("SET hnsw.iterative_scan = relaxed_order").catch((e: unknown) => console.error("pool: could not set hnsw.iterative_scan", e));
+  });
+  return pool;
 }
 
 /** Run `work` inside BEGIN/COMMIT; ROLLBACK on throw. */

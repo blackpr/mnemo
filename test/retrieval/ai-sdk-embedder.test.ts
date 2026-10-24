@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MockEmbeddingModelV3 } from "ai/test";
-import { AiSdkEmbedder, embedderFromEnv, HashingEmbedder, resolveEmbeddingModel } from "../../src/retrieval/index.js";
+import { AiSdkEmbedder, DEFAULT_EMBEDDING_DIMENSIONS, embedderFromEnv, embeddingDimensionsFromEnv, HashingEmbedder, resolveEmbeddingModel } from "../../src/retrieval/index.js";
 
 const mock = (dims: number, perCall = 100) =>
   new MockEmbeddingModelV3({
@@ -55,6 +55,12 @@ describe("AiSdkEmbedder", () => {
     expect(() => embedderFromEnv({ EMBEDDER: "openai:text-embedding-3-small" })).toThrow(/OPENAI_API_KEY/);
     expect(() => embedderFromEnv({ EMBEDDER: "google:gemini-embedding-001" })).toThrow(/GOOGLE_GENERATIVE_AI_API_KEY/);
     expect(() => embedderFromEnv({ EMBEDDER: "hashing", EMBEDDING_DIMENSIONS: "abc" })).toThrow(/positive integer/);
+    // The width defaults to the pinned default, for the pin and for the hashing double alike; providers keep their native id.
+    expect(embeddingDimensionsFromEnv({})).toBe(DEFAULT_EMBEDDING_DIMENSIONS);
+    expect(embeddingDimensionsFromEnv({ EMBEDDING_DIMENSIONS: "768" })).toBe(768);
+    expect(() => embeddingDimensionsFromEnv({ EMBEDDING_DIMENSIONS: "-1" })).toThrow(/positive integer/);
+    expect(embedderFromEnv({ EMBEDDER: "hashing" }).dimensions).toBe(1536);
+    expect(embedderFromEnv({ EMBEDDER: "openai:text-embedding-3-small", OPENAI_API_KEY: "test" }).id).toBe("openai/text-embedding-3-small@native");
   });
 
   // Paid call: only with an explicit opt-in (npm run test:live) and a key.

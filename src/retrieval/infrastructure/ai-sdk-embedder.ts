@@ -97,15 +97,29 @@ export class AiSdkEmbedder implements Embedder {
   }
 }
 
+/** The width the pgvector index is pinned to when EMBEDDING_DIMENSIONS is unset: openai:text-embedding-3-small's native size. */
+export const DEFAULT_EMBEDDING_DIMENSIONS = 1536;
+
+/**
+ * The dimensionality every embedder must produce and the index column is pinned to
+ * (`admin pin-dimensions`). EMBEDDING_DIMENSIONS, default 1536. When set explicitly it is also
+ * requested from providers that support reduction and becomes part of the embedder id.
+ */
+export function embeddingDimensionsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  return positiveInt(env.EMBEDDING_DIMENSIONS, "EMBEDDING_DIMENSIONS") ?? DEFAULT_EMBEDDING_DIMENSIONS;
+}
+
 /**
  * Builds the configured Embedder. `spec` is "provider:model" or "hashing" (the offline test
- * double). `EMBEDDING_DIMENSIONS` is optional.
+ * double). `EMBEDDING_DIMENSIONS` is optional for providers (unset means the model's native width,
+ * expected to be DEFAULT_EMBEDDING_DIMENSIONS; the boot probe checks); the hashing embedder always
+ * produces the configured width so it boots against a pinned index without extra configuration.
  */
 export function embedderFromEnv(env: NodeJS.ProcessEnv = process.env): Embedder {
   const spec = env.EMBEDDER ?? "openai:text-embedding-3-small";
   const dims = positiveInt(env.EMBEDDING_DIMENSIONS, "EMBEDDING_DIMENSIONS");
   const timeoutMs = positiveInt(env.EMBEDDER_TIMEOUT_MS, "EMBEDDER_TIMEOUT_MS");
-  if (spec === "hashing") return new HashingEmbedder(dims ?? 256);
+  if (spec === "hashing") return new HashingEmbedder(dims ?? DEFAULT_EMBEDDING_DIMENSIONS);
   const ref = parseModelSpec(spec);
   return new AiSdkEmbedder(ref.provider, ref.model, {
     embeddingModel: resolveEmbeddingModel(ref.provider, ref.model, env),

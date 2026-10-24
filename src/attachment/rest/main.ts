@@ -5,7 +5,7 @@ import { migrate } from "../../platform/postgres/migrator.js";
 import { migrationSources } from "../../platform/postgres/migrations.js";
 import { PgAuditLog, PgErasureRequestRepository, PgErasureUnitOfWork, PgPrincipalRepository, ScopeResolver, scopeAccessPolicy } from "../../governance/index.js";
 import { PgBankRepository, PgEpisodeRepository, PgFactRepository, PgMemoryErasure, PgOutboxRelay, PgUnitOfWork, WriteExtractedFactsHandler } from "../../memory/index.js";
-import { embedderFromEnv, engineFromEnv, EngineErasableStore, EngineMemoryFinder, IndexingProjector, PgvectorEngine } from "../../retrieval/index.js";
+import { embedderFromEnv, embeddingDimensionsFromEnv, engineFromEnv, EngineErasableStore, EngineMemoryFinder, IndexingProjector, PgvectorEngine, readPinnedIndex } from "../../retrieval/index.js";
 import { AiSdkLlmClient, ExtractionErasableStore, LlmExtractor, PgExtractionRunStore, RetainPipeline, type Extractor } from "../../extraction/index.js";
 import { ExportsErasableStore, PgExportStore } from "../../portability/index.js";
 import { createApp } from "./app.js";
@@ -20,9 +20,11 @@ import { createApp } from "./app.js";
  * SHUTDOWN_TIMEOUT_MS (default 10000), plus the provider keys the configured extractor models
  * need (ANTHROPIC_API_KEY, GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY,
  * OPENAI_COMPATIBLE_BASE_URL). EMBEDDER selects the embedding model ("provider:model", default
- * openai:text-embedding-3-small; "hashing" for the offline test double), EMBEDDING_DIMENSIONS and
- * EMBEDDER_TIMEOUT_MS are optional. Changing the embedder requires `admin reindex --bank <id>` for
- * existing banks and a server restart (the server keeps the embedder it booted with). ENGINE selects
+ * openai:text-embedding-3-small; "hashing" for the offline test double); EMBEDDING_DIMENSIONS (default
+ * 1536) is the width the embedder must produce and the pgvector index is pinned to (`admin
+ * pin-dimensions`): the boot probe refuses to start on a mismatch with either. EMBEDDER_TIMEOUT_MS is
+ * optional. Changing the embedder requires `admin reindex --bank <id>` for existing banks and a
+ * server restart (the server keeps the embedder it booted with). ENGINE selects
  * the retrieval engine ("pgvector" default, "hindsight" with HINDSIGHT_BASE_URL / HINDSIGHT_API_KEY,
  * "honcho" with HONCHO_BASE_URL / HONCHO_API_KEY; see src/retrieval/infrastructure/README.md);
  * switching engines also needs `admin reindex --bank <id>` since each engine holds its own derived state.
@@ -45,8 +47,23 @@ await migrate(pool, migrationSources);
 // The embedder is pgvector's; the external engines embed on their side, so it is neither built nor probed for them.
 const engine = engineFromEnv(pool, embedderFromEnv);
 if (engine instanceof PgvectorEngine) {
+  // The width is pinned twice: by EMBEDDING_DIMENSIONS and, once `admin pin-dimensions` ran, by the index
+  // column. A mismatch with either would dead-letter every projection (or recall against the wrong space).
+  // The pin is checked first so a plain misconfiguration is refused without a provider call.
+  const expectedDims = embeddingDimensionsFromEnv();
+  const pinned = await readPinnedIndex(pool);
+  if (pinned && pinned.dimensions !== expectedDims) {
+    console.error(`retrieval index is pinned to ${pinned.dimensions} dimensions (embedder ${pinned.embedder}) but EMBEDDING_DIMENSIONS is ${expectedDims}; run \`npm run admin -- pin-dimensions\` to re-pin (it deletes rows from other embedders) and \`admin reindex --bank <id>\` for every bank, refusing to start`);
+    process.exit(1);
+  }
   // One tiny call at boot: fail fast on a bad key or model instead of dead-lettering every event later.
   await engine.probeEmbedder();
+  if (engine.embedderDimensions !== expectedDims) {
+    console.error(`EMBEDDER ${engine.embedderId} produces ${engine.embedderDimensions ?? "?"} dimensions but EMBEDDING_DIMENSIONS is ${expectedDims} (default 1536); set EMBEDDING_DIMENSIONS=${engine.embedderDimensions ?? "<width>"}, which changes the embedder id, then \`admin pin-dimensions --yes\` and \`admin reindex --bank <id>\` for every bank; refusing to start`);
+    process.exit(1);
+  }
+  if (!pinned) console.warn("retrieval index is not pinned yet (untyped column, no HNSW index): run `npm run admin -- pin-dimensions` once");
+  else if (pinned.embedder !== engine.embedderId) console.warn(`retrieval index was pinned for embedder "${pinned.embedder}", the server runs "${engine.embedderId}" (same width); run \`npm run admin -- pin-dimensions\` and \`admin reindex --bank <id>\` for affected banks`);
   for (const f of await engine.foreignEmbedders()) {
     console.warn(`index has ${f.rows} row(s) from embedder "${f.embedder}" that recall ignores; run \`npm run admin -- reindex --bank <id>\` for affected banks`);
   }

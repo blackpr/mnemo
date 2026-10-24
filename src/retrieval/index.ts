@@ -5,6 +5,7 @@ export * from "./application/indexing-projector.js";
 export * from "./infrastructure/hashing-embedder.js";
 export * from "./infrastructure/ai-sdk-embedder.js";
 export * from "./infrastructure/pgvector/pgvector-engine.js";
+export * from "./infrastructure/pgvector/pin-dimensions.js";
 export * from "./application/engine-erasable-store.js";
 export * from "./infrastructure/hindsight/hindsight-engine.js";
 export * from "./infrastructure/honcho/honcho-engine.js";

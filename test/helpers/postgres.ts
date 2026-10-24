@@ -3,6 +3,7 @@ import type pg from "pg";
 import { createPool } from "../../src/platform/postgres/pool.js";
 import { migrate } from "../../src/platform/postgres/migrator.js";
 import { migrationSources } from "../../src/platform/postgres/migrations.js";
+import { HNSW_INDEX_NAME } from "../../src/retrieval/infrastructure/pgvector/pin-dimensions.js";
 
 /**
  * Database-backed tests run only when TEST_DATABASE_URL is set (see .env.example and
@@ -25,6 +26,11 @@ export async function setupTestDb(): Promise<TestDb> {
   if (!databaseUrl) throw new Error("TEST_DATABASE_URL not set");
   const pool = createPool(databaseUrl, 4);
   await migrate(pool, migrationSources);
+  // The pin suite types the shared embedding column; the other suites mix 64- and 256-dimension rows and need it
+  // untyped. Undo any pin a crashed run left behind, so no suite depends on another's cleanup.
+  await pool.query(`DROP INDEX IF EXISTS retrieval.${HNSW_INDEX_NAME}`);
+  await pool.query("ALTER TABLE retrieval.pgvector_index ALTER COLUMN embedding TYPE vector");
+  await pool.query("DELETE FROM retrieval.settings");
   return {
     pool,
     async truncateAll() {

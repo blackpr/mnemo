@@ -11,7 +11,7 @@ import { sha256 } from "../platform/hash.js";
 import { createBank, PgBankRepository, PgEpisodeRepository, PgFactRepository, PgMemoryErasure, PgOutboxRelay, PgUnitOfWork, RecordEpisodeHandler } from "../memory/index.js";
 import { EXPORT_FORMATS, ExportBankHandler, ExportsErasableStore, ImportDocumentsHandler, PgExportStore, readClaudeCodeMemory, type ExportFormat } from "../portability/index.js";
 import { ExtractionErasableStore, parseModelSpec, PgExtractionRunStore } from "../extraction/index.js";
-import { embedderFromEnv, engineFromEnv, EngineErasableStore, PgvectorEngine, type Embedder } from "../retrieval/index.js";
+import { assertPinnableDimensions, embedderFromEnv, embeddingDimensionsFromEnv, engineFromEnv, engineNameFromEnv, EngineErasableStore, foreignRows, PgvectorEngine, pinIndexDimensions, readPinnedIndex, type Embedder } from "../retrieval/index.js";
 
 /**
  * Bootstrap CLI. Creates the records the REST attachment needs before a first request:
@@ -26,6 +26,7 @@ import { embedderFromEnv, engineFromEnv, EngineErasableStore, PgvectorEngine, ty
  *   npm run admin -- clear-extractor --bank bank-vangelis
  *   npm run admin -- extraction-status [--bank bank-vangelis]   # queue counts; with --bank also the bank's extraction token spend
  *   npm run admin -- requeue-extraction
+ *   npm run admin -- pin-dimensions [--yes]              # once per database: type the index column to EMBEDDING_DIMENSIONS and build the HNSW index (locks the table; stop the server on a large index)
  *   npm run admin -- reindex --bank bank-vangelis        # after changing EMBEDDER
  *   npm run admin -- export --bank bank-vangelis --out exports/bank-vangelis.jsonl [--format jsonl|markdown]
  *   npm run admin -- import-claude-code --bank bank-vangelis --dir ~/.claude/projects/<project>/memory
@@ -176,10 +177,46 @@ try {
       console.log(`bank ${bankId} extraction disabled; existing facts untouched`);
       break;
     }
+    case "pin-dimensions": {
+      if (engineNameFromEnv() !== "pgvector") die(`pin-dimensions is for the pgvector engine; ENGINE is ${engineNameFromEnv()}`);
+      const embedder = embedderFromEnv();
+      const dims = embeddingDimensionsFromEnv();
+      try {
+        assertPinnableDimensions(dims);
+      } catch (e) {
+        die(e instanceof Error ? e.message : String(e));
+      }
+      const pinned = await readPinnedIndex(pool);
+      const foreign = await foreignRows(pool, embedder.id);
+      const own = Number((await pool.query<{ n: string }>("SELECT count(*)::text AS n FROM retrieval.pgvector_index WHERE embedder = $1", [embedder.id])).rows[0]?.n ?? 0);
+      if (embedder.dimensions === undefined && own === 0) {
+        // A provider embedder without EMBEDDING_DIMENSIONS and an index with no row of its own to measure: one
+        // embedding call establishes the width (otherwise the pin would trust the default and only boot would catch it).
+        console.warn(`embedder ${embedder.id} has no rows in the index yet; probing its width with one embedding call`);
+        await embedder.embed(["dimension probe"]);
+      }
+      if (embedder.dimensions !== undefined && embedder.dimensions !== dims) die(`embedder ${embedder.id} produces ${embedder.dimensions} dimensions but EMBEDDING_DIMENSIONS is ${dims}; set EMBEDDING_DIMENSIONS=${embedder.dimensions} (an embedder switch: pin again with --yes, then reindex every bank)`);
+      const foreignTotal = foreign.reduce((n, f) => n + f.rows, 0);
+      if (foreignTotal > 0 && !values.yes) {
+        die(`pinning to ${dims} dimensions for embedder ${embedder.id} deletes ${foreignTotal} index row(s) from other embedders (${foreign.map((f) => `${f.embedder}: ${f.rows}`).join(", ")}); they are derived state, rebuilt by \`admin reindex --bank <id>\`. Re-run with --yes`);
+      }
+      if (pinned && pinned.dimensions !== dims && !values.yes) die(`index is pinned to ${pinned.dimensions} dimensions (${pinned.embedder}); re-pinning to ${dims} retypes the column and rebuilds the index. Re-run with --yes`);
+      const started = Date.now();
+      const r = await pinIndexDimensions(pool, embedder.id, dims);
+      for (const f of r.deletedByEmbedder) console.log(`deleted ${f.rows} row(s) from embedder ${f.embedder}`);
+      console.log(`index pinned to vector(${dims}) for embedder ${embedder.id}: ${r.retypedColumn ? "column retyped" : "column already typed"}, HNSW index ${r.createdIndex ? "created" : "present"}, ${r.deletedForeignRows} foreign row(s) deleted, in ${Date.now() - started} ms`);
+      if (r.retypedColumn || r.deletedForeignRows > 0) console.log("restart the server (it checks the pin at boot); run `admin reindex --bank <id>` for banks whose rows were deleted");
+      break;
+    }
     case "reindex": {
       const bankId = asBankId(need("bank"));
       const bank = (await banks.get(bankId)) ?? die(`bank ${bankId} not found`);
       const engine = engineFromEnv(pool, embedderFromEnv);
+      if (engine instanceof PgvectorEngine) {
+        const pinned = await readPinnedIndex(pool);
+        const dims = engine.embedderDimensions ?? embeddingDimensionsFromEnv();
+        if (pinned && pinned.dimensions !== dims) die(`index is pinned to ${pinned.dimensions} dimensions but ${engine.embedderId} is configured for ${dims}; run \`admin pin-dimensions --yes\` first (it deletes the rows of the previous embedder), then reindex every bank`);
+      }
       const scope = { tenantId: bank.tenantId, bankId, principalId: asPrincipalId("system:admin"), capabilities: new Set<Capability>(["admin"]) };
       const facts = await new PgFactRepository(pool).listAll(scope);
       const episodes = await new PgEpisodeRepository(pool).listByBank(scope, { limit: 1_000_000 });
@@ -305,7 +342,7 @@ try {
       break;
     }
     default:
-      die("usage: admin <create-bank|create-principal|grant|issue-key|revoke-key|set-extractor|clear-extractor|reindex|export|import-claude-code|render-import|erase-bank|erasure-status|erasure-abandon|extraction-status|requeue-extraction|requeue-dead-letters> [options]");
+      die("usage: admin <create-bank|create-principal|grant|issue-key|revoke-key|set-extractor|clear-extractor|pin-dimensions|reindex|export|import-claude-code|render-import|erase-bank|erasure-status|erasure-abandon|extraction-status|requeue-extraction|requeue-dead-letters> [options]");
   }
 } finally {
   await pool.end();

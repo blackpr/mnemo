@@ -98,11 +98,10 @@ export class PgvectorEngine implements RetrievalEngine {
        LIMIT $5`,
       [toVectorLiteral(qvec ?? []), scope.bankId, kinds, options.asOf ?? null, options.limit, this.embedder.id],
     );
-    return rows.map((r) =>
-      r.kind === "fact"
-        ? { factId: r.ref_id as FactId, score: Number(r.score) }
-        : { episodeId: r.ref_id as EpisodeId, score: Number(r.score) },
-    );
+    // hnsw.iterative_scan = relaxed_order (set per connection in createPool) may hand rows back slightly out of distance order.
+    return rows
+      .map((r) => (r.kind === "fact" ? { factId: r.ref_id as FactId, score: Number(r.score) } : { episodeId: r.ref_id as EpisodeId, score: Number(r.score) }))
+      .sort((a, b) => b.score - a.score);
   }
 
   async countBank(bankId: BankId): Promise<number> {

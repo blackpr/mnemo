@@ -4,8 +4,8 @@
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE SCHEMA IF NOT EXISTS retrieval;
 
--- The embedding column has no fixed dimension yet: the embedder is chosen in the spike.
--- Once fixed, a later migration alters the column to vector(N) and adds an HNSW index.
+-- The embedding column starts without a fixed dimension: the embedder was chosen in the spike.
+-- `admin pin-dimensions` (not a migration; see 0002_settings.sql) types it to vector(N) and adds the HNSW index.
 CREATE TABLE retrieval.pgvector_index (
   bank_id     text NOT NULL,
   kind        text NOT NULL CHECK (kind IN ('fact', 'episode')),

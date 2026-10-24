@@ -6,7 +6,8 @@ import { episodeFixture, factFixture, fromArray, scopeFor } from "../helpers/fix
 /**
  * Contract every RetrievalEngine adapter must satisfy (pgvector, Hindsight, Honcho).
  * Call inside a describe() that provides a fresh engine per test via `make()`.
- * Engines hold derived state: nothing here touches memory.* tables.
+ * Engines hold derived state: nothing here touches memory.* tables. Hits are expected best first: an
+ * engine whose store returns approximate order (pgvector's relaxed iterative scans) sorts them itself.
  */
 export function retrievalEngineContract(make: () => Promise<RetrievalEngine> | RetrievalEngine): void {
   const bankA = asBankId("bank-a");
