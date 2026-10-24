@@ -31,25 +31,29 @@ import { assertPinnableDimensions, embedderFromEnv, embeddingDimensionsFromEnv, 
  *   npm run admin -- export --bank bank-vangelis --out exports/bank-vangelis.jsonl [--format jsonl|markdown]
  *   npm run admin -- import-claude-code --bank bank-vangelis --dir ~/.claude/projects/<project>/memory
  *   npm run admin -- render-import --bank bank-vangelis --target claude|gemini [--out <path>]
- *   npm run admin -- erase-bank --bank bank-vangelis --principal vangelis --yes   # principal needs the erase capability
+ *   npm run admin -- erase-bank --bank bank-vangelis --principal vangelis --yes [--no-wait]   # principal needs the erase capability; the server's worker runs it
  *   npm run admin -- erasure-status --id <request id>
  *   npm run admin -- verify-receipt --id <request id>     # recompute the digest and re-query every store; exit 1 on any failure
- *   npm run admin -- erasure-abandon --id <request id> --reason "worker died mid-purge" [--force]   # unblock a stuck request
+ *   npm run admin -- erasure-abandon --id <request id> --reason "no server will run it" [--force]   # give up on a stuck request (a dead pass is retaken by the server on its own)
  *
  * Portability commands act as the internal principal "system:admin" (admin capability on the
  * bank); exports are recorded in portability.exports and audited like any other read.
  * Erasure is different: it acts as a named principal that must hold `erase` (or `admin`) on the
  * bank, so the audit chain records who asked, and the CLI cannot bypass the policy the REST
  * attachment applies. ENGINE must name the engine the bank records (the one that holds its index):
- * the CLI refuses early, and the workflow refuses again before and under the freeze. It is synchronous and irreversible (hence --yes); the receipt digest is printed at
- * the end. Erasure also removes every grant on the bank and revokes the API keys of principals that
+ * the CLI refuses early, and the workflow refuses again before and under the freeze. It is irreversible (hence --yes). The
+ * command only enqueues the request (audit entry first); the erasure worker in the running server (`npm start`) claims
+ * it and runs the workflow, and the command polls the record until it is receipted or failed and prints it (the
+ * receipt digest at the end). With --no-wait it prints the request id and returns; `erasure-status --id` shows where it
+ * stands. Without a running server the request stays queued until one starts. Erasure also removes every grant on the bank and revokes the API keys of principals that
  * held grants on no other bank (the requesting principal included, if it was dedicated to the bank);
  * that store runs last, so a data-store failure leaves the requester able to retry. If the request
  * failed after access was removed (re-count failure), `grant --caps erase` again and retry; `grant`
- * refuses `erased` banks but allows `erasing` ones for exactly this. `erasure-abandon` is the recovery
- * path for a request left non-terminal by a crash: it marks it failed (as "system:admin", audited) so
- * the bank can be erased again; it deletes nothing, and refuses a request whose row changed in the last
- * 10 minutes (presumed still running) unless --force is given. `verify-receipt` is the after-the-fact check of a
+ * refuses `erased` banks but allows `erasing` ones for exactly this. A worker pass that dies mid-workflow is
+ * retaken by the server after ERASURE_STALE_MS and finished from where it stopped; `erasure-abandon` is for a
+ * request no server will finish (none running, or the worker gave up on it after repeated stale claims and it is
+ * still blocking the bank): it marks it failed (as "system:admin", audited) so the bank can be erased again; it
+ * deletes nothing, and refuses a request whose row changed within the stale window (presumed still running) unless --force is given. `verify-receipt` is the after-the-fact check of a
  * receipt: digest recomputed over the stored receipt, receipt checked against its row and against the tenant's
  * audit chain (the tamper evidence; the digest alone is an unkeyed hash beside its payload), every store (the
  * same list erase-bank purges) asked again what it holds for the bank, pass or fail per line and overall; it
@@ -91,6 +95,7 @@ const { values } = parseArgs({
     reason: { type: "string" },
     yes: { type: "boolean", default: false },
     force: { type: "boolean", default: false },
+    "no-wait": { type: "boolean", default: false },
   },
 });
 
@@ -327,10 +332,35 @@ try {
       const retrieval = engineFromEnv(pool, noEmbedder);
       if (!values.yes) die(`erase-bank deletes every fact, episode, retrieval row (engine: ${retrieval.name}), extraction run and export record of ${bankId} (subject ${bank.subjectId}), removes every grant on it and revokes the keys of principals granted on it alone; it cannot be undone; re-run with --yes`);
       const memoryErasure = new PgMemoryErasure(pool);
-      const handler = new EraseBankHandler(scopeAccessPolicy, memoryErasure, new PgErasureUnitOfWork(pool), erasableStores(pool, memoryErasure, retrieval), systemClock, randomUUID, sha256);
-      console.error(`erasing bank ${bankId} (subject ${bank.subjectId}) as ${principalId}; retrieval engine ${retrieval.name} (the one the bank records)`);
+      const requests = new PgErasureRequestRepository(pool);
+      const handler = new EraseBankHandler(scopeAccessPolicy, memoryErasure, new PgErasureUnitOfWork(pool), erasableStores(pool, memoryErasure, retrieval), systemClock, randomUUID);
+      console.error(`requesting erasure of bank ${bankId} (subject ${bank.subjectId}) as ${principalId}; retrieval engine ${retrieval.name} (the one the bank records)`);
       const r = await handler.handle(scope, bankId);
-      const request = r.ok ? r.value : die(`erasure refused: ${r.error.kind}`);
+      let request = r.ok ? r.value : die(`erasure refused: ${r.error.kind}`);
+      if (values["no-wait"]) {
+        console.log(`erasure ${request.id} queued (${request.state}); the server's erasure worker runs it; check with \`admin erasure-status --id ${request.id}\``);
+        break;
+      }
+      // The worker lives in the server process; poll the record until it lands a terminal state.
+      console.error(`erasure ${request.id} queued; waiting for the server's erasure worker (Ctrl-C leaves it queued; erasure-status --id ${request.id} shows it)`);
+      const started = Date.now();
+      let lastState = request.state;
+      let lastHint = started;
+      for (;;) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        request = (await requests.get(request.id)) ?? die(`erasure request ${request.id} disappeared`);
+        if (request.state !== lastState) {
+          console.error(`  ${request.state}`);
+          lastState = request.state;
+        }
+        if (request.state === "receipted" || request.state === "failed") break;
+        // Every landed step (a store's deletion, a claim) moves updated_at; warn only when nothing has moved for a while.
+        const quietFor = Date.now() - Math.max(lastHint, request.updatedAt?.getTime() ?? started);
+        if (quietFor > 30_000) {
+          console.error(`  still ${request.state} after ${Math.round((Date.now() - started) / 1000)} s with no step landed: is the server (\`npm start\`) running with ENGINE=${bank.engine}? A pass that died is retaken after ERASURE_STALE_MS (default 10 min)`);
+          lastHint = Date.now();
+        }
+      }
       printErasure(request);
       if (request.state !== "receipted") process.exitCode = 1;
       break;
@@ -376,11 +406,13 @@ try {
     case "erasure-abandon": {
       const requests = new PgErasureRequestRepository(pool);
       const request = (await requests.get(need("id"))) ?? die(`erasure request ${values.id} not found`);
-      const handler = new AbandonErasureHandler(scopeAccessPolicy, requests, new PgErasureUnitOfWork(pool), systemClock);
+      // "Still running" means a step landed or a pass claimed it within the worker's stale window (ERASURE_STALE_MS, the server's setting; default 10 min).
+      const staleMs = process.env.ERASURE_STALE_MS && /^[1-9]\d*$/.test(process.env.ERASURE_STALE_MS) ? Number(process.env.ERASURE_STALE_MS) : undefined;
+      const handler = new AbandonErasureHandler(scopeAccessPolicy, requests, new PgErasureUnitOfWork(pool), systemClock, staleMs);
       const r = await handler.handle(adminScope(request.bankId, request.tenantId), request.bankId, request.id, need("reason"), { force: values.force === true });
       if (!r.ok) {
         if (r.error.kind === "ErasureTerminal") die(`request is already ${r.error.state}; nothing to abandon`);
-        if (r.error.kind === "ErasureStillRunning") die(`request changed at ${r.error.updatedAt.toISOString()}, less than ${r.error.staleAfterMs / 60_000} min ago: it may still be running. Re-run with --force only if you are sure its process is gone`);
+        if (r.error.kind === "ErasureStillRunning") die(`request changed at ${r.error.updatedAt.toISOString()}, less than ${r.error.staleAfterMs / 60_000} min ago: a worker pass may still be running it (and a dead pass is retaken by the server on its own). Re-run with --force only if you are sure no server will finish it`);
         die(`abandon refused: ${r.error.kind}`);
       } else printErasure(r.value);
       const status = (await banks.get(request.bankId))?.status ?? "missing";

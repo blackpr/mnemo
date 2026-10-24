@@ -49,11 +49,42 @@ export class ErasureNotInFlightError extends Error {
   }
 }
 
+/** Thrown by ErasureRequestRepository.save when the row is still in flight but another worker pass has claimed it since (this pass went stale and was retaken). */
+export class ErasureClaimLostError extends Error {
+  constructor(readonly requestId: string) {
+    super(`Erasure request ${requestId} was claimed by another worker pass`);
+    this.name = "ErasureClaimLostError";
+  }
+}
+
+/**
+ * One worker pass's hold on an in-flight request. `token` goes with every save of that pass, so a pass whose claim
+ * went stale and was retaken cannot overwrite the retaker's progress. `attempts` counts claims so far, this one included.
+ */
+export interface ErasureClaim {
+  readonly request: ErasureRequest;
+  readonly token: string;
+  readonly claimedAt: Date;
+  readonly attempts: number;
+}
+
 export interface ErasureRequestRepository {
   /** Insert a new request in state `requested`. Throws ErasureInFlightError if the bank already has one in flight. */
   create(request: ErasureRequest): Promise<void>;
-  /** Persist a transition produced by the domain functions (never a raw status update). Throws ErasureNotInFlightError if the row is terminal. */
-  save(request: ErasureRequest): Promise<void>;
+  /**
+   * Persist a transition produced by the domain functions (never a raw status update). Throws ErasureNotInFlightError if the
+   * row is terminal; with `claimToken`, ErasureClaimLostError if another pass holds the row now.
+   */
+  save(request: ErasureRequest, opts?: { readonly claimToken?: string }): Promise<void>;
+  /**
+   * Worker: claim the oldest in-flight request that nobody holds, or whose holder has landed no step for `staleAfterMs`
+   * (its process died, or hung): every token-bearing `save` refreshes `claimed_at`, so a long but progressing pass is
+   * not retaken. One statement with `FOR UPDATE SKIP LOCKED`, so several workers never claim the same row. Returns the
+   * request as stored, in whatever state the previous pass left it: the worker resumes from there.
+   */
+  claimNext(opts: { readonly staleAfterMs: number }): Promise<ErasureClaim | undefined>;
+  /** Worker shutting down between steps: hand the row back so the next server picks it up at once instead of after `staleAfterMs`. Only while the claim is still this pass's. */
+  release(claim: ErasureClaim): Promise<void>;
   /** `within` narrows to a bank and tenant in SQL (second line of defence behind the handler's check); omitted only by operator tooling. */
   get(id: string, within?: { readonly bankId: BankId; readonly tenantId: TenantId }): Promise<ErasureRequest | undefined>;
 }
@@ -88,7 +119,12 @@ export interface ErasableStore {
    * never purge the wrong engine and receipt a bank whose index lives elsewhere.
    */
   readonly engine?: string;
-  /** Store names must be stable and distinct per adapter. Memory must be listed first in the workflow: it removes the outbox events whose consumers (indexing, extraction) write into the stores purged after it. */
+  /**
+   * Store names must be stable and distinct per adapter, and `count` and `purge` must report exactly the same names: verification
+   * fails closed on an inventoried name that is not re-counted, and a resumed worker pass decides from the counted names whether
+   * the store was already purged. Memory must be listed first in the workflow: it removes the outbox events whose consumers
+   * (indexing, extraction) write into the stores purged after it.
+   */
   count(bankId: BankId): Promise<Readonly<Record<string, number>>>;
   /** Delete everything the store holds for the bank; returns rows deleted per store name. */
   purge(bankId: BankId): Promise<Readonly<Record<string, number>>>;

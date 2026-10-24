@@ -1,8 +1,9 @@
 import type { BankId, PrincipalId, SubjectId, TenantId } from "../../../shared-kernel/index.js";
+import { randomUUID } from "node:crypto";
 import type pg from "pg";
 import { withTransaction, type Queryable } from "../../../platform/postgres/pool.js";
 import type { ErasureReceipt, ErasureRequest, ErasureState, StoreDeletion, StoreInventory, StoreVerification } from "../../domain/erasure-request.js";
-import { ErasureInFlightError, ErasureNotInFlightError, type ErasureRequestRepository, type ErasureTransaction, type ErasureUnitOfWork } from "../../ports/repositories.js";
+import { ErasureClaimLostError, ErasureInFlightError, ErasureNotInFlightError, type ErasureClaim, type ErasureRequestRepository, type ErasureTransaction, type ErasureUnitOfWork } from "../../ports/repositories.js";
 import { PgAuditLog } from "./repositories.js";
 
 interface Row {
@@ -17,6 +18,9 @@ interface Row {
   deletions: { store: string; deleted: number; deletedAt: string }[];
   verifications: { store: string; hitsAfter: number; checkedAt: string }[];
   updated_at: Date;
+  claim_token: string | null;
+  claimed_at: Date | null;
+  attempts: number;
   receipt: {
     requestId: string;
     tenantId: string;
@@ -85,19 +89,60 @@ export class PgErasureRequestRepository implements ErasureRequestRepository {
     }
   }
 
-  /** Compare-and-set on terminality: a row an operator abandoned (or that already receipted) is never overwritten by a late workflow step. */
-  async save(r: ErasureRequest): Promise<void> {
+  /**
+   * Compare-and-set on terminality and, for a worker pass, on its claim: a row an operator abandoned (or that already
+   * receipted) is never overwritten by a late workflow step, and a pass that was retaken cannot overwrite the retaker.
+   * A save with the claim token is also the pass's heartbeat: `claimed_at` moves, so "stale" means "no step landed".
+   */
+  async save(r: ErasureRequest, opts: { readonly claimToken?: string } = {}): Promise<void> {
     const res = await this.db.query(
       `UPDATE governance.erasure_requests
-       SET state = $2, inventory = $3, deletions = $4, verifications = $5, receipt = $6, failure = $7, updated_at = now()
-       WHERE id = $1 AND state NOT IN ('receipted', 'failed')`,
-      [r.id, r.state, ...jsonColumns(r)],
+       SET state = $2, inventory = $3, deletions = $4, verifications = $5, receipt = $6, failure = $7, updated_at = now(),
+           claimed_at = CASE WHEN $8::text IS NULL THEN claimed_at ELSE now() END
+       WHERE id = $1 AND state NOT IN ('receipted', 'failed') AND ($8::text IS NULL OR claim_token = $8)`,
+      [r.id, r.state, ...jsonColumns(r), opts.claimToken ?? null],
     );
     if (res.rowCount === 0) {
-      const exists = await this.db.query("SELECT 1 FROM governance.erasure_requests WHERE id = $1", [r.id]);
-      if ((exists.rowCount ?? 0) > 0) throw new ErasureNotInFlightError(r.id);
-      throw new Error(`ErasureRequest ${r.id} not found`);
+      const { rows } = await this.db.query<{ state: ErasureState }>("SELECT state FROM governance.erasure_requests WHERE id = $1", [r.id]);
+      const stored = rows[0];
+      if (!stored) throw new Error(`ErasureRequest ${r.id} not found`);
+      if (stored.state === "receipted" || stored.state === "failed") throw new ErasureNotInFlightError(r.id);
+      throw new ErasureClaimLostError(r.id);
     }
+  }
+
+  async claimNext(opts: { readonly staleAfterMs: number }): Promise<ErasureClaim | undefined> {
+    // One statement: the oldest in-flight row nobody holds (or whose holder went stale), SKIP LOCKED against other workers.
+    // The database clock on both sides (claimed_at is written by `now()` here and in `save`), so several servers need not agree on the time.
+    // A claim is a row change: `updated_at` moves too, so `AbandonErasureHandler` sees a just-retaken request as live.
+    const token = randomUUID();
+    const { rows } = await this.db.query<Row>(
+      `UPDATE governance.erasure_requests r
+       SET claim_token = $1, claimed_at = now(), updated_at = now(), attempts = r.attempts + 1
+       FROM (
+         SELECT id FROM governance.erasure_requests
+         WHERE state NOT IN ('receipted', 'failed')
+           AND (claimed_at IS NULL OR claimed_at < now() - make_interval(secs => $2::double precision / 1000))
+         ORDER BY requested_at, id
+         LIMIT 1
+         FOR UPDATE SKIP LOCKED
+       ) due
+       WHERE r.id = due.id
+       RETURNING r.*`,
+      [token, opts.staleAfterMs],
+    );
+    const row = rows[0];
+    if (!row) return undefined;
+    if (!row.claimed_at) throw new Error(`erasure claim ${row.id}: claimed_at not set by the claim statement`);
+    return { request: toRequest(row), token, claimedAt: row.claimed_at, attempts: row.attempts };
+  }
+
+  /** A graceful stop is not a failed attempt: the claim goes and the attempt is given back. */
+  async release(claim: ErasureClaim): Promise<void> {
+    await this.db.query(
+      "UPDATE governance.erasure_requests SET claim_token = NULL, claimed_at = NULL, attempts = greatest(attempts - 1, 0) WHERE id = $1 AND claim_token = $2 AND state NOT IN ('receipted', 'failed')",
+      [claim.request.id, claim.token],
+    );
   }
 
   async get(id: string, within?: { readonly bankId: BankId; readonly tenantId: TenantId }): Promise<ErasureRequest | undefined> {

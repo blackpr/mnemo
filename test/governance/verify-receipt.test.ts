@@ -1,13 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { asEpisodeId, asSubjectId, systemClock, type BankId, type Scope } from "../../src/shared-kernel/index.js";
-import { EraseBankHandler, PgAuditLog, PgErasureRequestRepository, receiptPayload, VerifyReceiptHandler, scopeAccessPolicy, type ErasableStore, type ReceiptVerification } from "../../src/governance/index.js";
+import { PgAuditLog, PgErasureRequestRepository, receiptPayload, VerifyReceiptHandler, scopeAccessPolicy, type ErasableStore, type ReceiptVerification } from "../../src/governance/index.js";
 import { sha256 } from "../../src/platform/hash.js";
 import { PgBankRepository, PgUnitOfWork, RecordEpisodeHandler } from "../../src/memory/index.js";
 import { EngineErasableStore, HashingEmbedder, PgvectorEngine } from "../../src/retrieval/index.js";
 import { PgExportStore } from "../../src/portability/index.js";
 import { describeWithDb, setupTestDb, type TestDb } from "../helpers/postgres.js";
-import { erasureDeps } from "../helpers/erasure.js";
+import { eraseNow, erasureDeps } from "../helpers/erasure.js";
 import { alice, bankFixture, scopeFor, tenant } from "../helpers/fixtures.js";
 
 describeWithDb("VerifyReceipt", () => {
@@ -22,8 +22,8 @@ describeWithDb("VerifyReceipt", () => {
     if (!r.ok) throw new Error(r.error.kind);
     return r.value;
   };
-  const erase = async () => {
-    const r = await new EraseBankHandler(scopeAccessPolicy, deps.bank, deps.uow, deps.stores, systemClock, randomUUID, sha256).handle(eraser(bankA.id), bankA.id);
+  const erase = async (bankId: BankId = bankA.id, stores: readonly ErasableStore[] = deps.stores) => {
+    const r = await eraseNow({ ...deps, stores }, eraser(bankId), bankId);
     if (!r.ok) throw new Error(r.error.kind);
     return r.value;
   };
@@ -72,9 +72,7 @@ describeWithDb("VerifyReceipt", () => {
     const receiptedB = await (async () => {
       const bankB = bankFixture("bank-b");
       await new PgBankRepository(db.pool).create(bankB);
-      const r = await new EraseBankHandler(scopeAccessPolicy, deps.bank, deps.uow, deps.stores, systemClock, randomUUID, sha256).handle(eraser(bankB.id), bankB.id);
-      if (!r.ok) throw new Error(r.error.kind);
-      return r.value;
+      return erase(bankB.id);
     })();
     await db.pool.query("UPDATE governance.erasure_requests SET receipt = $2 WHERE id = $1", [receiptedB.id, JSON.stringify(receipted.receipt)]);
     expect(await verify(receiptedB.id)).toMatchObject({ ok: false, digestValid: true, bound: false, chained: false });
@@ -113,9 +111,9 @@ describeWithDb("VerifyReceipt", () => {
   it("unknown ids and requests without a receipt are errors, not failures", async () => {
     expect(await verifier().handle("00000000-0000-4000-8000-000000000000")).toEqual({ ok: false, error: { kind: "ErasureNotFound", requestId: "00000000-0000-4000-8000-000000000000" } });
     const broken: ErasableStore = { count: async () => ({ "engine.broken": 1 }), purge: async () => { throw new Error("down"); } };
-    const failed = await new EraseBankHandler(scopeAccessPolicy, deps.bank, deps.uow, [...deps.stores, broken], systemClock, randomUUID, sha256).handle(eraser(bankA.id), bankA.id);
-    expect(failed.ok && failed.value.state).toBe("failed");
-    const id = failed.ok ? failed.value.id : "";
+    const failed = await erase(bankA.id, [...deps.stores, broken]);
+    expect(failed.state).toBe("failed");
+    const id = failed.id;
     expect(await verifier().handle(id)).toEqual({ ok: false, error: { kind: "NoReceipt", requestId: id, state: "failed" } });
     // A row that claims `receipted` without a receipt is corruption, reported as its own error.
     await db.pool.query("UPDATE governance.erasure_requests SET state = 'receipted', receipt = NULL WHERE id = $1", [id]);

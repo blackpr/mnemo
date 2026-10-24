@@ -227,18 +227,16 @@ export function createApp(deps: RestDeps, options: AppOptions = {}): Hono<Env> {
     });
   });
 
-  // Erasure: the one destructive operation. `erase` capability; runs the whole workflow (inventory, purge
-  // every store, verify, receipt) before answering, so the response already carries the outcome. The
-  // request record exists either way: 201 when `receipted`, 500 `erasure_failed` (with the record, so the
-  // id can be looked up and the bank retried) when `failed`. No body is read.
-  // Deliberately absent from MCP: an agent should never be able to erase its Subject's memory.
+  // Erasure: the one destructive operation. `erase` capability; creates the request (audit entry first) and
+  // answers 202 with the record in state `requested`; the erasure worker in the server process runs the
+  // workflow (freeze, inventory, purge every store, re-count, receipt) and GET on the id is the handle. No body
+  // is read. Deliberately absent from MCP: an agent should never be able to erase its Subject's memory.
   app.post("/v1/banks/:bankId/erasure", async (c) => {
     const scope = c.get("scope");
     const bankId = c.get("bankId");
     const r = await eraseBank.handle(scope, bankId);
     if (!r.ok) return fail(c, r.error, scope, bankId, deps);
-    const body = serializeErasure(r.value);
-    return r.value.state === "receipted" ? c.json(body, 201) : c.json({ error: "erasure_failed", request: body }, 500);
+    return c.json(serializeErasure(r.value), 202);
   });
 
   app.get("/v1/banks/:bankId/erasure/:id", async (c) => {

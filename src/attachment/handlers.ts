@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import type { BankId, Clock, Scope } from "../shared-kernel/index.js";
-import { sha256 } from "../platform/hash.js";
 import { EraseBankHandler, GetErasureHandler, type AccessPolicy, type AuditLogStore, type ErasableStore, type ErasureBankGateway, type ErasureRequestRepository, type ErasureUnitOfWork, type ScopeResolver } from "../governance/index.js";
 import type { BankRepository } from "../memory/index.js";
 import { ExportBankHandler, type ExportStore } from "../portability/index.js";
@@ -68,7 +67,7 @@ export function buildHandlers(deps: AttachmentDeps): Handlers {
     getFact: new GetFactHandler(deps.facts, deps.access, deps.audit, deps.clock),
     setConfirmation: new SetConfirmationHandler(deps.uow, deps.access, deps.clock),
     exportBank: new ExportBankHandler(deps.banks, deps.facts, deps.access, deps.exports, deps.audit, deps.clock),
-    eraseBank: new EraseBankHandler(deps.access, deps.erasure.bank, deps.erasure.uow, deps.erasure.stores, deps.clock, randomUUID, sha256),
+    eraseBank: new EraseBankHandler(deps.access, deps.erasure.bank, deps.erasure.uow, deps.erasure.stores, deps.clock, randomUUID),
     getErasure: new GetErasureHandler(deps.access, deps.erasure.requests),
   };
 }

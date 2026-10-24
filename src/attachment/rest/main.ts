@@ -1,9 +1,10 @@
 import { serve } from "@hono/node-server";
 import { systemClock, type ModelRef } from "../../shared-kernel/index.js";
 import { createPool } from "../../platform/postgres/pool.js";
+import { sha256 } from "../../platform/hash.js";
 import { migrate } from "../../platform/postgres/migrator.js";
 import { migrationSources } from "../../platform/postgres/migrations.js";
-import { PgAccessRevocation, PgAuditLog, PgErasureRequestRepository, PgErasureUnitOfWork, PgPrincipalRepository, ScopeResolver, scopeAccessPolicy } from "../../governance/index.js";
+import { ErasureWorker, PgAccessRevocation, PgAuditLog, PgErasureRequestRepository, PgErasureUnitOfWork, PgPrincipalRepository, ScopeResolver, scopeAccessPolicy } from "../../governance/index.js";
 import { PgBankRepository, PgEpisodeRepository, PgFactRepository, PgMemoryErasure, PgOutboxRelay, PgUnitOfWork, WriteExtractedFactsHandler } from "../../memory/index.js";
 import { embedderFromEnv, embeddingDimensionsFromEnv, engineFromEnv, EngineErasableStore, EngineMemoryFinder, IndexingProjector, PgvectorEngine, readPinnedIndex } from "../../retrieval/index.js";
 import { AiSdkLlmClient, ExtractionErasableStore, LlmExtractor, PgExtractionRunStore, RetainPipeline, type Extractor } from "../../extraction/index.js";
@@ -11,14 +12,17 @@ import { ExportsErasableStore, PgExportStore } from "../../portability/index.js"
 import { ADDRESS_LIMIT_FACTOR, createApp, DEFAULT_RATE_LIMIT_PER_MINUTE } from "./app.js";
 
 /**
- * Composition root for the REST attachment. One process: HTTP server plus the outbox relay
- * loop that (1) projects Memory events into the retrieval engine and (2) runs extraction on
- * new episodes for banks that have an extractor configured (`admin set-extractor`).
+ * Composition root for the REST attachment. One process: HTTP server plus three loops: the outbox
+ * relay that projects Memory events into the retrieval engine and enqueues extraction, the extraction
+ * worker that runs the model on new episodes for banks with an extractor (`admin set-extractor`), and
+ * the erasure worker that runs requested erasures (`POST .../erasure`, `admin erase-bank`) to a receipt.
  *
  * Env: DATABASE_URL (required), PORT (default 8787), RATE_LIMIT_PER_MINUTE (default 600 requests per API
  * key per minute under /v1, REST and MCP; 0 disables) and RATE_LIMIT_PER_ADDRESS_PER_MINUTE (default ten
  * times that, per client address; 0 means no address ceiling; in-process counters, see app.ts), OUTBOX_POLL_MS (default 500),
- * EXTRACTION_POLL_MS (default 1000), LLM_TIMEOUT_MS (default 120000),
+ * EXTRACTION_POLL_MS (default 1000), ERASURE_POLL_MS (default 1000), ERASURE_STALE_MS (default 600000: an erasure pass
+ * that has landed no step for this long is presumed dead and retaken; raise it if a single store's purge of a large
+ * bank takes longer; on the third retake a request ends failed instead), LLM_TIMEOUT_MS (default 120000),
  * SHUTDOWN_TIMEOUT_MS (default 10000), plus the provider keys the configured extractor models
  * need (ANTHROPIC_API_KEY, GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY,
  * OPENAI_COMPATIBLE_BASE_URL). EMBEDDER selects the embedding model ("provider:model", default
@@ -53,6 +57,18 @@ function nonNegativeInt(name: string): number | undefined {
 const port = Number(process.env.PORT ?? 8787);
 const pollMs = Number(process.env.OUTBOX_POLL_MS ?? 500);
 const extractionPollMs = Number(process.env.EXTRACTION_POLL_MS ?? 1_000);
+/** Digits only and at least 1: a 0 or garbage interval would spin the loop against Postgres. */
+function positiveInt(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return undefined;
+  if (!/^[1-9]\d*$/.test(raw)) {
+    console.error(`${name} must be a positive integer (milliseconds), got "${raw}"`);
+    process.exit(1);
+  }
+  return Number(raw);
+}
+const erasurePollMs = positiveInt("ERASURE_POLL_MS") ?? 1_000;
+const erasureStaleMs = positiveInt("ERASURE_STALE_MS") ?? 10 * 60_000;
 const llmTimeoutMs = Number(process.env.LLM_TIMEOUT_MS ?? 120_000);
 const shutdownTimeoutMs = Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 10_000);
 const rateLimitPerMinute = nonNegativeInt("RATE_LIMIT_PER_MINUTE") ?? DEFAULT_RATE_LIMIT_PER_MINUTE;
@@ -102,6 +118,11 @@ const uow = new PgUnitOfWork(pool);
 const runs = new PgExtractionRunStore(pool);
 const exports = new PgExportStore(pool);
 const memoryErasure = new PgMemoryErasure(pool);
+const erasureRequests = new PgErasureRequestRepository(pool);
+const erasureUow = new PgErasureUnitOfWork(pool);
+// Every store that holds Subject data, Memory first, then access to it last (so a data-store failure leaves the
+// eraser able to retry). A new store (engine adapter, cache) must be listed here or erasure cannot prove it empty.
+const erasableStores = [memoryErasure, new EngineErasableStore(engine), new ExtractionErasableStore(runs), new ExportsErasableStore(exports), new PgAccessRevocation(pool)];
 
 const app = createApp(
   {
@@ -115,14 +136,7 @@ const app = createApp(
   episodes,
   finder: new EngineMemoryFinder(engine),
   exports,
-  // Every store that holds Subject data, Memory first, then access to it last (so a data-store failure leaves the
-  // eraser able to retry). A new store (engine adapter, cache) must be listed here or erasure cannot prove it empty.
-  erasure: {
-    bank: memoryErasure,
-    requests: new PgErasureRequestRepository(pool),
-    uow: new PgErasureUnitOfWork(pool),
-    stores: [memoryErasure, new EngineErasableStore(engine), new ExtractionErasableStore(runs), new ExportsErasableStore(exports), new PgAccessRevocation(pool)],
-  },
+  erasure: { bank: memoryErasure, requests: erasureRequests, uow: erasureUow, stores: erasableStores },
   },
   { rateLimitPerMinute, rateLimitPerAddressPerMinute },
 );
@@ -189,6 +203,21 @@ const extractionTimer = setInterval(async () => {
   }
 }, extractionPollMs);
 
+// Loop 3: erasure worker. Purges run here, never inside the HTTP request that asked for them; the request id is the handle.
+const erasureWorker = new ErasureWorker(erasureRequests, memoryErasure, erasureUow, erasableStores, systemClock, sha256, { staleAfterMs: erasureStaleMs });
+let erasing = false;
+const erasureTimer = setInterval(async () => {
+  if (erasing) return;
+  erasing = true;
+  try {
+    await erasureWorker.drain();
+  } catch (e) {
+    console.error("erasure worker error", e);
+  } finally {
+    erasing = false;
+  }
+}, erasurePollMs);
+
 const server = serve({ fetch: app.fetch, port }, (info) => {
   console.log(`mem REST attachment listening on http://localhost:${info.port} (engine: ${engine.name}${engine instanceof PgvectorEngine ? `, embedder: ${engine.embedderId}, ${engine.embedderDimensions ?? "?"} dims` : ""}, extraction: per-bank, rate limit: ${rateLimitPerMinute === 0 ? "off" : `${rateLimitPerMinute}/min per key, ${rateLimitPerAddressPerMinute}/min per address`})`);
 });
@@ -200,12 +229,15 @@ async function shutdown(signal: string): Promise<void> {
   console.log(`${signal} received, shutting down`);
   clearInterval(timer);
   clearInterval(extractionTimer);
+  clearInterval(erasureTimer);
+  // The erasure pass hands its row back at the next step boundary; a purge longer than the timeout keeps its claim and is retaken after ERASURE_STALE_MS.
+  erasureWorker.stop();
   const deadline = Date.now() + shutdownTimeoutMs;
   const closed = new Promise<void>((resolve) => server.close(() => resolve()));
   const timeout = new Promise<void>((resolve) => setTimeout(resolve, shutdownTimeoutMs).unref());
   try {
     await Promise.race([closed, timeout]);
-    while ((draining || extracting) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+    while ((draining || extracting || erasing) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
     await pool.end();
     process.exit(0);
   } catch (e) {

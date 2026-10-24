@@ -9,7 +9,7 @@ import { serializeErasure } from "../../src/attachment/serialize.js";
 import { PgExportStore } from "../../src/portability/index.js";
 import { describeWithDb, setupTestDb, type TestDb } from "../helpers/postgres.js";
 import { bankFixture, tenant } from "../helpers/fixtures.js";
-import { erasureDeps } from "../helpers/erasure.js";
+import { erasureDeps, erasureWorker } from "../helpers/erasure.js";
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
@@ -262,7 +262,7 @@ describeWithDb("REST attachment", () => {
     expect(audit.map((a) => a.action)).toEqual(["episode.recorded", "fact.asserted", "export.produced", "export.produced", "access.denied"]);
   });
 
-  it("erasure: needs the erase capability, runs to a receipt, removes every grant and dedicated key (the GET route is proven with a repository-level re-grant, which admin grant refuses on erased banks); a stuck request is 409", async () => {
+  it("erasure: needs the erase capability, POST queues the request (202) and the worker runs it to a receipt that GET shows, removing every grant and dedicated key (the GET route is proven with a repository-level re-grant, which admin grant refuses on erased banks); a stuck request is 409", async () => {
     const principals = new PgPrincipalRepository(db.pool);
     const keys = new PgApiKeyStore(db.pool);
     const issue = async (id: string, bankId: string) => {
@@ -286,9 +286,26 @@ describeWithDb("REST attachment", () => {
     expect((await app.request(`/v1/banks/${bankA.id}/erasure/not-a-uuid`, { headers: { authorization: `Bearer ${eraserKey}` } })).status).toBe(404);
     expect((await app.request(`/v1/banks/${bankA.id}/erasure/00000000-0000-4000-8000-000000000000`, { headers: { authorization: `Bearer ${eraserKey}` } })).status).toBe(404);
 
+    // POST only queues: 202 with the record in `requested`; nothing is deleted and the bank is still active until the worker runs.
     const res = await app.request(`/v1/banks/${bankA.id}/erasure`, { method: "POST", headers: { authorization: `Bearer ${eraserKey}` } });
-    expect(res.status).toBe(201);
-    const body = await json<{ id: string; state: string; stores: { store: string; countBefore: number; deleted: number; hitsAfter: number }[]; receipt: { digest: string; deletions: unknown[] } | null; failure: string | null }>(res);
+    expect(res.status).toBe(202);
+    type ErasureBody = { id: string; state: string; stores: { store: string; countBefore: number; deleted: number; hitsAfter: number }[]; receipt: { digest: string; deletions: unknown[] } | null; failure: string | null };
+    const queued = await json<ErasureBody>(res);
+    expect(queued).toMatchObject({ state: "requested", stores: [], receipt: null, failure: null, requestedBy: "eraser" });
+    expect(queued.id).toMatch(/^[0-9a-f-]{36}$/);
+    expect((await rowsIn("memory.facts")).length).toBe(1);
+    expect((await new PgBankRepository(db.pool).get(bankA.id))?.status).toBe("active");
+    // The handle while it is queued: GET shows the same record (the eraser still holds its grant); a second POST is 409.
+    expect(await json(await app.request(`/v1/banks/${bankA.id}/erasure/${queued.id}`, { headers: { authorization: `Bearer ${eraserKey}` } }))).toEqual(queued);
+    const twice = await app.request(`/v1/banks/${bankA.id}/erasure`, { method: "POST", headers: { authorization: `Bearer ${eraserKey}` } });
+    expect(twice.status).toBe(409);
+    expect((await json<{ error: string }>(twice)).error).toBe("erasure_in_flight");
+
+    // One worker pass (the server's loop) runs the workflow to the receipt.
+    expect(await erasureWorker(deps.erasure).drain()).toBe(1);
+    const stored = await new PgErasureRequestRepository(db.pool).get(queued.id);
+    const body = JSON.parse(JSON.stringify(serializeErasure(stored!))) as ErasureBody;
+    expect(body.id).toBe(queued.id);
     expect(body.state).toBe("receipted");
     expect(body.failure).toBeNull();
     expect(body.receipt?.digest).toMatch(/^[0-9a-f]{64}$/);
@@ -308,15 +325,13 @@ describeWithDb("REST attachment", () => {
     expect(await rowsIn("governance.grants")).toEqual([]);
 
     // Access went with the data: the eraser's and the readers' keys are revoked (401), the principal that also holds bank B
-    // keeps its key but no longer has a grant on A (403, audited). The receipt is the POST response and the stored request
-    // (`admin erasure-status` / `verify-receipt`); over REST nobody can read it back, since no grant on the bank is left.
+    // keeps its key but no longer has a grant on A (403, audited). The receipt is on the stored request (`admin erasure-status`
+    // / `verify-receipt`); over REST nobody can read it back, since no grant on the bank is left.
     expect((await app.request(`/v1/banks/${bankA.id}/erasure/${body.id}`, { headers: { authorization: `Bearer ${eraserKey}` } })).status).toBe(401);
     expect((await get(`/v1/banks/${bankA.id}/erasure/${body.id}`, roKey)).status).toBe(401);
     expect((await get(`/v1/banks/${bankA.id}/erasure/${body.id}`, bothKey)).status).toBe(403);
     expect((await get(`/v1/banks/${bankB.id}/erasure/${body.id}`, bothKey)).status).toBe(403);
     expect((await get(`/v1/banks/${bankB.id}/erasure/${body.id}`, eraserBKey)).status).toBe(404);
-    const stored = await new PgErasureRequestRepository(db.pool).get(body.id);
-    expect(stored && JSON.parse(JSON.stringify(serializeErasure(stored)))).toEqual(body);
     // A grant written at the repository level (admin grant refuses erased banks; this only exercises the route): a fresh key with erase reads the record, read+write alone is 403 (audited).
     const eraserAgain = await issue("eraser", bankA.id);
     const bothAgain = (await principals.get(asPrincipalId("both")))!;
@@ -326,8 +341,9 @@ describeWithDb("REST attachment", () => {
     expect(await json(got)).toEqual(body);
     expect((await get(`/v1/banks/${bankA.id}/erasure/${body.id}`, bothKey)).status).toBe(403);
 
-    // A request left in flight (as after a crash) makes a new one 409 until an operator abandons it.
-    await db.pool.query("INSERT INTO governance.erasure_requests (id, tenant_id, bank_id, subject_id, requested_by, requested_at, state) VALUES ($1, $2, $3, $4, 'eraser-b', now(), 'inventoried')", [
+    // A request another worker pass holds (a fresh claim, as a slow or just-crashed pass leaves) makes a new one 409; the sweep
+    // retakes it once the claim is stale, or an operator abandons it.
+    await db.pool.query("INSERT INTO governance.erasure_requests (id, tenant_id, bank_id, subject_id, requested_by, requested_at, state, claim_token, claimed_at, attempts) VALUES ($1, $2, $3, $4, 'eraser-b', now(), 'inventoried', 'pass-1', now(), 1)", [
       "11111111-1111-4111-8111-111111111111", tenant, bankB.id, bankB.subjectId,
     ]);
     const stuck = await app.request(`/v1/banks/${bankB.id}/erasure`, { method: "POST", headers: { authorization: `Bearer ${eraserBKey}` } });
