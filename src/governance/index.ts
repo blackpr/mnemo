@@ -8,3 +8,4 @@ export * from "./application/scope-resolver.js";
 export * from "./infrastructure/postgres/repositories.js";
 export * from "./application/erase-bank.js";
 export * from "./infrastructure/postgres/erasure-repository.js";
+export * from "./infrastructure/postgres/access-revocation.js";

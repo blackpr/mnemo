@@ -1,5 +1,5 @@
 import type { BankId, PrincipalId, SubjectId, TenantId } from "../../shared-kernel/index.js";
-import type { AuditEntry } from "../domain/audit-log.js";
+import type { AuditAction, AuditEntry } from "../domain/audit-log.js";
 import type { ErasureRequest } from "../domain/erasure-request.js";
 import type { Principal } from "../domain/principal.js";
 
@@ -70,9 +70,16 @@ export interface ErasureUnitOfWork {
  * One adapter per context that holds Subject data, as the Erasure workflow sees it. `count`
  * and `purge` report per store name (e.g. "memory.facts"); the same names must come back from
  * both, because verification re-counts every inventoried store and fails closed on a missing
- * one. Implemented in Memory, Retrieval, Extraction and Portability; wired by the composition root.
+ * one. Implemented in Memory, Retrieval, Extraction, Portability and (for grants and keys) Governance; wired
+ * by the composition root, Memory first and the access store last.
  */
 export interface ErasableStore {
+  /**
+   * When set, the workflow appends an audit entry with this action right after the store's purge, carrying
+   * the per-store deleted counts, in the same transaction as the request save. Only the access store's action
+   * is allowed: the workflow's own entries (`requested`, `deleted`, `receipt_issued`, ...) cannot be forged this way.
+   */
+  readonly auditPurgeAs?: Extract<AuditAction, "erasure.access_revoked">;
   /** Store names must be stable and distinct per adapter. Memory must be listed first in the workflow: it removes the outbox events whose consumers (indexing, extraction) write into the stores purged after it. */
   count(bankId: BankId): Promise<Readonly<Record<string, number>>>;
   /** Delete everything the store holds for the bank; returns rows deleted per store name. */

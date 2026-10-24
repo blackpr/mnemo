@@ -6,12 +6,17 @@ import {
   EraseBankHandler,
   ErasureInFlightError,
   ErasureNotInFlightError,
+  generateApiKey,
   GetErasureHandler,
+  PgAccessRevocation,
+  PgApiKeyStore,
   PgAuditLog,
   PgErasureRequestRepository,
   PgErasureUnitOfWork,
+  PgPrincipalRepository,
   recordInventory,
   requestErasure,
+  ScopeResolver,
   scopeAccessPolicy,
   verifyChain,
   verifyReceipt,
@@ -29,7 +34,7 @@ import { alice, bankFixture, scopeFor, tenant } from "../helpers/fixtures.js";
 
 /** Rows per table for one bank, straight from SQL: the proof the receipt is supposed to carry. Table names are test constants, never input. */
 async function rowsFor(db: TestDb, bankId: BankId): Promise<Record<string, number>> {
-  const tables = ["memory.facts", "memory.episodes", "memory.outbox", "retrieval.pgvector_index", "extraction.runs", "portability.exports"];
+  const tables = ["memory.facts", "memory.episodes", "memory.outbox", "retrieval.pgvector_index", "extraction.runs", "portability.exports", "governance.grants"];
   const out: Record<string, number> = {};
   for (const t of tables) {
     const { rows } = await db.pool.query<{ n: string }>(`SELECT count(*)::text AS n FROM ${t} WHERE bank_id = $1`, [bankId]);
@@ -51,7 +56,11 @@ describeWithDb("EraseBank", () => {
   let memory: PgMemoryErasure;
   let stores: ErasableStore[];
   let recall: RecallHandler;
+  /** Plaintext API keys by principal id: `agent-<bank>` holds read+write+erase on its bank only; `shared` holds read+write on both; `lapsed` holds A plus an expired grant on B. */
+  const apiKeys = new Map<string, string>();
+  const activeKeys = async (principalId: string) => Number((await db.pool.query<{ n: string }>("SELECT count(*)::text AS n FROM governance.api_keys WHERE principal_id = $1 AND revoked_at IS NULL", [principalId])).rows[0]!.n);
 
+  const banksLookup = { tenantOf: (bankId: BankId) => new PgBankRepository(db.pool).tenantOf(bankId) };
   const handler = (opts: { stores?: readonly ErasableStore[]; uow?: ErasureUnitOfWork } = {}) =>
     new EraseBankHandler(scopeAccessPolicy, memory, opts.uow ?? uow, opts.stores ?? stores, systemClock, randomUUID, sha256);
   const requestsOf = async (bankId: BankId) => (await db.pool.query<{ id: string }>("SELECT id FROM governance.erasure_requests WHERE bank_id = $1 ORDER BY requested_at, id", [bankId])).rows.map((r) => r.id);
@@ -80,7 +89,7 @@ describeWithDb("EraseBank", () => {
     requests = new PgErasureRequestRepository(db.pool);
     uow = new PgErasureUnitOfWork(db.pool);
     memory = new PgMemoryErasure(db.pool);
-    stores = [memory, new EngineErasableStore(engine), new ExtractionErasableStore(new PgExtractionRunStore(db.pool)), new ExportsErasableStore(new PgExportStore(db.pool))];
+    stores = [memory, new EngineErasableStore(engine), new ExtractionErasableStore(new PgExtractionRunStore(db.pool)), new ExportsErasableStore(new PgExportStore(db.pool)), new PgAccessRevocation(db.pool)];
     recall = new RecallHandler(new EngineMemoryFinder(engine), new PgFactRepository(db.pool), new PgEpisodeRepository(db.pool), scopeAccessPolicy, audit, systemClock);
   });
   afterAll(async () => db.close());
@@ -92,6 +101,20 @@ describeWithDb("EraseBank", () => {
     await banks.create(bankB);
     await populate(bankA.id);
     await populate(bankB.id);
+    const principals = new PgPrincipalRepository(db.pool);
+    const keys = new PgApiKeyStore(db.pool);
+    const grant = (bankId: BankId, expiresAt?: Date) => ({ bankId, capabilities: new Set(["read", "write", "erase"] as const), grantedAt: new Date(), ...(expiresAt ? { expiresAt } : {}) });
+    for (const [id, grants] of [
+      [`agent-${bankA.id}`, [grant(bankA.id)]],
+      [`agent-${bankB.id}`, [grant(bankB.id)]],
+      ["shared", [grant(bankA.id), grant(bankB.id)]],
+      ["lapsed", [grant(bankA.id), grant(bankB.id, new Date("2026-01-02T00:00:00Z"))]],
+    ] as const) {
+      await principals.save({ id: asPrincipalId(id), tenantId: tenant, kind: "agent", displayName: id, grants: [...grants] });
+      const key = generateApiKey();
+      await keys.issue(asPrincipalId(id), key.hash, "test");
+      apiKeys.set(id, key.token);
+    }
     const relay = new PgOutboxRelay(db.pool);
     const projector = new IndexingProjector(engine, new PgFactRepository(db.pool), new PgEpisodeRepository(db.pool));
     await relay.drainAll((events) => projector.handle(events));
@@ -99,7 +122,7 @@ describeWithDb("EraseBank", () => {
 
   it("erases one bank completely, leaves the other untouched, and issues a receipt the audit chain carries", async () => {
     const before = await rowsFor(db, bankA.id);
-    expect(before).toEqual({ "memory.facts": 1, "memory.episodes": 2, "memory.outbox": 3, "retrieval.pgvector_index": 3, "extraction.runs": 1, "portability.exports": 1 });
+    expect(before).toEqual({ "memory.facts": 1, "memory.episodes": 2, "memory.outbox": 3, "retrieval.pgvector_index": 3, "extraction.runs": 1, "portability.exports": 1, "governance.grants": 3 });
     const beforeB = await rowsFor(db, bankB.id);
     const auditBefore = (await audit.list(tenant)).length;
 
@@ -111,14 +134,33 @@ describeWithDb("EraseBank", () => {
     expect(request.failure).toBeUndefined();
     expect(Object.fromEntries(request.inventory.map((i) => [i.store, i.countBefore]))).toEqual({
       "memory.facts": 1, "memory.episodes": 2, "memory.outbox": 3, "retrieval.pgvector": 3, "extraction.runs": 1, "portability.exports": 1,
+      // Access: the three grants on A and the keys of the two principals with no live grant elsewhere (an expired one does not count).
+      "governance.grants": 3, "governance.api_keys": 2,
     });
     expect(Object.fromEntries(request.deletions.map((d) => [d.store, d.deleted]))).toEqual(Object.fromEntries(request.inventory.map((i) => [i.store, i.countBefore])));
     expect(request.verifications.every((v) => v.hitsAfter === 0)).toBe(true);
     expect(request.verifications.map((v) => v.store).sort()).toEqual(request.inventory.map((i) => i.store).sort());
 
     // The system of record and every derived store hold nothing for the bank; the other bank is exactly as it was.
-    expect(await rowsFor(db, bankA.id)).toEqual({ "memory.facts": 0, "memory.episodes": 0, "memory.outbox": 0, "retrieval.pgvector_index": 0, "extraction.runs": 0, "portability.exports": 0 });
+    expect(await rowsFor(db, bankA.id)).toEqual({ "memory.facts": 0, "memory.episodes": 0, "memory.outbox": 0, "retrieval.pgvector_index": 0, "extraction.runs": 0, "portability.exports": 0, "governance.grants": 0 });
     expect(await rowsFor(db, bankB.id)).toEqual(beforeB);
+
+    // Access is gone with the data: the dedicated agent's key is revoked (401 at the attachment), the shared principal
+    // keeps its key but has no grant on A any more (403), and nothing changed for bank B's agent.
+    const resolver = new ScopeResolver(new PgPrincipalRepository(db.pool), banksLookup, systemClock);
+    expect(await activeKeys(`agent-${bankA.id}`)).toBe(0);
+    expect(await activeKeys("lapsed")).toBe(0);
+    expect(await activeKeys("shared")).toBe(1);
+    expect(await activeKeys(`agent-${bankB.id}`)).toBe(1);
+    expect((await resolver.resolve(apiKeys.get(`agent-${bankA.id}`), bankA.id))).toEqual({ ok: false, error: { kind: "Unauthorized" } });
+    expect((await resolver.resolve(apiKeys.get("shared"), bankA.id))).toMatchObject({ ok: false, error: { kind: "NoGrant", bankId: bankA.id, principalId: "shared" } });
+    expect((await resolver.resolve(apiKeys.get("shared"), bankB.id)).ok).toBe(true);
+    expect((await resolver.resolve(apiKeys.get(`agent-${bankB.id}`), bankB.id)).ok).toBe(true);
+    expect((await db.pool.query<{ principal_id: string; bank_id: string }>("SELECT principal_id, bank_id FROM governance.grants ORDER BY 1")).rows).toEqual([
+      { principal_id: `agent-${bankB.id}`, bank_id: bankB.id },
+      { principal_id: "lapsed", bank_id: bankB.id },
+      { principal_id: "shared", bank_id: bankB.id },
+    ]);
     const recalled = await recall.handle(scopeFor(bankA.id, ["read"]), { bankId: bankA.id, query: "where does the user live, Lisbon?", includeEpisodes: true, limit: 10 });
     expect(recalled.ok && recalled.value).toEqual({ facts: [], episodes: [] });
     const recalledB = await recall.handle(scopeFor(bankB.id, ["read"]), { bankId: bankB.id, query: "where does the user live, Lisbon?", includeEpisodes: true, limit: 10 });
@@ -141,10 +183,11 @@ describeWithDb("EraseBank", () => {
     expect(entries.length).toBeGreaterThan(auditBefore);
     expect(verifyChain(entries, sha256)).toBeUndefined();
     const erasureEntries = entries.filter((e) => e.action.startsWith("erasure."));
-    expect(erasureEntries.map((e) => e.action)).toEqual(["erasure.requested", "erasure.deleted", "erasure.verified", "erasure.receipt_issued"]);
+    expect(erasureEntries.map((e) => e.action)).toEqual(["erasure.requested", "erasure.access_revoked", "erasure.deleted", "erasure.verified", "erasure.receipt_issued"]);
     expect(erasureEntries[0]?.details).toEqual({ requestId: request.id, subjectId: bankA.subjectId });
-    expect(erasureEntries[1]?.details).toMatchObject({ requestId: request.id, "deleted.memory.facts": 1, "deleted.memory.episodes": 2, "deleted.retrieval.pgvector": 3 });
-    expect(erasureEntries[3]?.details["digest"]).toBe(request.receipt?.digest);
+    expect(erasureEntries[1]?.details).toEqual({ requestId: request.id, "deleted.governance.grants": 3, "deleted.governance.api_keys": 2 });
+    expect(erasureEntries[2]?.details).toMatchObject({ requestId: request.id, "deleted.memory.facts": 1, "deleted.memory.episodes": 2, "deleted.retrieval.pgvector": 3, "deleted.governance.grants": 3, "deleted.governance.api_keys": 2 });
+    expect(erasureEntries[4]?.details["digest"]).toBe(request.receipt?.digest);
     expect(request.receipt).toMatchObject({ tenantId: tenant, bankId: bankA.id, subjectId: bankA.subjectId });
     expect(request.receipt?.deletions).toEqual(request.deletions);
     // A receipt with any signed field altered no longer verifies.
@@ -172,7 +215,7 @@ describeWithDb("EraseBank", () => {
     if (!r.ok) return;
     expect(r.value.state).toBe("failed");
     // Step and error kind only: the store's message (which may echo content) never leaves the process log.
-    expect(r.value.failure).toBe("purge of store 2 of 5 failed (Error)");
+    expect(r.value.failure).toBe("purge of store 2 of 6 failed (Error)");
     expect(r.value.receipt).toBeUndefined();
     expect(Object.fromEntries(r.value.deletions.map((d) => [d.store, d.deleted]))).toEqual({ "memory.facts": 1, "memory.episodes": 2, "memory.outbox": 3 });
     expect(r.value.inventory.map((i) => i.store)).toContain("engine.broken");
@@ -191,15 +234,24 @@ describeWithDb("EraseBank", () => {
     expect(erasureEntries[1]?.details).toEqual({ requestId: r.value.id, kind: "Error" });
     expect(JSON.stringify(erasureEntries)).not.toContain("unreachable");
 
+    // Access was not touched (its store runs last), so the dedicated eraser can still retry with the scope its own grant resolves to.
+    expect((await rowsFor(db, bankA.id))["governance.grants"]).toBe(3);
+    const resolver = new ScopeResolver(new PgPrincipalRepository(db.pool), banksLookup, systemClock);
+    const resolved = await resolver.resolve(apiKeys.get(`agent-${bankA.id}`), bankA.id);
+    expect(resolved.ok).toBe(true);
+    if (!resolved.ok) return;
     // The failed request is terminal: a retry with healthy stores finishes the job and receipts.
-    const retry = await handler().handle(eraser(bankA.id), bankA.id);
+    const retry = await handler().handle(resolved.value, bankA.id);
     expect(retry.ok && retry.value.state).toBe("receipted");
-    expect(await rowsFor(db, bankA.id)).toEqual({ "memory.facts": 0, "memory.episodes": 0, "memory.outbox": 0, "retrieval.pgvector_index": 0, "extraction.runs": 0, "portability.exports": 0 });
+    expect(retry.ok && retry.value.requestedBy).toBe(`agent-${bankA.id}`);
+    expect(await activeKeys(`agent-${bankA.id}`)).toBe(0);
+    expect(await rowsFor(db, bankA.id)).toEqual({ "memory.facts": 0, "memory.episodes": 0, "memory.outbox": 0, "retrieval.pgvector_index": 0, "extraction.runs": 0, "portability.exports": 0, "governance.grants": 0 });
     expect((await new PgBankRepository(db.pool).get(bankA.id))?.status).toBe("erased");
   });
 
   it("a store that still reports data after purge fails verification closed: no receipt, hits recorded", async () => {
     const sticky: ErasableStore = { count: async () => ({ "engine.sticky": 2 }), purge: async () => ({ "engine.sticky": 2 }) };
+    // Appended after the access store only to provoke a re-count failure; production lists keep the access store last.
     const r = await handler({ stores: [...stores, sticky] }).handle(eraser(bankA.id), bankA.id);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
@@ -209,9 +261,12 @@ describeWithDb("EraseBank", () => {
     expect(r.value.verifications.find((v) => v.store === "engine.sticky")?.hitsAfter).toBe(2);
     expect(r.value.verifications.find((v) => v.store === "memory.facts")?.hitsAfter).toBe(0);
     expect((await new PgBankRepository(db.pool).get(bankA.id))?.status).toBe("erasing");
+    // A re-count failure comes after the access store ran: the grants are gone, so a retry needs an operator to grant `erase` again.
+    expect((await rowsFor(db, bankA.id))["governance.grants"]).toBe(0);
+    expect(await activeKeys(`agent-${bankA.id}`)).toBe(0);
     const erasureEntries = (await audit.list(tenant)).filter((e) => e.action.startsWith("erasure."));
-    expect(erasureEntries.map((e) => e.action)).toEqual(["erasure.requested", "erasure.deleted", "erasure.failed"]);
-    expect(erasureEntries[2]?.details).toEqual({ requestId: r.value.id, kind: "VerificationFailed", stores: ["engine.sticky"] });
+    expect(erasureEntries.map((e) => e.action)).toEqual(["erasure.requested", "erasure.access_revoked", "erasure.deleted", "erasure.failed"]);
+    expect(erasureEntries[3]?.details).toEqual({ requestId: r.value.id, kind: "VerificationFailed", stores: ["engine.sticky"] });
   });
 
   it("if the audit entry cannot be written, the request is not even recorded, nothing is deleted and the bank is not frozen", async () => {

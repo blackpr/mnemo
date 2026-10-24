@@ -3,7 +3,7 @@ import { systemClock, type ModelRef } from "../../shared-kernel/index.js";
 import { createPool } from "../../platform/postgres/pool.js";
 import { migrate } from "../../platform/postgres/migrator.js";
 import { migrationSources } from "../../platform/postgres/migrations.js";
-import { PgAuditLog, PgErasureRequestRepository, PgErasureUnitOfWork, PgPrincipalRepository, ScopeResolver, scopeAccessPolicy } from "../../governance/index.js";
+import { PgAccessRevocation, PgAuditLog, PgErasureRequestRepository, PgErasureUnitOfWork, PgPrincipalRepository, ScopeResolver, scopeAccessPolicy } from "../../governance/index.js";
 import { PgBankRepository, PgEpisodeRepository, PgFactRepository, PgMemoryErasure, PgOutboxRelay, PgUnitOfWork, WriteExtractedFactsHandler } from "../../memory/index.js";
 import { embedderFromEnv, embeddingDimensionsFromEnv, engineFromEnv, EngineErasableStore, EngineMemoryFinder, IndexingProjector, PgvectorEngine, readPinnedIndex } from "../../retrieval/index.js";
 import { AiSdkLlmClient, ExtractionErasableStore, LlmExtractor, PgExtractionRunStore, RetainPipeline, type Extractor } from "../../extraction/index.js";
@@ -87,12 +87,13 @@ const app = createApp({
   episodes,
   finder: new EngineMemoryFinder(engine),
   exports,
-  // Every store that holds Subject data, Memory first. A new store (engine adapter, cache) must be listed here or erasure cannot prove it empty.
+  // Every store that holds Subject data, Memory first, then access to it last (so a data-store failure leaves the
+  // eraser able to retry). A new store (engine adapter, cache) must be listed here or erasure cannot prove it empty.
   erasure: {
     bank: memoryErasure,
     requests: new PgErasureRequestRepository(pool),
     uow: new PgErasureUnitOfWork(pool),
-    stores: [memoryErasure, new EngineErasableStore(engine), new ExtractionErasableStore(runs), new ExportsErasableStore(exports)],
+    stores: [memoryErasure, new EngineErasableStore(engine), new ExtractionErasableStore(runs), new ExportsErasableStore(exports), new PgAccessRevocation(pool)],
   },
 });
 

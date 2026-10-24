@@ -6,7 +6,7 @@ import { createPool } from "../platform/postgres/pool.js";
 import { migrate } from "../platform/postgres/migrator.js";
 import { migrationSources } from "../platform/postgres/migrations.js";
 import { randomUUID } from "node:crypto";
-import { AbandonErasureHandler, EraseBankHandler, type ErasureRequest, generateApiKey, hashApiKey, PgApiKeyStore, PgAuditLog, PgErasureRequestRepository, PgErasureUnitOfWork, PgPrincipalRepository, resolveScope, scopeAccessPolicy, type Grant } from "../governance/index.js";
+import { AbandonErasureHandler, EraseBankHandler, type ErasureRequest, generateApiKey, hashApiKey, PgAccessRevocation, PgApiKeyStore, PgAuditLog, PgErasureRequestRepository, PgErasureUnitOfWork, PgPrincipalRepository, resolveScope, scopeAccessPolicy, type Grant } from "../governance/index.js";
 import { sha256 } from "../platform/hash.js";
 import { createBank, PgBankRepository, PgEpisodeRepository, PgFactRepository, PgMemoryErasure, PgOutboxRelay, PgUnitOfWork, RecordEpisodeHandler } from "../memory/index.js";
 import { EXPORT_FORMATS, ExportBankHandler, ExportsErasableStore, ImportDocumentsHandler, PgExportStore, readClaudeCodeMemory, type ExportFormat } from "../portability/index.js";
@@ -40,9 +40,14 @@ import { assertPinnableDimensions, embedderFromEnv, embeddingDimensionsFromEnv, 
  * Erasure is different: it acts as a named principal that must hold `erase` (or `admin`) on the
  * bank, so the audit chain records who asked, and the CLI cannot bypass the policy the REST
  * attachment applies. It is synchronous and irreversible (hence --yes); the receipt digest is printed at
- * the end. `erasure-abandon` is the recovery path for a request left non-terminal by a crash: it marks it
- * failed (as "system:admin", audited) so the bank can be erased again; it deletes nothing, and refuses a
- * request whose row changed in the last 10 minutes (presumed still running) unless --force is given.
+ * the end. Erasure also removes every grant on the bank and revokes the API keys of principals that
+ * held grants on no other bank (the requesting principal included, if it was dedicated to the bank);
+ * that store runs last, so a data-store failure leaves the requester able to retry. If the request
+ * failed after access was removed (re-count failure), `grant --caps erase` again and retry; `grant`
+ * refuses `erased` banks but allows `erasing` ones for exactly this. `erasure-abandon` is the recovery
+ * path for a request left non-terminal by a crash: it marks it failed (as "system:admin", audited) so
+ * the bank can be erased again; it deletes nothing, and refuses a request whose row changed in the last
+ * 10 minutes (presumed still running) unless --force is given.
  *
  * The API key is printed once and never stored in plaintext. Every command refuses to silently
  * change existing state: create-* fail if the id exists, grants require matching tenants.
@@ -134,6 +139,7 @@ try {
       const bankId = asBankId(need("bank"));
       const bank = (await banks.get(bankId)) ?? die(`bank ${bankId} not found`);
       if (bank.tenantId !== principal.tenantId) die(`tenant mismatch: principal is in ${principal.tenantId}, bank is in ${bank.tenantId}`);
+      if (bank.status === "erased") die(`bank ${bankId} is erased; nothing is left to grant access to (its erasure record is readable with erasure-status)`);
       const caps = need("caps").split(",").map((s) => s.trim());
       const bad = caps.filter((c) => !(CAPABILITIES as readonly string[]).includes(c));
       if (bad.length > 0) die(`unknown capabilities: ${bad.join(", ")} (valid: ${CAPABILITIES.join(", ")})`);
@@ -287,14 +293,14 @@ try {
       const scope = resolveScope(principal, bankId, new Date()) ?? die(`principal ${principalId} has no live grant on ${bankId}`);
       // The retrieval store purged is whichever ENGINE this shell names; a server running another engine keeps its copy.
       const retrieval = engineFromEnv(pool, noEmbedder);
-      if (!values.yes) die(`erase-bank deletes every fact, episode, retrieval row (engine: ${retrieval.name}), extraction run and export record of ${bankId} (subject ${bank.subjectId}) and cannot be undone; re-run with --yes`);
+      if (!values.yes) die(`erase-bank deletes every fact, episode, retrieval row (engine: ${retrieval.name}), extraction run and export record of ${bankId} (subject ${bank.subjectId}), removes every grant on it and revokes the keys of principals granted on it alone; it cannot be undone; re-run with --yes`);
       const memoryErasure = new PgMemoryErasure(pool);
       const handler = new EraseBankHandler(
         scopeAccessPolicy,
         memoryErasure,
         new PgErasureUnitOfWork(pool),
-        // Memory first: see ErasableStore.
-        [memoryErasure, new EngineErasableStore(retrieval), new ExtractionErasableStore(new PgExtractionRunStore(pool)), new ExportsErasableStore(new PgExportStore(pool))],
+        // Memory first, access last: see ErasableStore.
+        [memoryErasure, new EngineErasableStore(retrieval), new ExtractionErasableStore(new PgExtractionRunStore(pool)), new ExportsErasableStore(new PgExportStore(pool)), new PgAccessRevocation(pool)],
         systemClock,
         randomUUID,
         sha256,

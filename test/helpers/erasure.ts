@@ -1,5 +1,5 @@
 import type pg from "pg";
-import { PgErasureRequestRepository, PgErasureUnitOfWork } from "../../src/governance/index.js";
+import { PgAccessRevocation, PgErasureRequestRepository, PgErasureUnitOfWork } from "../../src/governance/index.js";
 import { PgMemoryErasure } from "../../src/memory/index.js";
 import { EngineErasableStore, type RetrievalEngine } from "../../src/retrieval/index.js";
 import { ExtractionErasableStore, PgExtractionRunStore } from "../../src/extraction/index.js";
@@ -13,6 +13,6 @@ export function erasureDeps(pool: pg.Pool, engine: RetrievalEngine): ErasureDeps
     bank: memory,
     requests: new PgErasureRequestRepository(pool),
     uow: new PgErasureUnitOfWork(pool),
-    stores: [memory, new EngineErasableStore(engine), new ExtractionErasableStore(new PgExtractionRunStore(pool)), new ExportsErasableStore(new PgExportStore(pool))],
+    stores: [memory, new EngineErasableStore(engine), new ExtractionErasableStore(new PgExtractionRunStore(pool)), new ExportsErasableStore(new PgExportStore(pool)), new PgAccessRevocation(pool)],
   };
 }

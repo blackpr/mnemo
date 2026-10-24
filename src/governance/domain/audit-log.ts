@@ -20,6 +20,7 @@ export type AuditAction =
   | "extraction.applied"
   | "access.denied"
   | "erasure.requested"
+  | "erasure.access_revoked"
   | "erasure.deleted"
   | "erasure.verified"
   | "erasure.receipt_issued"

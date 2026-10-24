@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type pg from "pg";
+import pg from "pg";
 import type { BankId, Capability, PrincipalId, TenantId } from "../../../shared-kernel/index.js";
 import type { Queryable } from "../../../platform/postgres/pool.js";
 import { withTransaction } from "../../../platform/postgres/pool.js";
@@ -45,19 +45,24 @@ export class PgPrincipalRepository implements PrincipalRepository {
     return rows[0] ? this.hydrate(rows[0]) : undefined;
   }
 
+  /** The grants are replaced, not merged. On a pool this runs in its own transaction so no reader (erasure's access store included) sees the principal with its grants half-written. */
   async save(p: Principal): Promise<void> {
-    await this.db.query(
-      `INSERT INTO governance.principals (id, tenant_id, kind, display_name) VALUES ($1, $2, $3, $4)
-       ON CONFLICT (id) DO UPDATE SET kind = EXCLUDED.kind, display_name = EXCLUDED.display_name`,
-      [p.id, p.tenantId, p.kind, p.displayName],
-    );
-    await this.db.query("DELETE FROM governance.grants WHERE principal_id = $1", [p.id]);
-    for (const g of p.grants) {
-      await this.db.query(
-        "INSERT INTO governance.grants (principal_id, bank_id, capabilities, granted_at, expires_at) VALUES ($1, $2, $3, $4, $5)",
-        [p.id, g.bankId, [...g.capabilities], g.grantedAt, g.expiresAt ?? null],
+    const write = async (db: Queryable) => {
+      await db.query(
+        `INSERT INTO governance.principals (id, tenant_id, kind, display_name) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (id) DO UPDATE SET kind = EXCLUDED.kind, display_name = EXCLUDED.display_name`,
+        [p.id, p.tenantId, p.kind, p.displayName],
       );
-    }
+      await db.query("DELETE FROM governance.grants WHERE principal_id = $1", [p.id]);
+      for (const g of p.grants) {
+        await db.query(
+          "INSERT INTO governance.grants (principal_id, bank_id, capabilities, granted_at, expires_at) VALUES ($1, $2, $3, $4, $5)",
+          [p.id, g.bankId, [...g.capabilities], g.grantedAt, g.expiresAt ?? null],
+        );
+      }
+    };
+    if (this.db instanceof pg.Pool) await withTransaction(this.db, write);
+    else await write(this.db);
   }
 
   private async hydrate(r: PrincipalRow): Promise<Principal> {

@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { asPrincipalId, systemClock } from "../../src/shared-kernel/index.js";
-import { generateApiKey, PgApiKeyStore, PgAuditLog, PgPrincipalRepository, ScopeResolver, scopeAccessPolicy, verifyChain, type Principal } from "../../src/governance/index.js";
+import { generateApiKey, PgApiKeyStore, PgAuditLog, PgErasureRequestRepository, PgPrincipalRepository, ScopeResolver, scopeAccessPolicy, verifyChain, type Principal } from "../../src/governance/index.js";
 import { PgBankRepository, PgEpisodeRepository, PgFactRepository, PgOutboxRelay, PgUnitOfWork } from "../../src/memory/index.js";
 import { EngineMemoryFinder, HashingEmbedder, IndexingProjector, PgvectorEngine } from "../../src/retrieval/index.js";
 import { createApp } from "../../src/attachment/rest/app.js";
+import { serializeErasure } from "../../src/attachment/serialize.js";
 import { PgExportStore } from "../../src/portability/index.js";
 import { describeWithDb, setupTestDb, type TestDb } from "../helpers/postgres.js";
 import { bankFixture, tenant } from "../helpers/fixtures.js";
@@ -258,7 +259,7 @@ describeWithDb("REST attachment", () => {
     expect(audit.map((a) => a.action)).toEqual(["episode.recorded", "fact.asserted", "export.produced", "export.produced", "access.denied"]);
   });
 
-  it("erasure: needs the erase capability, runs to a receipt, is readable afterwards; a stuck request is 409", async () => {
+  it("erasure: needs the erase capability, runs to a receipt, removes every grant and dedicated key (the GET route is proven with a repository-level re-grant, which admin grant refuses on erased banks); a stuck request is 409", async () => {
     const principals = new PgPrincipalRepository(db.pool);
     const keys = new PgApiKeyStore(db.pool);
     const issue = async (id: string, bankId: string) => {
@@ -278,6 +279,9 @@ describeWithDb("REST attachment", () => {
     expect((await post(`/v1/banks/${bankA.id}/erasure`, rwKey, {})).status).toBe(403);
     expect((await post(`/v1/banks/${bankA.id}/erasure`, roKey, {})).status).toBe(403);
     expect((await rowsIn("memory.facts")).length).toBe(1);
+    // Unknown or malformed request ids are 404 (checked before the erasure: afterwards no key reaches the bank, see below).
+    expect((await app.request(`/v1/banks/${bankA.id}/erasure/not-a-uuid`, { headers: { authorization: `Bearer ${eraserKey}` } })).status).toBe(404);
+    expect((await app.request(`/v1/banks/${bankA.id}/erasure/00000000-0000-4000-8000-000000000000`, { headers: { authorization: `Bearer ${eraserKey}` } })).status).toBe(404);
 
     const res = await app.request(`/v1/banks/${bankA.id}/erasure`, { method: "POST", headers: { authorization: `Bearer ${eraserKey}` } });
     expect(res.status).toBe(201);
@@ -292,19 +296,32 @@ describeWithDb("REST attachment", () => {
       "retrieval.pgvector": [2, 2, 0],
       "extraction.runs": [0, 0, 0],
       "portability.exports": [0, 0, 0],
+      // Every grant on A (rw, ro, both, eraser) and the keys of the principals that existed only for A (rw, ro, eraser).
+      "governance.grants": [4, 4, 0],
+      "governance.api_keys": [3, 3, 0],
     });
     expect(await rowsIn("memory.facts")).toEqual([]);
     expect(await rowsIn("retrieval.pgvector_index")).toEqual([]);
+    expect(await rowsIn("governance.grants")).toEqual([]);
 
-    // Status: same evidence back; only with erase; unknown or malformed ids are 404; the other bank cannot see it.
-    const got = await app.request(`/v1/banks/${bankA.id}/erasure/${body.id}`, { headers: { authorization: `Bearer ${eraserKey}` } });
-    expect(got.status).toBe(200);
-    expect(await json(got)).toEqual(body);
-    expect((await get(`/v1/banks/${bankA.id}/erasure/${body.id}`, roKey)).status).toBe(403);
-    expect((await app.request(`/v1/banks/${bankA.id}/erasure/not-a-uuid`, { headers: { authorization: `Bearer ${eraserKey}` } })).status).toBe(404);
-    expect((await app.request(`/v1/banks/${bankA.id}/erasure/00000000-0000-4000-8000-000000000000`, { headers: { authorization: `Bearer ${eraserKey}` } })).status).toBe(404);
+    // Access went with the data: the eraser's and the readers' keys are revoked (401), the principal that also holds bank B
+    // keeps its key but no longer has a grant on A (403, audited). The receipt is the POST response and the stored request
+    // (`admin erasure-status` / `verify-receipt`); over REST nobody can read it back, since no grant on the bank is left.
+    expect((await app.request(`/v1/banks/${bankA.id}/erasure/${body.id}`, { headers: { authorization: `Bearer ${eraserKey}` } })).status).toBe(401);
+    expect((await get(`/v1/banks/${bankA.id}/erasure/${body.id}`, roKey)).status).toBe(401);
+    expect((await get(`/v1/banks/${bankA.id}/erasure/${body.id}`, bothKey)).status).toBe(403);
     expect((await get(`/v1/banks/${bankB.id}/erasure/${body.id}`, bothKey)).status).toBe(403);
     expect((await get(`/v1/banks/${bankB.id}/erasure/${body.id}`, eraserBKey)).status).toBe(404);
+    const stored = await new PgErasureRequestRepository(db.pool).get(body.id);
+    expect(stored && JSON.parse(JSON.stringify(serializeErasure(stored)))).toEqual(body);
+    // A grant written at the repository level (admin grant refuses erased banks; this only exercises the route): a fresh key with erase reads the record, read+write alone is 403 (audited).
+    const eraserAgain = await issue("eraser", bankA.id);
+    const bothAgain = (await principals.get(asPrincipalId("both")))!;
+    await principals.save({ ...bothAgain, grants: [...bothAgain.grants, { bankId: bankA.id, capabilities: new Set(["read", "write"]), grantedAt: new Date() }] });
+    const got = await app.request(`/v1/banks/${bankA.id}/erasure/${body.id}`, { headers: { authorization: `Bearer ${eraserAgain}` } });
+    expect(got.status).toBe(200);
+    expect(await json(got)).toEqual(body);
+    expect((await get(`/v1/banks/${bankA.id}/erasure/${body.id}`, bothKey)).status).toBe(403);
 
     // A request left in flight (as after a crash) makes a new one 409 until an operator abandons it.
     await db.pool.query("INSERT INTO governance.erasure_requests (id, tenant_id, bank_id, subject_id, requested_by, requested_at, state) VALUES ($1, $2, $3, $4, 'eraser-b', now(), 'inventoried')", [
@@ -314,22 +331,26 @@ describeWithDb("REST attachment", () => {
     expect(stuck.status).toBe(409);
     expect((await json<{ error: string }>(stuck)).error).toBe("erasure_in_flight");
 
-    // The bank is a tombstone: writes and exports are refused, recall is empty, the audit chain carries the receipt digest.
-    expect((await post(`/v1/banks/${bankA.id}/episodes`, rwKey, { source: "test", text: "after erasure" })).status).toBe(409);
-    expect((await get(`/v1/banks/${bankA.id}/export`, roKey)).status).toBe(409);
+    // The bank is a tombstone even for a principal an operator grants on it afterwards: writes and exports are refused,
+    // recall is empty, the audit chain carries the receipt digest.
+    expect((await post(`/v1/banks/${bankA.id}/episodes`, bothKey, { source: "test", text: "after erasure" })).status).toBe(409);
+    expect((await get(`/v1/banks/${bankA.id}/export`, bothKey)).status).toBe(409);
     expect(await rowsIn("portability.exports")).toEqual([]);
-    const recalled = await json<{ facts: unknown[]; episodes: unknown[] }>(await post(`/v1/banks/${bankA.id}/recall`, roKey, { query: "Lisbon", includeEpisodes: true }));
+    const recalled = await json<{ facts: unknown[]; episodes: unknown[] }>(await post(`/v1/banks/${bankA.id}/recall`, bothKey, { query: "Lisbon", includeEpisodes: true }));
     expect(recalled).toEqual({ facts: [], episodes: [] });
     const audit = await new PgAuditLog(db.pool).list(tenant);
     expect(verifyChain(audit, sha256)).toBeUndefined();
     expect(audit.filter((a) => a.action.startsWith("erasure.")).map((a) => [a.action, a.principalId])).toEqual([
       ["erasure.requested", "eraser"],
+      ["erasure.access_revoked", "eraser"],
       ["erasure.deleted", "eraser"],
       ["erasure.verified", "eraser"],
       ["erasure.receipt_issued", "eraser"],
     ]);
+    expect(audit.find((a) => a.action === "erasure.access_revoked")?.details).toEqual({ requestId: body.id, "deleted.governance.grants": 4, "deleted.governance.api_keys": 3 });
     expect(audit.find((a) => a.action === "erasure.receipt_issued")?.details["digest"]).toBe(body.receipt?.digest);
-    expect(audit.filter((a) => a.action === "access.denied").map((a) => a.principalId)).toEqual(["rw", "ro", "ro", "both"]);
+    // rw and ro: erasure without the capability; both: probing A with no grant left, B's erasure record without erase, then A's after the re-grant.
+    expect(audit.filter((a) => a.action === "access.denied").map((a) => [a.principalId, a.details["required"]])).toEqual([["rw", "erase"], ["ro", "erase"], ["both", "grant"], ["both", "erase"], ["both", "erase"]]);
   });
 
   it("projector is idempotent under redelivery", async () => {

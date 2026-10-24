@@ -33,8 +33,9 @@ const TERMINAL = new Set(["receipted", "failed"]);
  *   3. The bank is frozen (`erasing`) under a row lock: writers that already passed their status check
  *      finish first, later ones are refused, so no write can slip in while stores are being purged.
  *   4. Inventory: every store counts what it holds. Delete: every store purges, one at a time, each
- *      deletion saved on the request before the next store starts. Verify: every store counts again;
- *      any hit, or any inventoried store that did not report, fails closed.
+ *      deletion saved on the request before the next store starts (a store that declares `auditPurgeAs`,
+ *      the access store with `erasure.access_revoked`, gets its own audit entry in that same transaction).
+ *      Verify: every store counts again; any hit, or any inventoried store that did not report, fails closed.
  *   5. Only then: the bank becomes a tombstone (`erased`), and in one transaction the receipt is saved
  *      and its digest goes into the audit chain (`erasure.receipt_issued`).
  * Any failure leaves the request `failed` with the reason and whatever was deleted recorded per
@@ -111,7 +112,12 @@ export class EraseBankHandler {
       const deletedAt = this.clock.now();
       for (const [name, n] of Object.entries(deleted)) request = unwrap(recordDeletion(request, { store: name, deleted: n, deletedAt }));
       track(request);
-      await this.save(request);
+      const saved = request;
+      const action = store.auditPurgeAs;
+      await this.uow.run(async (tx) => {
+        await tx.requests.save(saved);
+        if (action) await tx.audit.append(this.entry(scope, saved, action, Object.fromEntries(Object.entries(deleted).map(([name, n]) => [`deleted.${name}`, n])), deletedAt));
+      });
     }
     at("deleted");
     request = unwrap(markDeleted(request));
