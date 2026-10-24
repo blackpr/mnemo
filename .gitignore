@@ -6,3 +6,5 @@ eval/corpus/index.json
 eval/results/
 .env
 .demo-key
+eval/datasets/raw/
+eval/datasets/corpus/

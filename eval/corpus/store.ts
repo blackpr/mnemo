@@ -27,8 +27,9 @@ export interface CorpusIndex {
 }
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-export const CORPUS_DIR = path.join(here, "normalized");
-export const INDEX_PATH = path.join(here, "index.json");
+/** EVAL_CORPUS_DIR points the arms at another corpus (a public benchmark built by `eval/datasets/build.ts`); its index.json lives inside it. */
+export const CORPUS_DIR = process.env.EVAL_CORPUS_DIR ? path.resolve(process.env.EVAL_CORPUS_DIR) : path.join(here, "normalized");
+export const INDEX_PATH = process.env.EVAL_CORPUS_DIR ? path.join(CORPUS_DIR, "index.json") : path.join(here, "index.json");
 
 export async function readIndex(): Promise<CorpusIndex> {
   try {

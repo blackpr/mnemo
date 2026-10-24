@@ -3,7 +3,7 @@
  * case per question, each graded by `llm-rubric` with the frozen grader prompt and this question's
  * rubric (question, type, answer key). The arms read the question and its conversation id from vars.
  *
- * Env for subsets: EVAL_CONVERSATIONS (comma-separated ids), EVAL_MAX_CONVERSATIONS, EVAL_MAX_QUESTIONS,
+ * Env for subsets: EVAL_QUESTIONS (path of the question file; default questions.jsonl), EVAL_CONVERSATIONS (comma-separated ids), EVAL_MAX_CONVERSATIONS, EVAL_MAX_QUESTIONS,
  * EVAL_MAX_PER_CONVERSATION (spread a small run across conversations), EVAL_REQUIRE_AUDITED=1 (only
  * audited questions, by a model or a human; since stage 2 that is all of them) or
  * EVAL_REQUIRE_AUDITED=human (only questions a human audited; none yet).
@@ -14,7 +14,8 @@ import { fileURLToPath } from "node:url";
 import type { TestCase } from "promptfoo";
 import { parseQuestionsJsonl, QUESTION_TYPES, rubricFor, type Question } from "./schema.js";
 
-const QUESTIONS_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "questions.jsonl");
+/** EVAL_QUESTIONS points at another question file (the public benchmark subsets live beside questions.jsonl, e.g. `eval/questions/locomo.jsonl`). */
+const QUESTIONS_PATH = process.env.EVAL_QUESTIONS ? path.resolve(process.env.EVAL_QUESTIONS) : path.join(path.dirname(fileURLToPath(import.meta.url)), "questions.jsonl");
 
 /**
  * Within each conversation, order questions round-robin over the types (one preference, one fact, one
@@ -68,7 +69,7 @@ export function toTestCase(q: Question): TestCase {
     description: `${q.id} [${q.type}]`,
     vars: { question: q.question, conversationId: q.conversationId, questionId: q.id, type: q.type, asOf: q.asOf ?? "", rubric: rubricFor(q) },
     assert: [{ type: "llm-rubric", value: "{{ rubric }}" }],
-    metadata: { questionId: q.id, conversationId: q.conversationId, type: q.type, audited: q.audited, auditedBy: q.auditedBy ?? null },
+    metadata: { questionId: q.id, conversationId: q.conversationId, type: q.type, audited: q.audited, auditedBy: q.auditedBy ?? null, datasetCategory: q.datasetCategory ?? null },
   };
 }
 

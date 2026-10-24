@@ -5,6 +5,10 @@
  *
  * For a temporal question the arm still sees every turn (that is what "full context" means) and is
  * told the as-of instant; filtering turns by time would be a retrieval policy, which this arm has none of.
+ *
+ * The history block is marked for Anthropic prompt caching (lib.ts `cachedPrefix`): on a long history
+ * the questions after the first read it at the cached rate. Nominal prompt tokens are still recorded
+ * per question; `promptCacheReadTokens` in the metadata says how many of them were cache reads.
  */
 import type { ApiProvider, CallApiContextParams, ProviderResponse } from "promptfoo";
 import { loadConversation, renderTurn } from "../corpus/store.js";
@@ -27,8 +31,10 @@ export default class FullContextProvider implements ApiProvider {
     const vars = evalVars(context);
     const turns = await loadConversation(vars.conversationId);
     const material = turns.map(renderTurn).join("\n\n");
-    const user = `Here is the user's full conversation history, oldest first.\n\n<history>\n${material}\n</history>\n\nQuestion: ${vars.question}${asOfInstruction(vars.asOf)}`;
-    const a = await answer(ARM, user, context);
+    // The history is the cacheable prefix (same bytes for every question on this conversation); the question follows it.
+    const prefix = `Here is the user's full conversation history, oldest first.\n\n<history>\n${material}\n</history>\n\n`;
+    const user = `${prefix}Question: ${vars.question}${asOfInstruction(vars.asOf)}`;
+    const a = await answer(ARM, user, context, { cachedPrefix: prefix });
     return providerResponse(ARM, a, context, { questionId: vars.questionId, conversationId: vars.conversationId, type: vars.type, asOf: vars.asOf ?? null, conversationTurns: turns.length, contextChars: material.length });
   }
 }

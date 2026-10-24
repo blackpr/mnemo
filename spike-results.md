@@ -114,3 +114,59 @@ rate), over the 15 USD target: Hindsight ingestion 11.9, promptfoo passes 5.9 (o
 exhausted API account and resumed from caches), Honcho 0.8, probes and contract runs 0.6. Stage 1
 cost about 5.8. The overrun is Hindsight's consolidation of the 64-turn conversation, which the
 12-turn smoke bank had not predicted linearly.
+
+## Public benchmarks (2026-10-24)
+
+Run after the decision above, on LoCoMo and LongMemEval-S subsets, to check whether four Claude
+Code conversations had hidden an engine advantage. Full tables, intervals, spend and the list of
+deviations are in `eval/RESULTS.md` ("Public benchmarks"); loaders and sources in `eval/datasets/`.
+The 45 USD cap bought 40 LoCoMo questions over 4 of its 10 conversations for all four arms (plus
+pgvector without extraction), and 20 LongMemEval questions over pooled evidence sessions for full
+context and raw pgvector only. Same answering model and grader as stage 2; extraction Opus 5.5 in
+B and C, Sonnet 4.5 in D.
+
+**The recommendation stands, with one change of tone.** On LoCoMo the ordering is Hindsight 82.5%
+(33/40), full context 75%, pgvector with extraction 75%, pgvector raw 67.5%, Honcho 62.5%; on the
+LongMemEval subset full context 95% and raw pgvector 90%. With four conversations as clusters
+every paired difference is inside its MDD and no t interval excludes zero (C−B +7.5 points, MDD 31;
+A−C −7.5, MDD 10.4, bootstrap interval [−10, −2.5] but t interval [−15.5, 0.5]; B−B-raw +7.5,
+MDD 10.4, bootstrap [2.5, 10]). So, as in stage 2, nothing is significant; unlike stage 2, the
+arms are no longer at the ceiling and the point estimates are not flat: Hindsight is ahead of
+pgvector-plus-extraction on every LoCoMo type except adversarial (temporal 7/8 vs 5/8, fact 14/16
+vs 12/16, multi-hop 6/8 vs 5/8, adversarial 6/8 vs 8/8), while Honcho is behind it on every type.
+Under the plan's rule there are no per-type numbers to report (every per-type difference is well
+inside a per-type MDD of 26 to 100 points on eight questions per type).
+
+What changes the reading is cost, and it goes the same way as stage 2: Hindsight spent 46 LLM
+tokens per corpus token (20.3 USD as billed for 89k tokens of transcript; output tokens are 11% of the
+tokens and 38% of the cost), our extraction 26 (11.1 USD), Honcho 2.7 on a cheaper model; per answered question
+including the write side, full context 0.041 USD, raw pgvector 0.052, Honcho 0.088, pgvector with
+extraction 0.294, Hindsight 0.554. On histories the size of LoCoMo's, read ten times, neither
+extracting arm amortizes against reading the history, and Hindsight's 7.5-point edge over our arm
+B costs 1.9x per question. The governance findings (trace rows after a bank delete, asynchronous
+deletion, no point-in-time filter) are unchanged by accuracy numbers. The honest summary of the
+rubric's accuracy rows after this run: Hindsight "beats pgvector within MDD, with a consistent
+sign across types on 40 questions"; Honcho "worse than pgvector within MDD". A decision run that
+could promote Hindsight's edge to a finding needs about 150 LoCoMo questions over all 10
+conversations for arms B and C (about 60 USD at these rates, almost all of it extraction), or
+Hindsight with consolidation off, which is a different engine.
+
+**Against the vendors' published numbers** (not comparable, for three reasons given below):
+
+| System | Vendor's LoCoMo | Vendor's LongMemEval-S | Here (LoCoMo, 40 q) | Here (LongMemEval pooled, 20 q) |
+| --- | --- | --- | --- | --- |
+| Hindsight | 92.0% (vectorize.io/benchmarks, benchmarks.hindsight.vectorize.io, "LoCoMo10"); 89.61% in the paper (arXiv 2512.12818, Gemini 3 as answer model) | 94.6% (same pages); 91.4% in the paper | 82.5% | not run |
+| Honcho | 89.9% (honcho.dev/evals; LLM judge, 1,540 questions, i.e. without the adversarial category; a third-party review notes the answer agent had the whole conversation in context) | 90.4% (honcho.dev/evals; 92.6% with Gemini 3 Pro; per type: knowledge update 94.9, temporal 88.7, multi-session 85.0) | 62.5% (Sonnet 4.5 deriver) | not run |
+| Full context (reference) | Honcho's page: 75.6% with Haiku 4.5 | Honcho's page: 62.6% with Haiku 4.5 | 75.0% (Opus 5.5, our grader) | 95.0% |
+
+Why the columns do not line up: (1) the grader: ours fails hedged answers and any adversarial
+answer that invents a specific, and both vendors use LLM judges of their own (Honcho explicitly
+not LoCoMo's F1; Hindsight's judge is in its paper's scripts); our full-context arm at 75% on
+LoCoMo with Opus 5.5 next to Honcho's 75.6% Haiku 4.5 baseline shows how much the grader moves
+the floor. (2) The question mix: LoCoMo numbers in the literature usually exclude the adversarial
+category; ours keeps it at a fifth of the set, where full context and Honcho scored 5/8. (3) Scale
+and history: 40 and 20 questions against 1,540 to 1,986 and 500, and our LongMemEval haystack is
+the evidence sessions pooled per user, not the benchmark's 115k-token haystack, so that column is
+easier than the published task. The published 90-to-95 figures are all within a few points of each
+other, which an independent leaderboard note also observes; on our sample the engines are 20
+points apart, in opposite directions from pgvector.

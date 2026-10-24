@@ -1,5 +1,189 @@
 # Eval results
 
+## Public benchmarks, 2026-10-24: LongMemEval-S and LoCoMo subsets
+
+### Spend estimate before the run (hard cap 45 USD for this session)
+
+Measured first on one LoCoMo conversation (`locomo49`, 25 session chunks, 18.1k corpus tokens),
+Opus 5.5 list prices (4 USD per million input, 20 per million output, cache reads 0.20):
+
+| Arm | Measured write cost on locomo49 | Per 1k corpus tokens | Basis |
+| --- | --- | --- | --- |
+| B-pgvector (our extraction, Opus 5.5) | 443,571 in / 24,892 out = 2.27 USD | 0.125 USD (24 LLM tokens per corpus token) | every extraction prompt carries the 12 most recent episodes and up to 200 facts |
+| C-hindsight (Opus 5.5, as shipped) | 728,779 in (148,308 cached) / 88,734 out over 71 LLM calls = 4.12 USD | 0.227 USD (40 LLM tokens per corpus token; 536 s to ingest) | retain plus background consolidation |
+| D-honcho (Sonnet 4.5 deriver) | not re-measured | about 0.02 USD (stage 2 ratio) | deriver counters |
+| A-full-context | n/a | about 0.01 USD per question-read with prompt caching | history block cached across a user's questions |
+| Reads (B, C, D) and grading | n/a | about 0.10 USD per question for three memory arms plus A, grader included | |
+
+What the task asked for (100 LongMemEval-S questions over their own 115k-token haystacks plus 100
+LoCoMo questions over all 10 conversations) is out of reach by more than an order of magnitude at
+these rates: arm A alone on real LongMemEval-S haystacks is about 0.46 USD per question, and the
+extracting arms would be in the hundreds of dollars (LoCoMo's 10 conversations are 183k corpus
+tokens, so B about 23 and C about 42 USD on LoCoMo by themselves). Even the pooled LongMemEval
+design below (evidence sessions only) at 100 + 100 questions would be about 135 USD.
+
+The subset therefore shrank to what 45 USD buys with the arms as they are (same extraction models
+as stage 2, nothing changed to make it cheaper):
+
+| Dataset | Subset (seed 20261024) | Corpus | Arms | Estimated cost |
+| --- | --- | --- | --- | --- |
+| LoCoMo | 4 of 10 conversations (seeded sample: conv-44, 47, 48, 49), 2 questions per category per conversation = 40 questions, 8 per category, 10 per conversation | 114 session chunks, 88.7k tokens | A, B, C, D, plus B-raw (pgvector over raw chunks, no extraction: the plan's own definition of arm B, zero write cost) | B 11.1, C 20.1, D 1.8, A 1.0, reads 3.8, grading 1.2 = 39.0 (6.4 of it already spent on the measurement) |
+| LongMemEval-S | 4 of each of our five types = 20 questions (one per type per synthetic user), 4 users | 100 chunks from 36 evidence sessions, 129.5k tokens | A and B-raw only; B with extraction (about 16 USD) and C (about 29 USD) do not fit; D (about 3.5 with its reads and grading) only if the LoCoMo run comes in under its estimate | A 1.0, reads 0.5, grading 0.25 = 1.8 (plus 3.5 with D) |
+
+Estimated total 40.8 USD without D on LongMemEval, 44.3 with it; the LoCoMo run goes first (arms A and
+B, then C with its trace totals watched per bank, then D and B-raw), and the LongMemEval arms are
+decided on the actual spend after it. Hindsight's number is the least certain: its consolidation
+cost did not scale linearly in stage 2.
+
+### LoCoMo: 4 conversations, 40 questions, five arms
+
+Setup: `locomo10.json` conversations conv-44, 47, 48, 49 (seeded sample of the 10), one corpus
+chunk per session (114 chunks, 88.7k tokens), 2 questions per dataset category per conversation
+(40: 8 multi-hop, 8 temporal, 8 open-domain, 8 single-hop, 8 adversarial). Answering model
+`anthropic:claude-opus-5-5` everywhere, grader `anthropic:claude-opus-5-5` with the frozen prompt
+(so a hedged answer fails and an adversarial question passes only on an explicit "not in the
+conversation"). Recall limit 10 as in stage 2 (`limit` is shared by facts and episodes, which is
+why arm B's material is small: its ten best hits are mostly facts). Arm B-raw is pgvector over the
+raw session chunks with no extraction (the plan's own definition of arm B). Arm A's history block is
+prompt-cached. Extraction: B and C Opus 5.5, D Sonnet 4.5 (Honcho cannot drive Claude 5).
+Results files: `eval/results/locomo-ab.json`, `locomo-c.json`, `locomo-d-braw.json`
+(`npm run eval:summary -- <the three files>`; `npm run eval:ci -- <the three files>`).
+
+| Measure | A-full-context | B-pgvector | B-pgvector-raw | C-hindsight | D-honcho |
+| --- | --- | --- | --- | --- | --- |
+| Accuracy, overall (40) | 75% (30/40) | 75% (30/40) | 68% (27/40) | 83% (33/40) | 63% (25/40) |
+| Accuracy, decision = 1 multi-hop (8) | 75% | 63% | 63% | 75% | 50% |
+| Accuracy, fact (16) = 4 single-hop (8) / 3 open-domain (8) | 81% = 88% / 75% | 75% = 75% / 75% | 69% = 63% / 75% | 88% = 88% / 88% | 69% = 63% / 75% |
+| Accuracy, temporal = 2 temporal (8) | 75% | 63% | 75% | 88% | 63% |
+| Accuracy, negative = 5 adversarial (8) | 63% | 100% | 63% | 75% | 63% |
+| Cluster-robust 95% CI, overall (G = 4, t = 3.18) | [65.8, 84.2] | [47.4, 100] | [43.6, 91.4] | [74.5, 90.5] | [32.4, 92.6] |
+| Read tokens per question (prompt, mean, nominal) | 31,982 (of which 27,000 cache reads) | 1,433 | 10,745 | 9,191 | 11,551 |
+| Write tokens, total (4 banks) | 0 | 2,352,590 | 0 | 4,072,499 (350 LLM calls, 711,006 cached; 164,781 embedding) | 240,374 (deriver counters) |
+| Write LLM tokens per corpus token | 0 | 26.5 | 0 | 45.9 | 2.7 |
+| Retrieval latency p50 / p95 (ms) | n/a | 244 / 294 | 266 / 338 | 3,882 / 5,148 | 241 / 385 |
+| End-to-end latency p50 / p95 (ms, uncached) | n/a (the recorded file is the rerun after the server kill; every A answer came from cache) | 2,514 / 4,229 | 3,088 / 4,850 | 6,837 / 9,197 | 3,268 / 5,390 |
+| Ingest seconds per chunk | n/a | 10.4 | 0.5 | 22.6 | 7.5 |
+| Write cost, total (USD, as billed: cache reads at 0.20, Sonnet 4.5 prices for D) | 0 | 11.12 | 0 | 20.27 (22.97 at list) | 1.25 |
+| Read cost, total (USD, as billed) | 1.37 (5.27 nominal; prompt caching) | 0.36 | 1.86 | 1.62 | 2.02 |
+| Grader cost, total (USD) | 0.25 | 0.27 | 0.23 | 0.27 | 0.24 |
+| Total per answered question incl. write (USD) | 0.041 | 0.294 | 0.052 | 0.554 | 0.088 |
+
+Paired differences (cluster-robust, G = 4; MDD at 80% power in brackets; none significant):
+A−B 0.0 [24.0]; A−B-raw +7.5 [19.9]; A−C −7.5 [10.4], t interval [−15.5, 0.5], cluster bootstrap
+[−10, −2.5]; A−D +12.5 [31.2]; B−B-raw +7.5 [10.4]; B−C −7.5 [31.2]; B−D +12.5 [26.2]; C−D +20.0
+[29.4]. Per type nothing comes within half of its MDD (eight questions per type per arm; the per-type
+MDDs are 26 to 100 points), so there is no per-type difference to report under the plan's rule.
+
+Reading:
+- Hindsight is the best arm on this sample (33/40, ahead of full context by three questions, with
+  the narrowest interval), and the only engine that beats pgvector-plus-extraction here, by 7.5
+  points on 40 questions with an MDD of 31. Its wins over B are on temporal (7/8 vs 5/8) and fact
+  (14/16 vs 12/16); B is better on adversarial (8/8 vs 6/8).
+- Full context is not a ceiling on LoCoMo under this grader: 75%. Its ten misses are three
+  adversarial questions answered with invented specifics (the strict negative rule), three "partial
+  set" answers (keys that list three or four items), and four genuine misreads of a 20k-token
+  two-person transcript. Honcho's own page reports 75.6% for a Haiku 4.5 full-context baseline on
+  LoCoMo; the number is in the same place for a different reason (its grader is more lenient, its
+  model smaller).
+- Arm B matches full context on 1,433 prompt tokens per question, 22x fewer, and is the only arm
+  with no false specifics on adversarial questions: with facts crowding out episodes under the shared
+  limit, the answering model sees extracted statements only, and when none fits it abstains. The
+  price is the misses where the fact was never extracted (q132, q45, q68: "I do not have that
+  information" against a key that is in the transcript), and the 11 USD of extraction for 89k
+  corpus tokens, 26 LLM tokens per corpus token (each prompt carries the 12 previous sessions and
+  up to 200 facts; `contextTurns` is not configurable from the environment, see follow-ups).
+- B-raw (no extraction) is 7.5 points under B on the same questions, interval [−0.5, 15.5], bootstrap
+  [2.5, 10]: the closest thing to a finding in this run, and it says extraction earns its keep on
+  abstention (8/8 vs 5/8) rather than on recall.
+- Honcho is last (25/40) with Sonnet 4.5 doing its extraction and the most material per question
+  (11.5k tokens); its misses are the same partial-set and adversarial questions as B-raw plus three
+  more facts, and its representation path produced no answer the message search did not.
+- Costs per answered question including the write side: A 0.041, B-raw 0.052, D 0.088, B 0.294,
+  C 0.554 USD. On a 20k-token history read 10 times, extraction does not amortize; Hindsight's 46
+  LLM tokens per corpus token (11% of them output tokens at five times the input price) is the
+  same order as stage 2's 68; output tokens are 11% of its write tokens and about 38% of its write cost.
+
+### LongMemEval-S (pooled evidence sessions): 4 synthetic users, 20 questions, arms A and B-raw
+
+Setup: 4 questions of each of our five types (seeded; dataset types in the table), one per type
+per user; a user's history is the union of its questions' evidence sessions in dataset order
+(7 to 14 sessions, 17 to 40 chunks, 21k to 52k tokens; 129.5k tokens in all). Temporal questions
+carry the dataset's `question_date` as `asOf`. Only full context and pgvector over raw chunks ran:
+extraction with Opus 5.5 (about 16 USD) and Hindsight (about 29 USD) did not fit the cap after the
+LoCoMo run, and Honcho (about 3.5 USD) would have taken the total past it. Results file:
+`eval/results/longmemeval-a-braw.json`.
+
+| Measure | A-full-context | B-pgvector-raw |
+| --- | --- | --- |
+| Accuracy, overall (20) | 95% (19/20) | 90% (18/20) |
+| preference = single-session-preference (4) | 100% | 100% |
+| fact = single-session-user 1 / single-session-assistant 2 / multi-session 1 | 100% | 75% (the multi-session question) |
+| decision = knowledge-update (4) | 100% | 100% |
+| temporal = temporal-reasoning (4) | 75% | 75% |
+| negative = abstention (4: one each of knowledge-update, multi-session, single-session-user, temporal-reasoning) | 100% | 100% |
+| Cluster-robust 95% CI, overall (G = 4) | [79.1, 100] | [71.6, 100] |
+| Read tokens per question (prompt, mean, nominal) | 46,377 (37,070 of them cache reads) | 18,265 |
+| Retrieval latency p50 / p95 (ms) | n/a | 288 / 359 |
+| End-to-end latency p50 / p95 (ms) | 3,917 / 6,843 | 3,182 / 5,712 |
+| Read cost, total (USD, as billed) | 1.17 (3.80 nominal) | 1.55 |
+| Grader cost, total (USD) | 0.11 | 0.11 |
+
+A−B-raw +5.0 points, interval [−10.9, 20.9], MDD 20.8, not significant. The three misses: both
+arms on the same temporal-reasoning question (neither committed to which show was started first;
+the key says the answer is in the sessions), and B-raw on the one multi-session question (a count
+of five items across sessions, it found four). Knowledge updates (4/4 both arms) and abstentions
+(4/4 both) were not where either arm failed on this sample. With the haystack reduced to the
+evidence sessions plus other questions' evidence, this is an easier task than LongMemEval-S, and
+20 questions over 4 users cannot rank anything: it says the pipeline runs on this benchmark and
+what it costs, no more.
+
+### Actual spend against the estimate
+
+As billed (Anthropic prices: Opus 5.5 at 4 / 20 USD per million, cache reads 0.20, cache writes
+5; Sonnet 4.5 at 3 / 15 for Honcho's deriver; OpenAI embeddings under 0.02):
+
+| Item | Estimate | Actual |
+| --- | --- | --- |
+| Measurement on locomo49 (B and C ingestion, 2 answers) | 6.4 | 6.4 |
+| LoCoMo arm B extraction (other 3 banks) and reads | 9.6 | 8.6 write + 0.4 read |
+| LoCoMo arm C Hindsight (other 3 banks) and reads | 16.0 + 1.0 | 16.2 write + 1.6 read |
+| LoCoMo arm D Honcho | 1.8 + 1.0 | 1.25 write + 2.0 read |
+| LoCoMo arm A | 1.0 | 1.4 |
+| LoCoMo B-raw reads | 0.8 | 1.9 |
+| LoCoMo grading (200 rows) | 1.2 | 1.3 |
+| LongMemEval A and B-raw with grading | 1.8 | 2.9 |
+| **Total** | **39.0 + 1.8 = 40.8** | **about 44.0** (about 53 at nominal list prices, i.e. without prompt caching and with Hindsight's cache reads at full price) |
+
+Under the 45 USD cap by about one dollar; the reads of B-raw and D (ten session chunks each) and
+the grader were under-estimated, Hindsight came in on its measured rate. Nothing was retried
+after a failure except the arm-B rows lost to the server kill, which re-spent nothing (A answers
+and grades came from promptfoo's cache, B's banks from the ingestion record).
+
+### Deviations from the task and follow-ups
+
+- Subset: 40 LoCoMo questions over 4 of 10 conversations and 20 LongMemEval questions over
+  pooled evidence sessions, instead of 100 + 100 over the full benchmarks; arms B (with extraction),
+  C and D did not run on LongMemEval. All cost, see the estimate above. The sample is seeded
+  (`EVAL_DATASET_SEED=20261024`) and rebuilt by `eval/datasets/build.ts`; growing it is a matter of
+  budget, not code.
+- Corpus unit is a session chunk, not a turn, in every arm (see `eval/README.md`); LoCoMo's two
+  speakers are both the Subject (role `user`, names in the text), so Honcho's "user" peer
+  represents both and arm B's extractor sees a two-person dialogue.
+- The grader is ours, not the benchmarks': stricter on hedging and on abstention than LongMemEval's
+  per-type prompts or LoCoMo's F1, so the absolute numbers are not comparable to published scores
+  (the comparison in `spike-results.md` says what can be said).
+- Arm B's material is small under the shared recall limit (ten best hits, mostly facts); a per-kind
+  limit in `recall` would make B's read side comparable to the engines' (follow-up for `src/`).
+- Extraction cost per corpus token (26 LLM tokens in B, 46 in Hindsight) is the number that
+  decides what any of these engines costs at history sizes like LoCoMo's; `RetainPipeline`'s
+  `contextTurns` (12 previous episodes in every prompt) is not configurable from the environment
+  and is most of arm B's write cost on session-sized episodes (follow-up for `src/`).
+- Cleanup: the twelve `eval-*` pgvector banks (four B, four B-raw, four LongMemEval raw) were erased
+  with receipts (`erasure_requests` holds the ids, all `receipted`), the four Hindsight banks deleted
+  (404 on re-read), the four Honcho workspaces and their sessions deleted (workspace list empty);
+  `bank-demo` untouched. The ingestion records under `eval/results/` still name the erased banks, so
+  a rerun must delete those entries first (`eval/README.md`).
+
 ## Stage 2 decision run, 2026-10-23/24: four arms, 40 audited questions, 4 conversations
 
 **This is the stage 2 run the plan asked for, at the corpus size we have.** It is complete (every

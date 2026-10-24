@@ -31,6 +31,13 @@ eval/
     pgvector.ts          arm B: retain through REST into eval-<id8>, drain, recall, answer
     hindsight.ts         arm C: Hindsight natively (its own extraction, recall), official TS client
     honcho.ts            arm D: Honcho natively (deriver, representation + message search), official SDK
+  datasets/
+    SOURCES.md           where the public benchmarks come from (licences, pinned revisions, hashes, fetch commands)
+    build.ts             raw download -> datasets/corpus/<dataset>/ (gitignored) + questions/<dataset>.jsonl (committed subset)
+    common.ts            corpus writer, dataset timestamp parsers, session chunking, seeded sampler
+    longmemeval.ts       LongMemEval-S (cleaned release) -> synthetic users over the evidence sessions; type mapping in the header
+    locomo.ts            LoCoMo (locomo10) -> one chunk per session; category mapping in the header
+    raw/, corpus/        (gitignored) the downloads and the built corpora with their sample.json manifests
   stats/
     rows.ts              the slice of a promptfoo results file the two scripts read
     summarize.ts         promptfoo results -> the section 6 table as Markdown
@@ -51,6 +58,29 @@ npm run eval:summary             # table from eval/results/latest.json (several 
 npm run eval:ci                  # cluster-robust CI by conversation, paired differences and MDD
 npm run eval:view                # promptfoo's browser UI over past runs
 ```
+
+Public benchmarks (LongMemEval-S and LoCoMo; results in `RESULTS.md`, "Public benchmarks"): fetch the
+raw files as `datasets/SOURCES.md` says, build a subset, then point the run at it with two variables
+(everything else, arms, grader, stats, is unchanged; the question files carry the dataset's own
+category in `datasetCategory`, which `eval:summary` and `eval:ci` report beside our five types):
+
+```bash
+LOCOMO_CONVERSATIONS=4 node --import tsx eval/datasets/build.ts locomo
+LME_PER_TYPE=4 LME_USERS=4 node --max-old-space-size=4096 --import tsx eval/datasets/build.ts longmemeval-s
+EVAL_QUESTIONS=eval/questions/locomo.jsonl EVAL_CORPUS_DIR=eval/datasets/corpus/locomo EVAL_RECALL_LIMIT=10 \
+  PROMPTFOO_DISABLE_TELEMETRY=1 node --env-file-if-exists=.env --import tsx node_modules/promptfoo/dist/src/entrypoint.js \
+  eval -c eval/promptfooconfig.yaml -o eval/results/locomo.json --no-progress-bar
+npm run eval:summary -- eval/results/locomo.json && npm run eval:ci -- eval/results/locomo.json
+```
+
+The corpus unit for a benchmark is one session (split at turn boundaries when longer than 7,000
+characters), not one turn: both benchmarks are annotated per session, and every extraction prompt
+in arm B carries the 12 most recent episodes and up to 200 facts, so per-turn ingestion of a
+600-turn LoCoMo conversation would cost an order of magnitude more for the same text. The recall limit stays at
+stage 2's 10 (`limit` is shared by facts and episodes in `recall`, so arm B sees the ten best of both); arm D's
+ten session chunks are more material than arm C's 4,096-token budget, which the read-token row reports.
+Arm A marks the history block for Anthropic prompt caching, so repeated questions on one history
+read it at the cached rate (`promptCacheReadTokens` per row; nominal prompt tokens unchanged).
 
 Needs: the server (`npm start`, :8787), `MEM_API_KEY` in `.env` for principal `eval-runner`
 (tenant `t-eval`; `admin create-principal` + `issue-key`), provider keys in `.env`, and for arms C

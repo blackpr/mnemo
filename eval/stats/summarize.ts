@@ -11,7 +11,7 @@
  * printed by `npm run eval:ci` (eval/stats/ci.ts).
  */
 import { costUsd, PRICE_USD_PER_MTOK } from "../llm.js";
-import { armOf, loadRows, typeOf, type Row } from "./rows.js";
+import { armOf, datasetCategoryOf, loadRows, typeOf, type Row } from "./rows.js";
 
 const files = process.argv.slice(2);
 const file = files.length > 0 ? files.join(", ") : "eval/results/latest.json";
@@ -27,6 +27,7 @@ const pct = (n: number, d: number): string => (d === 0 ? "n/a" : `${Math.round((
 
 const arms = [...new Set(rows.map(armOf))].sort();
 const types = [...new Set(rows.map(typeOf))].sort();
+const datasetCategories = [...new Set(rows.map(datasetCategoryOf).filter((c): c is string => c !== undefined))].sort();
 
 console.log(`Source: ${file} (${rows.length} answered results, ${arms.length} arm(s), ${new Set(rows.map((r) => String(r.vars?.conversationId ?? ""))).size} conversation(s)).`);
 if (notRun.size > 0) console.log(`Not run (provider error, excluded from every row below): ${[...notRun].map(([a, n]) => `${a} ${n}`).join(", ")}.`);
@@ -46,6 +47,10 @@ table.push(["Extraction model (write path)", ...col((rs) => {
 table.push(["Accuracy, overall", ...col((rs) => pct(rs.filter((r) => r.success).length, rs.length))]);
 for (const t of types) table.push([`Accuracy, ${t}`, ...col((rs) => {
   const sub = rs.filter((r) => typeOf(r) === t);
+  return pct(sub.filter((r) => r.success).length, sub.length);
+})]);
+for (const c of datasetCategories) table.push([`Accuracy, dataset category ${c}`, ...col((rs) => {
+  const sub = rs.filter((r) => datasetCategoryOf(r) === c);
   return pct(sub.filter((r) => r.success).length, sub.length);
 })]);
 table.push(["Read tokens per question (prompt, mean, nominal)", ...col((rs) => Math.round(rs.reduce((n, r) => n + num(r.response?.tokenUsage?.prompt), 0) / Math.max(1, rs.length)).toLocaleString())]);

@@ -19,8 +19,10 @@ export const questionSchema = z.object({
   type: z.enum(QUESTION_TYPES),
   evidenceTurnIndexes: z.array(z.number().int().nonnegative()).default([]),
   audited: z.boolean(),
-  /** Who settled the key: a model re-reading the transcript (stage 2) or a human. The plan wants a human audit; this keeps the two distinguishable. */
-  auditedBy: z.enum(["model", "human"]).optional(),
+  /** Who settled the key: a model re-reading the transcript (stage 2), a human, or a public benchmark's published answer key (`dataset`). The plan wants a human audit; this keeps them distinguishable. */
+  auditedBy: z.enum(["model", "human", "dataset"]).optional(),
+  /** Public benchmarks only: the dataset's own category (e.g. LongMemEval `knowledge-update`, LoCoMo `1 multi-hop`), reported beside our five types. */
+  datasetCategory: z.string().optional(),
   note: z.string().optional(),
 });
 

@@ -56,5 +56,10 @@ export async function loadRows(files: readonly string[]): Promise<{ rows: Row[];
 /** The arm name the provider recorded (B-pgvector vs B-pgvector-raw share one YAML label), else the label. */
 export const armOf = (r: Row): string => String(r.response?.metadata?.arm ?? r.provider?.label ?? r.provider?.id ?? "?");
 export const typeOf = (r: Row): string => String(r.testCase?.metadata?.type ?? r.vars?.type ?? "?");
+/** Public benchmarks carry the dataset's own category beside our type; undefined for the Claude Code corpus. */
+export const datasetCategoryOf = (r: Row): string | undefined => {
+  const c = r.testCase?.metadata?.datasetCategory;
+  return typeof c === "string" && c !== "" ? c : undefined;
+};
 export const conversationOf = (r: Row): string => String(r.vars?.conversationId ?? r.testCase?.metadata?.conversationId ?? "?");
 export const questionOf = (r: Row): string => String(r.vars?.questionId ?? r.testCase?.metadata?.questionId ?? r.testCase?.description ?? "?");

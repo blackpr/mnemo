@@ -42,8 +42,22 @@ export interface AnswerResult {
   readonly text: string;
   readonly inputTokens: number;
   readonly outputTokens: number;
+  /** Prompt tokens the provider served from its prompt cache (arm A marks its history block for Anthropic prompt caching); nominal inputTokens include them. */
+  readonly cacheReadTokens: number;
+  readonly cacheWriteTokens: number;
   readonly latencyMs: number;
   readonly cached: boolean;
+}
+
+export interface AnswerOptions {
+  /**
+   * The leading part of the user prompt that repeats across questions (arm A's whole history). It is
+   * sent as its own text part with Anthropic `cacheControl`, so consecutive questions on one history
+   * read the prefix from the provider's cache (about a tenth of the list price) instead of paying for
+   * it again; the answer and the nominal token counts are unchanged. The memoization key is the same
+   * as for an unsplit prompt.
+   */
+  readonly cachedPrefix?: string;
 }
 
 /** Resolved on first use, so merely importing an arm (promptfoo view, typecheck tooling) needs no credentials. */
@@ -74,15 +88,39 @@ function answerCache(context: CallApiContextParams | undefined): AnswerCache | u
  * Generation options (MAX_OUTPUT_TOKENS, provider defaults) are part of the frozen setup and not in the
  * key; changing them means one run with PROMPTFOO_CACHE_ENABLED=false.
  */
-export async function answer(arm: string, user: string, context: CallApiContextParams | undefined): Promise<AnswerResult> {
+export async function answer(arm: string, user: string, context: CallApiContextParams | undefined, options: AnswerOptions = {}): Promise<AnswerResult> {
+  const prefix = options.cachedPrefix ?? "";
+  if (!user.startsWith(prefix)) throw new Error("cachedPrefix must be a prefix of the user prompt");
   const key = `mem-eval:${createHash("sha256").update(JSON.stringify([arm, ANSWERING_MODEL, ANSWER_SYSTEM, user])).digest("hex")}`;
   const cache = answerCache(context);
   const hit = await cache?.get(key);
-  if (typeof hit === "string") return { ...(JSON.parse(hit) as AnswerResult), latencyMs: 0, cached: true };
+  if (typeof hit === "string") {
+    // Entries written before cache-read accounting existed lack the two cache fields.
+    const stored = JSON.parse(hit) as Partial<AnswerResult> & Pick<AnswerResult, "text" | "inputTokens" | "outputTokens">;
+    return { ...stored, cacheReadTokens: stored.cacheReadTokens ?? 0, cacheWriteTokens: stored.cacheWriteTokens ?? 0, latencyMs: 0, cached: true };
+  }
   model ??= languageModel(ANSWERING_MODEL);
   const started = Date.now();
-  const result = await generateText({ model, instructions: ANSWER_SYSTEM, prompt: user, maxOutputTokens: MAX_OUTPUT_TOKENS, abortSignal: AbortSignal.timeout(LLM_TIMEOUT_MS) });
-  const out: AnswerResult = { text: result.text.trim(), inputTokens: result.usage.inputTokens ?? 0, outputTokens: result.usage.outputTokens ?? 0, latencyMs: Date.now() - started, cached: false };
+  const rest = user.slice(prefix.length);
+  // A second, empty text block is rejected by the API; with nothing after the prefix there is nothing to split.
+  const content: Array<{ type: "text"; text: string; providerOptions?: { anthropic: { cacheControl: { type: "ephemeral" } } } }> =
+    prefix === "" || rest === ""
+      ? [{ type: "text", text: user }]
+      : [
+          { type: "text", text: prefix, providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } } },
+          { type: "text", text: rest },
+        ];
+  const result = await generateText({ model, instructions: ANSWER_SYSTEM, messages: [{ role: "user", content }], maxOutputTokens: MAX_OUTPUT_TOKENS, abortSignal: AbortSignal.timeout(LLM_TIMEOUT_MS) });
+  const details = result.usage.inputTokenDetails;
+  const out: AnswerResult = {
+    text: result.text.trim(),
+    inputTokens: result.usage.inputTokens ?? 0,
+    outputTokens: result.usage.outputTokens ?? 0,
+    cacheReadTokens: details?.cacheReadTokens ?? 0,
+    cacheWriteTokens: details?.cacheWriteTokens ?? 0,
+    latencyMs: Date.now() - started,
+    cached: false,
+  };
   if (out.text === "") throw new Error(`answering model returned no text (finishReason ${JSON.stringify(result.finishReason)})`);
   await cache?.set(key, JSON.stringify(out));
   return out;
@@ -107,7 +145,7 @@ export function providerResponse(arm: string, a: AnswerResult, context: CallApiC
     tokenUsage: { prompt: a.inputTokens, completion: a.outputTokens, total: a.inputTokens + a.outputTokens, numRequests: a.cached ? 0 : 1, ...(a.cached ? { cached: a.inputTokens + a.outputTokens } : {}) },
     latencyMs: totalLatencyMs,
     cached: a.cached,
-    metadata: { arm, answeringModel: ANSWERING_MODEL, graderModel: graderModelOf(context), answerLatencyMs: a.latencyMs, promptTokens: a.inputTokens, completionTokens: a.outputTokens, ...metadata },
+    metadata: { arm, answeringModel: ANSWERING_MODEL, graderModel: graderModelOf(context), answerLatencyMs: a.latencyMs, promptTokens: a.inputTokens, completionTokens: a.outputTokens, promptCacheReadTokens: a.cacheReadTokens, promptCacheWriteTokens: a.cacheWriteTokens, ...metadata },
   };
 }
 

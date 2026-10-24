@@ -63,4 +63,23 @@ for (let i = 0; i < arms.length; i++) {
     console.log(`| ${arms[i]} | ${arms[j]} | ${paired.length} | ${d.clusters} | ${pp(d.mean)}${band} | ${pp(d.se)} | ${interval(d.low, d.high)} | ${interval(d.bootstrapLow, d.bootstrapHigh)} | ${pp(d.mdd)} | ${Number.isFinite(d.se) ? (d.significant ? "yes" : "no") : "n/a"} |`);
   }
 }
+console.log("\nPaired differences per question type (same estimator; the per-type numbers the public-benchmark write-up reports where an engine differs from pgvector by more than the MDD):\n");
+console.log("| X | Y | Type | Common questions | G | Difference | 95% CI (t) | MDD | Significant |");
+console.log("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+for (let i = 0; i < arms.length; i++) {
+  for (let j = i + 1; j < arms.length; j++) {
+    const yById = new Map(rows.filter((r) => armOf(r) === arms[j]).map((r) => [questionOf(r), r]));
+    for (const t of types) {
+      const paired: Obs[] = [];
+      for (const rx of rows.filter((r) => armOf(r) === arms[i] && typeOf(r) === t)) {
+        const ry = yById.get(questionOf(rx));
+        if (ry) paired.push({ cluster: conversationOf(rx), y: Number(rx.success) - Number(ry.success) });
+      }
+      if (paired.length === 0) continue;
+      const d = pairedDifference(paired);
+      const band = !Number.isFinite(d.mdd) ? "" : Math.abs(d.mean) > d.mdd ? " (beyond MDD)" : " (within MDD)";
+      console.log(`| ${arms[i]} | ${arms[j]} | ${t} | ${paired.length} | ${d.clusters} | ${pp(d.mean)}${band} | ${interval(d.low, d.high)} | ${pp(d.mdd)} | ${Number.isFinite(d.se) ? (d.significant ? "yes" : "no") : "n/a"} |`);
+    }
+  }
+}
 console.log("\nReading: the MDD is what this design could have detected with 80% power given the observed spread; a difference below it is noise unless its interval excludes zero (plan section 6). With G = 4 the t critical value is 3.18; the interval width is the finding.");
