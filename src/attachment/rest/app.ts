@@ -2,8 +2,11 @@ import { randomUUID } from "node:crypto";
 import { Hono, type Context } from "hono";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import { HTTPException } from "hono/http-exception";
+import { getConnInfo } from "@hono/node-server/conninfo";
+import { rateLimiter } from "hono-rate-limiter";
 import type { ZodType } from "zod";
 import { asBankId, asEpisodeId, asFactId, type BankId, type Scope } from "../../shared-kernel/index.js";
+import { hashApiKey, looksLikeApiKey } from "../../governance/index.js";
 import { auditDenial, buildHandlers, type AppError, type AttachmentDeps } from "../handlers.js";
 import { createMcpServer } from "../mcp/server.js";
 import { serializeEpisode, serializeErasure, serializeFact } from "../serialize.js";
@@ -16,18 +19,61 @@ import { assertFactBody, erasureIdParam, exportQuery, listFactsQuery, recallBody
  * result. No domain logic lives here. Application handlers write their own audit entries
  * (inside the transaction for writes); the attachment only audits denials it sees first.
  * The MCP attachment is mounted on the same app under /v1/banks/:bankId/mcp and shares the
- * auth middleware and handlers.
+ * auth middleware, the rate limit and the handlers.
+ *
+ * Rate limit: two fixed one-minute windows over everything under /v1 (MCP included), `hono-rate-limiter`
+ * with its in-memory store, 429 `rate_limited` with the IETF draft-6 `RateLimit-*` headers and
+ * `Retry-After`. First a ceiling per client address (TCP peer, never X-Forwarded-For; default ten times
+ * the per-key limit) so a client rotating made-up tokens cannot dodge the limiter or grow the store
+ * without bound; then the per-key limit, keyed by the sha256 of a well-formed bearer token (the plaintext
+ * is never held; the hash is the one `governance.api_keys` stores), while requests with no token or a
+ * malformed one share the address's bucket. Windows start at a key's first hit, so a client can burst
+ * up to twice the limit across a reset. The headers describe the limiter that answered. The counters
+ * live in this process: several instances need a shared store (`@hono-rate-limiter/redis`, or a `Store`
+ * over Postgres, or `rate-limiter-flexible`'s Postgres limiter); not built.
  */
 export type RestDeps = AttachmentDeps;
 
+export interface AppOptions {
+  /** Requests per API key per minute under /v1; default 600 (RATE_LIMIT_PER_MINUTE); 0 disables both limiters (tests). */
+  readonly rateLimitPerMinute?: number;
+  /** Requests per client address per minute, all keys together; default ten times the per-key limit (RATE_LIMIT_PER_ADDRESS_PER_MINUTE); 0 means no address ceiling. */
+  readonly rateLimitPerAddressPerMinute?: number;
+}
+
+export const DEFAULT_RATE_LIMIT_PER_MINUTE = 600;
+export const ADDRESS_LIMIT_FACTOR = 10;
+
 type Env = { Variables: { scope: Scope; bankId: BankId } };
 
-export function createApp(deps: RestDeps): Hono<Env> {
+export function createApp(deps: RestDeps, options: AppOptions = {}): Hono<Env> {
   const app = new Hono<Env>();
   const handlers = buildHandlers(deps);
   const { recordEpisode, recall, assertFact: assertFactH, listFacts, getFact, setConfirmation, exportBank, eraseBank, getErasure } = handlers;
+  const perMinute = options.rateLimitPerMinute ?? DEFAULT_RATE_LIMIT_PER_MINUTE;
+  const perAddress = options.rateLimitPerAddressPerMinute ?? perMinute * ADDRESS_LIMIT_FACTOR;
 
   app.get("/healthz", (c) => c.json({ ok: true }));
+
+  // Rate limits first: they cost no database round trip and also cover unauthenticated probing.
+  if (perMinute > 0) {
+    const addressBucket = (c: Context) => `addr:${remoteAddress(c) ?? "unknown"}`;
+    if (perAddress > 0) app.use("/v1/*", rateLimiter<Env>({ windowMs: 60_000, limit: perAddress, standardHeaders: "draft-6", keyGenerator: addressBucket, message: { error: "rate_limited" } }));
+    app.use(
+      "/v1/*",
+      rateLimiter<Env>({
+        windowMs: 60_000,
+        limit: perMinute,
+        standardHeaders: "draft-6",
+        keyGenerator: (c) => {
+          const token = bearerToken(c.req.header("authorization"));
+          // Only a well-formed key gets its own bucket; anything else is the address's problem, so made-up tokens never allocate.
+          return token && looksLikeApiKey(token) ? `key:${hashApiKey(token)}` : addressBucket(c);
+        },
+        message: { error: "rate_limited" },
+      }),
+    );
+  }
 
   // Deny by default: anything under /v1 that is not a bank-scoped route is 404, never unauthenticated.
   app.use("/v1/*", async (c, next) => {
@@ -65,8 +111,12 @@ export function createApp(deps: RestDeps): Hono<Env> {
     try {
       return (await transport.handleRequest(c)) ?? c.json({ error: "not_found" }, 404);
     } catch (e) {
-      // The transport reports protocol errors (406/415/400/404) as HTTPExceptions with JSON-RPC bodies.
-      if (e instanceof HTTPException) return e.getResponse();
+      // The transport reports protocol errors (406/415/400/404) as HTTPExceptions with JSON-RPC bodies. Rebuilt through the
+      // context so the headers middleware set (RateLimit-*) are kept; a raw Response would drop them.
+      if (e instanceof HTTPException) {
+        const res = e.getResponse();
+        return c.newResponse(res.body, res.status as 400, Object.fromEntries(res.headers));
+      }
       throw e;
     } finally {
       server.close().catch(() => {});
@@ -207,6 +257,15 @@ export function createApp(deps: RestDeps): Hono<Env> {
   });
 
   return app;
+}
+
+/** The client's address under @hono/node-server; undefined on other runtimes and in-process tests (`app.request`). */
+function remoteAddress(c: Context): string | undefined {
+  try {
+    return getConnInfo(c).remote.address;
+  } catch {
+    return undefined;
+  }
 }
 
 /** RFC 7235: the scheme is case-insensitive. */

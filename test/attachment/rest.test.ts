@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { asPrincipalId, systemClock } from "../../src/shared-kernel/index.js";
 import { generateApiKey, PgApiKeyStore, PgAuditLog, PgErasureRequestRepository, PgPrincipalRepository, ScopeResolver, scopeAccessPolicy, verifyChain, type Principal } from "../../src/governance/index.js";
 import { PgBankRepository, PgEpisodeRepository, PgFactRepository, PgOutboxRelay, PgUnitOfWork } from "../../src/memory/index.js";
@@ -16,6 +16,7 @@ const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 describeWithDb("REST attachment", () => {
   let db: TestDb;
   let app: ReturnType<typeof createApp>;
+  let deps: Parameters<typeof createApp>[0];
   let relay: PgOutboxRelay;
   let projector: IndexingProjector;
   let rwKey: string; // read+write on bank A
@@ -44,7 +45,7 @@ describeWithDb("REST attachment", () => {
     const episodes = new PgEpisodeRepository(db.pool);
     relay = new PgOutboxRelay(db.pool);
     projector = new IndexingProjector(engine, facts, episodes);
-    app = createApp({
+    deps = {
       scopes: new ScopeResolver(new PgPrincipalRepository(db.pool), new PgBankRepository(db.pool), systemClock),
       access: scopeAccessPolicy,
       audit: new PgAuditLog(db.pool),
@@ -56,9 +57,11 @@ describeWithDb("REST attachment", () => {
       finder: new EngineMemoryFinder(engine),
       exports: new PgExportStore(db.pool),
       erasure: erasureDeps(db.pool, engine),
-    });
+    };
+    app = createApp(deps);
   });
   afterAll(async () => db.close());
+  afterEach(() => vi.useRealTimers());
 
   beforeEach(async () => {
     await db.truncateAll();
@@ -351,6 +354,53 @@ describeWithDb("REST attachment", () => {
     expect(audit.find((a) => a.action === "erasure.receipt_issued")?.details["digest"]).toBe(body.receipt?.digest);
     // rw and ro: erasure without the capability; both: probing A with no grant left, B's erasure record without erase, then A's after the re-grant.
     expect(audit.filter((a) => a.action === "access.denied").map((a) => [a.principalId, a.details["required"]])).toEqual([["rw", "erase"], ["ro", "erase"], ["both", "grant"], ["both", "erase"], ["both", "erase"]]);
+  });
+
+  it("rate limit: per API key over everything under /v1 (MCP included), 429 with the standard headers; a per-address ceiling catches clients without a valid key; /healthz is exempt; the window resets", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    const limited = createApp(deps, { rateLimitPerMinute: 3, rateLimitPerAddressPerMinute: 10 });
+    // @hono/node-server exposes the socket on c.env; the test injects it the same way (app.request's third argument).
+    const from = (address: string) => ({ incoming: { socket: { remoteAddress: address } } });
+    const list = (key: string, address = "10.0.0.1") => limited.request(`/v1/banks/${bankA.id}/facts`, { headers: headers(key) }, from(address));
+    for (const remaining of ["2", "1", "0"]) {
+      const res = await list(rwKey);
+      expect(res.status).toBe(200);
+      expect([res.headers.get("ratelimit-limit"), res.headers.get("ratelimit-remaining"), res.headers.get("ratelimit-policy")]).toEqual(["3", remaining, "3;w=60"]);
+    }
+    const blocked = await list(rwKey);
+    expect(blocked.status).toBe(429);
+    expect(await json(blocked)).toEqual({ error: "rate_limited" });
+    expect(blocked.headers.get("ratelimit-remaining")).toBe("0");
+    expect(Number(blocked.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect(Number(blocked.headers.get("ratelimit-reset"))).toBeGreaterThan(0);
+    // The same key is throttled on the MCP route too, before any handler or transport runs.
+    const mcp = await limited.request(`/v1/banks/${bankA.id}/mcp`, { method: "POST", headers: { ...headers(rwKey), accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }) });
+    expect(mcp.status).toBe(429);
+    // Other keys have their own window; the bucket is the key's hash, so a key is never compared in plaintext.
+    expect((await list(roKey)).status).toBe(200);
+    // No credential, or a malformed one, counts against the client's address: 401 until that window is spent, then 429; another address is unaffected.
+    const anon = (address: string, token = "Bearer mem_nope") => limited.request(`/v1/banks/${bankA.id}/facts`, { headers: { authorization: token } }, from(address));
+    for (let i = 0; i < 3; i++) expect((await anon("10.0.0.2")).status).toBe(401);
+    expect((await anon("10.0.0.2")).status).toBe(429);
+    expect((await anon("10.0.0.2", "Bearer ")).status).toBe(429);
+    expect((await anon("10.0.0.3")).status).toBe(401);
+    // Rotating well-formed but unknown tokens gets a fresh key bucket each time, so the per-address ceiling (10 here) is what stops it: 5 more from 10.0.0.1 (5 spent above) then 429.
+    const fresh = () => `Bearer mem_${"x".repeat(40)}${Math.random().toString(36).slice(2, 8)}`;
+    for (let i = 0; i < 5; i++) expect((await anon("10.0.0.1", fresh())).status).toBe(401);
+    const ceiling = await anon("10.0.0.1", fresh());
+    expect(ceiling.status).toBe(429);
+    expect(ceiling.headers.get("ratelimit-limit")).toBe("10");
+    // Unknown address (no socket, as in-process requests without an env): one shared bucket, never a crash.
+    expect((await limited.request(`/v1/banks/${bankA.id}/facts`, { headers: headers(roKey) })).status).toBe(200);
+    // Health is outside /v1 and never limited; the default app advertises its 600/minute.
+    for (let i = 0; i < 5; i++) expect((await limited.request("/healthz")).status).toBe(200);
+    expect((await get(`/v1/banks/${bankA.id}/facts`, rwKey)).headers.get("ratelimit-limit")).toBe("600");
+    // The window is fixed from the first hit: a minute later the exhausted key is served again.
+    vi.advanceTimersByTime(60_001);
+    expect((await list(rwKey, "10.0.0.9")).status).toBe(200);
+    // An explicit 0 for the address ceiling means none, not "nothing allowed".
+    const noCeiling = createApp(deps, { rateLimitPerMinute: 3, rateLimitPerAddressPerMinute: 0 });
+    for (let i = 0; i < 5; i++) expect((await noCeiling.request(`/v1/banks/${bankA.id}/facts`, { headers: { authorization: fresh() } }, from("10.0.0.1"))).status).toBe(401);
   });
 
   it("projector is idempotent under redelivery", async () => {

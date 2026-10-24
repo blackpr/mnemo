@@ -8,14 +8,16 @@ import { PgBankRepository, PgEpisodeRepository, PgFactRepository, PgMemoryErasur
 import { embedderFromEnv, embeddingDimensionsFromEnv, engineFromEnv, EngineErasableStore, EngineMemoryFinder, IndexingProjector, PgvectorEngine, readPinnedIndex } from "../../retrieval/index.js";
 import { AiSdkLlmClient, ExtractionErasableStore, LlmExtractor, PgExtractionRunStore, RetainPipeline, type Extractor } from "../../extraction/index.js";
 import { ExportsErasableStore, PgExportStore } from "../../portability/index.js";
-import { createApp } from "./app.js";
+import { ADDRESS_LIMIT_FACTOR, createApp, DEFAULT_RATE_LIMIT_PER_MINUTE } from "./app.js";
 
 /**
  * Composition root for the REST attachment. One process: HTTP server plus the outbox relay
  * loop that (1) projects Memory events into the retrieval engine and (2) runs extraction on
  * new episodes for banks that have an extractor configured (`admin set-extractor`).
  *
- * Env: DATABASE_URL (required), PORT (default 8787), OUTBOX_POLL_MS (default 500),
+ * Env: DATABASE_URL (required), PORT (default 8787), RATE_LIMIT_PER_MINUTE (default 600 requests per API
+ * key per minute under /v1, REST and MCP; 0 disables) and RATE_LIMIT_PER_ADDRESS_PER_MINUTE (default ten
+ * times that, per client address; 0 means no address ceiling; in-process counters, see app.ts), OUTBOX_POLL_MS (default 500),
  * EXTRACTION_POLL_MS (default 1000), LLM_TIMEOUT_MS (default 120000),
  * SHUTDOWN_TIMEOUT_MS (default 10000), plus the provider keys the configured extractor models
  * need (ANTHROPIC_API_KEY, GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY,
@@ -35,11 +37,26 @@ if (!url) {
   console.error("DATABASE_URL is not set (see .env.example)");
   process.exit(1);
 }
+/** Digits only: "1e3" or " 600 " are configuration mistakes, not limits. 0 is allowed and means "off" for both limits. */
+function nonNegativeInt(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return undefined;
+  if (!/^\d+$/.test(raw)) {
+    console.error(`${name} must be a non-negative integer (0 turns that limit off), got "${raw}"`);
+    process.exit(1);
+  }
+  return Number(raw);
+}
 const port = Number(process.env.PORT ?? 8787);
 const pollMs = Number(process.env.OUTBOX_POLL_MS ?? 500);
 const extractionPollMs = Number(process.env.EXTRACTION_POLL_MS ?? 1_000);
 const llmTimeoutMs = Number(process.env.LLM_TIMEOUT_MS ?? 120_000);
 const shutdownTimeoutMs = Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 10_000);
+const rateLimitPerMinute = nonNegativeInt("RATE_LIMIT_PER_MINUTE") ?? DEFAULT_RATE_LIMIT_PER_MINUTE;
+const rateLimitPerAddressPerMinute = nonNegativeInt("RATE_LIMIT_PER_ADDRESS_PER_MINUTE") ?? rateLimitPerMinute * ADDRESS_LIMIT_FACTOR;
+if (rateLimitPerMinute > 0 && rateLimitPerAddressPerMinute > 0 && rateLimitPerAddressPerMinute < rateLimitPerMinute) {
+  console.warn(`RATE_LIMIT_PER_ADDRESS_PER_MINUTE (${rateLimitPerAddressPerMinute}) is below RATE_LIMIT_PER_MINUTE (${rateLimitPerMinute}): every client hits the address ceiling before its own limit`);
+}
 
 const pool = createPool(url);
 await migrate(pool, migrationSources);
@@ -76,7 +93,8 @@ const runs = new PgExtractionRunStore(pool);
 const exports = new PgExportStore(pool);
 const memoryErasure = new PgMemoryErasure(pool);
 
-const app = createApp({
+const app = createApp(
+  {
   scopes: new ScopeResolver(new PgPrincipalRepository(pool), banks, systemClock),
   access: scopeAccessPolicy,
   audit: new PgAuditLog(pool),
@@ -95,7 +113,9 @@ const app = createApp({
     uow: new PgErasureUnitOfWork(pool),
     stores: [memoryErasure, new EngineErasableStore(engine), new ExtractionErasableStore(runs), new ExportsErasableStore(exports), new PgAccessRevocation(pool)],
   },
-});
+  },
+  { rateLimitPerMinute, rateLimitPerAddressPerMinute },
+);
 
 // Extractors are created lazily per configured model and cached for the process lifetime.
 const extractors = new Map<string, Extractor>();
@@ -160,7 +180,7 @@ const extractionTimer = setInterval(async () => {
 }, extractionPollMs);
 
 const server = serve({ fetch: app.fetch, port }, (info) => {
-  console.log(`mem REST attachment listening on http://localhost:${info.port} (engine: ${engine.name}${engine instanceof PgvectorEngine ? `, embedder: ${engine.embedderId}, ${engine.embedderDimensions ?? "?"} dims` : ""}, extraction: per-bank)`);
+  console.log(`mem REST attachment listening on http://localhost:${info.port} (engine: ${engine.name}${engine instanceof PgvectorEngine ? `, embedder: ${engine.embedderId}, ${engine.embedderDimensions ?? "?"} dims` : ""}, extraction: per-bank, rate limit: ${rateLimitPerMinute === 0 ? "off" : `${rateLimitPerMinute}/min per key, ${rateLimitPerAddressPerMinute}/min per address`})`);
 });
 
 let shuttingDown = false;
