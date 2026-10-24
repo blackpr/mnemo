@@ -275,6 +275,7 @@ describeWithDb("EraseBank", () => {
         throw new Error("audit store down");
       },
       list: async () => [],
+      find: async () => undefined,
     };
     const deafUow: ErasureUnitOfWork = { run: (work) => uow.run((tx) => work({ requests: tx.requests, audit: deaf })) };
     const before = await rowsFor(db, bankA.id);

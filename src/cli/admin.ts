@@ -2,16 +2,16 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { asBankId, asPrincipalId, asSubjectId, asTenantId, systemClock, type BankId, type Capability, type Scope } from "../shared-kernel/index.js";
-import { createPool } from "../platform/postgres/pool.js";
+import { createPool, type Pool } from "../platform/postgres/pool.js";
 import { migrate } from "../platform/postgres/migrator.js";
 import { migrationSources } from "../platform/postgres/migrations.js";
 import { randomUUID } from "node:crypto";
-import { AbandonErasureHandler, EraseBankHandler, type ErasureRequest, generateApiKey, hashApiKey, PgAccessRevocation, PgApiKeyStore, PgAuditLog, PgErasureRequestRepository, PgErasureUnitOfWork, PgPrincipalRepository, resolveScope, scopeAccessPolicy, type Grant } from "../governance/index.js";
+import { AbandonErasureHandler, EraseBankHandler, type ErasureRequest, generateApiKey, hashApiKey, PgAccessRevocation, PgApiKeyStore, PgAuditLog, PgErasureRequestRepository, PgErasureUnitOfWork, PgPrincipalRepository, resolveScope, scopeAccessPolicy, VerifyReceiptHandler, type ErasableStore, type Grant } from "../governance/index.js";
 import { sha256 } from "../platform/hash.js";
 import { createBank, PgBankRepository, PgEpisodeRepository, PgFactRepository, PgMemoryErasure, PgOutboxRelay, PgUnitOfWork, RecordEpisodeHandler } from "../memory/index.js";
 import { EXPORT_FORMATS, ExportBankHandler, ExportsErasableStore, ImportDocumentsHandler, PgExportStore, readClaudeCodeMemory, type ExportFormat } from "../portability/index.js";
 import { ExtractionErasableStore, parseModelSpec, PgExtractionRunStore } from "../extraction/index.js";
-import { assertPinnableDimensions, embedderFromEnv, embeddingDimensionsFromEnv, engineFromEnv, engineNameFromEnv, EngineErasableStore, foreignRows, PgvectorEngine, pinIndexDimensions, readPinnedIndex, type Embedder } from "../retrieval/index.js";
+import { assertPinnableDimensions, embedderFromEnv, embeddingDimensionsFromEnv, engineFromEnv, engineNameFromEnv, EngineErasableStore, foreignRows, PgvectorEngine, pinIndexDimensions, readPinnedIndex, type Embedder, type RetrievalEngine } from "../retrieval/index.js";
 
 /**
  * Bootstrap CLI. Creates the records the REST attachment needs before a first request:
@@ -33,6 +33,7 @@ import { assertPinnableDimensions, embedderFromEnv, embeddingDimensionsFromEnv, 
  *   npm run admin -- render-import --bank bank-vangelis --target claude|gemini [--out <path>]
  *   npm run admin -- erase-bank --bank bank-vangelis --principal vangelis --yes   # principal needs the erase capability
  *   npm run admin -- erasure-status --id <request id>
+ *   npm run admin -- verify-receipt --id <request id>     # recompute the digest and re-query every store; exit 1 on any failure
  *   npm run admin -- erasure-abandon --id <request id> --reason "worker died mid-purge" [--force]   # unblock a stuck request
  *
  * Portability commands act as the internal principal "system:admin" (admin capability on the
@@ -47,7 +48,11 @@ import { assertPinnableDimensions, embedderFromEnv, embeddingDimensionsFromEnv, 
  * refuses `erased` banks but allows `erasing` ones for exactly this. `erasure-abandon` is the recovery
  * path for a request left non-terminal by a crash: it marks it failed (as "system:admin", audited) so
  * the bank can be erased again; it deletes nothing, and refuses a request whose row changed in the last
- * 10 minutes (presumed still running) unless --force is given.
+ * 10 minutes (presumed still running) unless --force is given. `verify-receipt` is the after-the-fact check of a
+ * receipt: digest recomputed over the stored receipt, receipt checked against its row and against the tenant's
+ * audit chain (the tamper evidence; the digest alone is an unkeyed hash beside its payload), every store (the
+ * same list erase-bank purges) asked again what it holds for the bank, pass or fail per line and overall; it
+ * reads counts and digests, never content.
  *
  * The API key is printed once and never stored in plaintext. Every command refuses to silently
  * change existing state: create-* fail if the id exists, grants require matching tenants.
@@ -295,16 +300,7 @@ try {
       const retrieval = engineFromEnv(pool, noEmbedder);
       if (!values.yes) die(`erase-bank deletes every fact, episode, retrieval row (engine: ${retrieval.name}), extraction run and export record of ${bankId} (subject ${bank.subjectId}), removes every grant on it and revokes the keys of principals granted on it alone; it cannot be undone; re-run with --yes`);
       const memoryErasure = new PgMemoryErasure(pool);
-      const handler = new EraseBankHandler(
-        scopeAccessPolicy,
-        memoryErasure,
-        new PgErasureUnitOfWork(pool),
-        // Memory first, access last: see ErasableStore.
-        [memoryErasure, new EngineErasableStore(retrieval), new ExtractionErasableStore(new PgExtractionRunStore(pool)), new ExportsErasableStore(new PgExportStore(pool)), new PgAccessRevocation(pool)],
-        systemClock,
-        randomUUID,
-        sha256,
-      );
+      const handler = new EraseBankHandler(scopeAccessPolicy, memoryErasure, new PgErasureUnitOfWork(pool), erasableStores(pool, memoryErasure, retrieval), systemClock, randomUUID, sha256);
       console.error(`erasing bank ${bankId} (subject ${bank.subjectId}) as ${principalId}; retrieval engine ${retrieval.name} (set ENGINE to match the server's)`);
       const r = await handler.handle(scope, bankId);
       const request = r.ok ? r.value : die(`erasure refused: ${r.error.kind}`);
@@ -315,6 +311,33 @@ try {
     case "erasure-status": {
       const request = (await new PgErasureRequestRepository(pool).get(need("id"))) ?? die(`erasure request ${values.id} not found`);
       printErasure(request);
+      break;
+    }
+    case "verify-receipt": {
+      // Same store list as erase-bank, so a store the receipt names is re-queried by the adapter that purged it.
+      const retrieval = engineFromEnv(pool, noEmbedder);
+      const handler = new VerifyReceiptHandler(new PgErasureRequestRepository(pool), new PgAuditLog(pool), erasableStores(pool, new PgMemoryErasure(pool), retrieval), sha256);
+      const r = await handler.handle(need("id"));
+      const v = r.ok
+        ? r.value
+        : die(
+            r.error.kind === "ErasureNotFound"
+              ? `erasure request ${r.error.requestId} not found`
+              : r.error.kind === "ReceiptMissing"
+                ? `erasure request ${r.error.requestId} is receipted but holds no receipt: the row is corrupted`
+                : `erasure request ${r.error.requestId} is ${r.error.state}: it has no receipt to verify`,
+          );
+      const bankStatus = (await banks.get(v.bankId))?.status ?? "missing";
+      console.log(`receipt ${v.digest} for erasure ${v.requestId} (bank ${v.bankId}, now ${bankStatus}; subject ${v.subjectId}, tenant ${v.tenantId}) issued at ${v.issuedAt.toISOString()}; retrieval engine re-queried: ${retrieval.name}`);
+      console.log(`  ${v.digestValid ? "PASS" : "FAIL"}  digest recomputed over the stored receipt ${v.digestValid ? "matches" : "does not match"}`);
+      console.log(`  ${v.bound ? "PASS" : "FAIL"}  receipt names this request, bank, tenant and subject`);
+      console.log(`  ${v.chained ? "PASS" : "FAIL"}  digest ${v.chained ? "is" : "is not"} in the tenant's audit chain (erasure.receipt_issued)`);
+      for (const s of v.stores) {
+        const note = s.note === "not_in_receipt" ? "  (not in the receipt: store wired after it was issued)" : s.note === "not_requeried" ? "  (no wired store answered for it)" : "";
+        console.log(`  ${s.ok ? "PASS" : "FAIL"}  ${s.store.padEnd(22)} receipt ${s.receipted ?? "-"}  now ${s.now ?? "-"}${note}`);
+      }
+      console.log(`  ${v.ok ? "PASS" : "FAIL"}  overall`);
+      if (!v.ok) process.exitCode = 1;
       break;
     }
     case "erasure-abandon": {
@@ -348,10 +371,15 @@ try {
       break;
     }
     default:
-      die("usage: admin <create-bank|create-principal|grant|issue-key|revoke-key|set-extractor|clear-extractor|pin-dimensions|reindex|export|import-claude-code|render-import|erase-bank|erasure-status|erasure-abandon|extraction-status|requeue-extraction|requeue-dead-letters> [options]");
+      die("usage: admin <create-bank|create-principal|grant|issue-key|revoke-key|set-extractor|clear-extractor|pin-dimensions|reindex|export|import-claude-code|render-import|erase-bank|erasure-status|verify-receipt|erasure-abandon|extraction-status|requeue-extraction|requeue-dead-letters> [options]");
   }
 } finally {
   await pool.end();
+}
+
+/** Every store that holds Subject data or access to it: Memory first, access last (see ErasableStore). Shared by erase-bank and verify-receipt. */
+function erasableStores(db: Pool, memoryErasure: PgMemoryErasure, retrieval: RetrievalEngine): readonly ErasableStore[] {
+  return [memoryErasure, new EngineErasableStore(retrieval), new ExtractionErasableStore(new PgExtractionRunStore(db)), new ExportsErasableStore(new PgExportStore(db)), new PgAccessRevocation(db)];
 }
 
 async function* iterate<T>(items: readonly T[]): AsyncIterable<T> {
@@ -365,6 +393,6 @@ function printErasure(r: ErasureRequest): void {
     const after = r.verifications.find((v) => v.store === i.store)?.hitsAfter;
     console.log(`  ${i.store.padEnd(22)} before ${i.countBefore}  deleted ${deleted ?? "-"}  after ${after ?? "-"}`);
   }
-  if (r.receipt) console.log(`  receipt ${r.receipt.digest} issued at ${r.receipt.issuedAt.toISOString()} (verify with verifyReceipt over the stored request)`);
+  if (r.receipt) console.log(`  receipt ${r.receipt.digest} issued at ${r.receipt.issuedAt.toISOString()} (check with \`admin verify-receipt --id ${r.id}\`)`);
   if (r.failure) console.log(`  failure: ${r.failure}`);
 }

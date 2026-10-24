@@ -150,6 +150,7 @@ export class PgAuditLog implements AuditLogStore {
     return {
       append: (input) => appendOnClient(client, input),
       list: (tenantId, opts) => listEntries(client, tenantId, opts),
+      find: (tenantId, match) => findEntry(client, tenantId, match),
     };
   }
 
@@ -160,6 +161,15 @@ export class PgAuditLog implements AuditLogStore {
   list(tenantId: TenantId, opts: { readonly limit?: number } = {}): Promise<readonly AuditEntry[]> {
     return listEntries(this.pool, tenantId, opts);
   }
+
+  find(tenantId: TenantId, match: { readonly action: AuditEntry["action"]; readonly requestId: string }): Promise<AuditEntry | undefined> {
+    return findEntry(this.pool, tenantId, match);
+  }
+}
+
+async function findEntry(db: Queryable, tenantId: TenantId, match: { readonly action: AuditEntry["action"]; readonly requestId: string }): Promise<AuditEntry | undefined> {
+  const { rows } = await db.query<AuditRow>("SELECT * FROM governance.audit_log WHERE tenant_id = $1 AND action = $2 AND details->>'requestId' = $3 ORDER BY seq ASC LIMIT 1", [tenantId, match.action, match.requestId]);
+  return rows[0] ? toAuditEntry(rows[0]) : undefined;
 }
 
 async function listEntries(db: Queryable, tenantId: TenantId, opts: { readonly limit?: number } = {}): Promise<readonly AuditEntry[]> {

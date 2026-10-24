@@ -22,6 +22,8 @@ export interface AuditLogStore {
   /** Append one hash-chained entry for the tenant. Serialized per tenant by the adapter. */
   append(entry: NewAuditEntry): Promise<AuditEntry>;
   list(tenantId: TenantId, opts?: { readonly limit?: number }): Promise<readonly AuditEntry[]>;
+  /** The tenant's first entry with this action whose details name this request id (erasure entries carry `requestId`). */
+  find(tenantId: TenantId, match: { readonly action: AuditAction; readonly requestId: string }): Promise<AuditEntry | undefined>;
 }
 
 /** The one thing Governance needs to know about a Bank: which tenant owns it. Implemented by Memory's bank repository. */
