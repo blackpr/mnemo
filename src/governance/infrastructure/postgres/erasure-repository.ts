@@ -15,7 +15,7 @@ interface Row {
   requested_at: Date;
   state: ErasureState;
   inventory: { store: string; countBefore: number }[];
-  deletions: { store: string; deleted: number; deletedAt: string }[];
+  deletions: StoredDeletion[];
   verifications: { store: string; hitsAfter: number; checkedAt: string }[];
   updated_at: Date;
   claim_token: string | null;
@@ -26,7 +26,7 @@ interface Row {
     tenantId: string;
     bankId: string;
     subjectId: string;
-    deletions: { store: string; deleted: number; deletedAt: string }[];
+    deletions: StoredDeletion[];
     stores: { store: string; hitsAfter: number; checkedAt: string }[];
     issuedAt: string;
     digest: string;
@@ -34,9 +34,22 @@ interface Row {
   failure: string | null;
 }
 
+interface StoredDeletion {
+  store: string;
+  deleted: number;
+  deletedAt: string;
+  evidence?: Record<string, string[]>;
+}
+
 // jsonb does not keep key order, so every nested object is rebuilt field by field.
 const toInventory = (i: Row["inventory"][number]): StoreInventory => Object.freeze({ store: i.store, countBefore: i.countBefore });
-const toDeletion = (d: Row["deletions"][number]): StoreDeletion => Object.freeze({ store: d.store, deleted: d.deleted, deletedAt: new Date(d.deletedAt) });
+const toDeletion = (d: StoredDeletion): StoreDeletion =>
+  Object.freeze({
+    store: d.store,
+    deleted: d.deleted,
+    deletedAt: new Date(d.deletedAt),
+    ...(d.evidence ? { evidence: Object.freeze(Object.fromEntries(Object.entries(d.evidence).map(([k, ids]) => [k, Object.freeze([...ids])]))) } : {}),
+  });
 const toVerification = (v: Row["verifications"][number]): StoreVerification => Object.freeze({ store: v.store, hitsAfter: v.hitsAfter, checkedAt: new Date(v.checkedAt) });
 const toReceipt = (r: NonNullable<Row["receipt"]>): ErasureReceipt =>
   Object.freeze({

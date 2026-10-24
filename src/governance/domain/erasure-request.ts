@@ -25,6 +25,8 @@ export interface StoreDeletion {
   readonly store: string;
   readonly deleted: number;
   readonly deletedAt: Date;
+  /** Ids the purge named (e.g. the principals whose keys were revoked); never names or secrets. Covered by the receipt digest. */
+  readonly evidence?: Readonly<Record<string, readonly string[]>>;
 }
 
 export interface StoreVerification {
@@ -117,7 +119,7 @@ export function receiptPayload(receipt: Omit<ErasureReceipt, "digest">): string 
     tenantId: receipt.tenantId,
     bankId: receipt.bankId,
     subjectId: receipt.subjectId,
-    deletions: receipt.deletions.map((d) => ({ store: d.store, deleted: d.deleted, deletedAt: d.deletedAt.toISOString() })),
+    deletions: receipt.deletions.map((d) => ({ store: d.store, deleted: d.deleted, deletedAt: d.deletedAt.toISOString(), ...(d.evidence ? { evidence: d.evidence } : {}) })),
     stores: receipt.stores.map((s) => ({ store: s.store, hitsAfter: s.hitsAfter, checkedAt: s.checkedAt.toISOString() })),
     issuedAt: receipt.issuedAt.toISOString(),
   });

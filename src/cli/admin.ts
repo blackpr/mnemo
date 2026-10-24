@@ -56,8 +56,9 @@ import { assertPinnableDimensions, embedderFromEnv, embeddingDimensionsFromEnv, 
  * deletes nothing, and refuses a request whose row changed within the stale window (presumed still running) unless --force is given. `verify-receipt` is the after-the-fact check of a
  * receipt: digest recomputed over the stored receipt, receipt checked against its row and against the tenant's
  * audit chain (the tamper evidence; the digest alone is an unkeyed hash beside its payload), every store (the
- * same list erase-bank purges) asked again what it holds for the bank, pass or fail per line and overall; it
- * reads counts and digests, never content.
+ * same list erase-bank purges) asked again what it holds for the bank, the keys store counting the live keys this request
+ * marked as revoked plus any receipted principal whose keys no longer carry the mark, the whole tenant chain verified end to end, the bank row checked to be the
+ * `erased` tombstone, pass or fail per line and overall; it reads counts, statuses and digests, never content.
  *
  * The API key is printed once and never stored in plaintext. Every command refuses to silently
  * change existing state: create-* fail if the id exists, grants require matching tenants.
@@ -379,7 +380,8 @@ try {
       const receiptedEngine = requestRow.receipt?.stores.map((s) => /^retrieval\.(.+)$/.exec(s.store)?.[1]).find((e) => e !== undefined);
       const engineName = receiptedEngine ?? (await banks.get(requestRow.bankId))?.engine ?? engineNameFromEnv();
       const retrieval = engineFromEnv(pool, noEmbedder, { ...process.env, ENGINE: engineName });
-      const handler = new VerifyReceiptHandler(new PgErasureRequestRepository(pool), new PgAuditLog(pool), erasableStores(pool, new PgMemoryErasure(pool), retrieval), sha256);
+      const memoryErasure = new PgMemoryErasure(pool);
+      const handler = new VerifyReceiptHandler(new PgErasureRequestRepository(pool), new PgAuditLog(pool), memoryErasure, erasableStores(pool, memoryErasure, retrieval), sha256);
       const r = await handler.handle(need("id"));
       const v = r.ok
         ? r.value
@@ -390,11 +392,12 @@ try {
                 ? `erasure request ${r.error.requestId} is receipted but holds no receipt: the row is corrupted`
                 : `erasure request ${r.error.requestId} is ${r.error.state}: it has no receipt to verify`,
           );
-      const bankStatus = (await banks.get(v.bankId))?.status ?? "missing";
-      console.log(`receipt ${v.digest} for erasure ${v.requestId} (bank ${v.bankId}, now ${bankStatus}; subject ${v.subjectId}, tenant ${v.tenantId}) issued at ${v.issuedAt.toISOString()}; retrieval engine re-queried: ${retrieval.name}`);
+      console.log(`receipt ${v.digest} for erasure ${v.requestId} (bank ${v.bankId}; subject ${v.subjectId}, tenant ${v.tenantId}) issued at ${v.issuedAt.toISOString()}; retrieval engine re-queried: ${retrieval.name}`);
       console.log(`  ${v.digestValid ? "PASS" : "FAIL"}  digest recomputed over the stored receipt ${v.digestValid ? "matches" : "does not match"}`);
       console.log(`  ${v.bound ? "PASS" : "FAIL"}  receipt names this request, bank, tenant and subject`);
       console.log(`  ${v.chained ? "PASS" : "FAIL"}  digest ${v.chained ? "is" : "is not"} in the tenant's audit chain (erasure.receipt_issued)`);
+      console.log(`  ${v.chainIntact ? "PASS" : "FAIL"}  the tenant's audit chain ${v.chainIntact ? "verifies end to end" : `breaks at seq ${v.chainBrokenAt}`}`);
+      console.log(`  ${v.bankErased ? "PASS" : "FAIL"}  bank ${v.bankId.padEnd(17)} ${v.bankStatus === "erased" ? "is the erased tombstone" : v.bankStatus === "missing" ? "row is missing" : `is ${v.bankStatus}, not erased`}`);
       for (const s of v.stores) {
         const note = s.note === "not_in_receipt" ? "  (not in the receipt: store wired after it was issued)" : s.note === "not_requeried" ? "  (no wired store answered for it)" : "";
         console.log(`  ${s.ok ? "PASS" : "FAIL"}  ${s.store.padEnd(22)} receipt ${s.receipted ?? "-"}  now ${s.now ?? "-"}${note}`);

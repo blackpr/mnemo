@@ -91,14 +91,17 @@ describeWithDb("EraseBank", () => {
     await requests.save(request, { claimToken: claim.token });
     if (until === "inventoried") return request;
     for (const store of withStores) {
-      for (const [name, n] of Object.entries(await store.purge(bankId))) request = unwrap(recordDeletion(request, { store: name, deleted: n, deletedAt: new Date() }));
+      for (const [name, p] of Object.entries(await store.purge(bankId, { id: request.id }))) {
+        const { deleted, evidence } = typeof p === "number" ? { deleted: p, evidence: undefined } : p;
+        request = unwrap(recordDeletion(request, { store: name, deleted, deletedAt: new Date(), ...(evidence ? { evidence } : {}) }));
+      }
       await requests.save(request, { claimToken: claim.token });
     }
     request = unwrap(markDeleted(request));
     await requests.save(request, { claimToken: claim.token });
     if (until === "deleted") return request;
     const verifications = [];
-    for (const store of withStores) for (const [name, hitsAfter] of Object.entries(await store.count(bankId))) verifications.push({ store: name, hitsAfter, checkedAt: new Date() });
+    for (const store of withStores) for (const [name, hitsAfter] of Object.entries(await store.count(bankId, { requestId: request.id, deletions: request.deletions }))) verifications.push({ store: name, hitsAfter, checkedAt: new Date() });
     request = unwrap(recordVerification(request, verifications));
     await requests.save(request, { claimToken: claim.token });
     if (until === "verified") return request;
@@ -248,13 +251,25 @@ describeWithDb("EraseBank", () => {
     const erasureEntries = entries.filter((e) => e.action.startsWith("erasure."));
     expect(erasureEntries.map((e) => e.action)).toEqual(["erasure.requested", "erasure.access_revoked", "erasure.deleted", "erasure.verified", "erasure.receipt_issued"]);
     expect(erasureEntries[0]?.details).toEqual({ requestId: request.id, subjectId: bankA.subjectId });
-    expect(erasureEntries[1]?.details).toEqual({ requestId: request.id, "deleted.governance.grants": 3, "deleted.governance.api_keys": 2 });
+    // The revoked principals are on the audit entry and on the request's deletion (ids only), and each revoked key says why and by which request.
+    expect(erasureEntries[1]?.details).toEqual({ requestId: request.id, "deleted.governance.grants": 3, "deleted.governance.api_keys": 2, "governance.api_keys.revokedPrincipals": [`agent-${bankA.id}`, "lapsed"] });
+    expect(request.deletions.find((d) => d.store === "governance.api_keys")?.evidence).toEqual({ revokedPrincipals: [`agent-${bankA.id}`, "lapsed"] });
+    expect(request.deletions.find((d) => d.store === "governance.grants")?.evidence).toBeUndefined();
+    expect((await db.pool.query("SELECT principal_id, revocation_reason, erasure_request_id FROM governance.api_keys WHERE revoked_at IS NOT NULL ORDER BY 1")).rows).toEqual([
+      { principal_id: `agent-${bankA.id}`, revocation_reason: "erasure", erasure_request_id: request.id },
+      { principal_id: "lapsed", revocation_reason: "erasure", erasure_request_id: request.id },
+    ]);
+    expect((await db.pool.query("SELECT count(*)::int AS n FROM governance.api_keys WHERE revoked_at IS NULL AND revocation_reason IS NOT NULL")).rows[0]?.n).toBe(0);
+    expect(JSON.stringify(entries)).not.toContain("mem_");
     expect(erasureEntries[2]?.details).toMatchObject({ requestId: request.id, "deleted.memory.facts": 1, "deleted.memory.episodes": 2, "deleted.retrieval.pgvector": 3, "deleted.governance.grants": 3, "deleted.governance.api_keys": 2 });
     expect(erasureEntries[4]?.details["digest"]).toBe(request.receipt?.digest);
     expect(request.receipt).toMatchObject({ tenantId: tenant, bankId: bankA.id, subjectId: bankA.subjectId });
     expect(request.receipt?.deletions).toEqual(request.deletions);
     // A receipt with any signed field altered no longer verifies.
     expect(verifyReceipt({ ...stored!.receipt!, bankId: bankB.id }, sha256)).toBe(false);
+    // The evidence is covered by the digest too: a receipt whose revoked principals were edited no longer verifies.
+    const edited = stored!.receipt!.deletions.map((d) => (d.store === "governance.api_keys" ? { ...d, evidence: { revokedPrincipals: ["lapsed"] } } : d));
+    expect(verifyReceipt({ ...stored!.receipt!, deletions: edited }, sha256)).toBe(false);
     expect(JSON.stringify(entries)).not.toContain("Lisbon");
     // The audit entry was written before the first deletion.
     expect(entries.findIndex((e) => e.action === "erasure.requested")).toBe(auditBefore);
@@ -426,7 +441,7 @@ describeWithDb("EraseBank", () => {
     let partial = await driveTo(pass1, "inventoried");
     for (const [name, n] of Object.entries(await memory.purge(bankA.id))) partial = unwrap(recordDeletion(partial, { store: name, deleted: n, deletedAt: new Date() }));
     await requests.save(partial, { claimToken: pass1.token });
-    expect(await stores[1]!.purge(bankA.id)).toEqual({ "retrieval.pgvector": 3 });
+    expect(await stores[1]!.purge(bankA.id, { id: queued.value.id })).toEqual({ "retrieval.pgvector": 3 });
     expect((await rowsFor(db, bankA.id))["retrieval.pgvector_index"]).toBe(0);
 
     // While the claim is fresh, no other pass touches it (a slow pass is not a dead one).
@@ -456,6 +471,18 @@ describeWithDb("EraseBank", () => {
 
     // The dead pass wakes up and tries to save: its claim is gone, the retaker's row is untouched.
     await expect(requests.save(partial, { claimToken: pass1.token })).rejects.toBeInstanceOf(ErasureNotInFlightError);
+  });
+
+  it("a re-purge of the access store (a pass died after revoking, before saving) revokes nothing more but still names every principal this request revoked", async () => {
+    const queued = await handler().handle(eraser(bankA.id), bankA.id);
+    if (!queued.ok) throw new Error("setup");
+    const access = stores[stores.length - 1]!;
+    const first = await access.purge(bankA.id, { id: queued.value.id });
+    expect(first).toEqual({ "governance.grants": 3, "governance.api_keys": { deleted: 2, evidence: { revokedPrincipals: [`agent-${bankA.id}`, "lapsed"] } } });
+    const again = await access.purge(bankA.id, { id: queued.value.id });
+    expect(again).toEqual({ "governance.grants": 0, "governance.api_keys": { deleted: 0, evidence: { revokedPrincipals: [`agent-${bankA.id}`, "lapsed"] } } });
+    // Another request's purge would not claim them: the marker is per request.
+    expect(await access.purge(bankA.id, { id: randomUUID() })).toEqual({ "governance.grants": 0, "governance.api_keys": { deleted: 0, evidence: { revokedPrincipals: [] } } });
   });
 
   it("a pass that died at `deleted`, or at `verified` after the tombstone, is finished by the next pass without repeating a step", async () => {
@@ -647,7 +674,7 @@ describeWithDb("EraseBank", () => {
 
   it("refuses a bank whose recorded engine no wired store purges, before anything is written; the engine is re-checked under the freeze", async () => {
     const banks = new PgBankRepository(db.pool);
-    expect(await memory.describe(bankA.id)).toEqual({ tenantId: tenant, subjectId: bankA.subjectId, engine: "pgvector" });
+    expect(await memory.describe(bankA.id)).toEqual({ tenantId: tenant, subjectId: bankA.subjectId, engine: "pgvector", status: "active" });
     await banks.update(switchEngine((await banks.get(bankA.id))!, "honcho"));
     const before = await rowsFor(db, bankA.id);
     const r = await handler().handle(eraser(bankA.id), bankA.id);

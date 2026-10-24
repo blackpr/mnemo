@@ -1,6 +1,6 @@
 import type { BankId, PrincipalId, SubjectId, TenantId } from "../../shared-kernel/index.js";
 import type { AuditAction, AuditEntry } from "../domain/audit-log.js";
-import type { ErasureRequest } from "../domain/erasure-request.js";
+import type { ErasureRequest, StoreDeletion } from "../domain/erasure-request.js";
 import type { Principal } from "../domain/principal.js";
 
 export interface PrincipalRepository {
@@ -125,15 +125,32 @@ export interface ErasableStore {
    * the store was already purged. Memory must be listed first in the workflow: it removes the outbox events whose consumers
    * (indexing, extraction) write into the stores purged after it.
    */
-  count(bankId: BankId): Promise<Readonly<Record<string, number>>>;
-  /** Delete everything the store holds for the bank; returns rows deleted per store name. */
-  purge(bankId: BankId): Promise<Readonly<Record<string, number>>>;
+  count(bankId: BankId, after?: ErasureRecount): Promise<Readonly<Record<string, number>>>;
+  /** Delete everything the store holds for the bank; returns rows deleted per store name, optionally with evidence (ids) of what went. */
+  purge(bankId: BankId, request: { readonly id: string }): Promise<Readonly<Record<string, StorePurge>>>;
+}
+
+/**
+ * What a store's purge reports per name: a count, or a count with evidence (ids only, never names or secrets) that the
+ * workflow records on the request's deletion and on the store's audit entry (`auditPurgeAs`), so a later re-count can check
+ * exactly what the purge claims to have removed.
+ */
+export type StorePurge = number | { readonly deleted: number; readonly evidence?: Readonly<Record<string, readonly string[]>> };
+
+/**
+ * Passed to `count` when the store is being re-counted after its purge (the verify step, `verify-receipt`): the request id and
+ * the deletions the request recorded, evidence included. A store whose plain count is implied by another's (the keys re-count
+ * once no grant is left) uses them to count what the purge actually marked instead.
+ */
+export interface ErasureRecount {
+  readonly requestId: string;
+  readonly deletions: readonly StoreDeletion[];
 }
 
 /** What Governance needs from Memory about the Bank being erased. Implemented by Memory. */
 export interface ErasureBankGateway {
-  /** `engine` is the retrieval engine the bank records as holding its index; the workflow refuses to run against another. */
-  describe(bankId: BankId): Promise<{ readonly tenantId: TenantId; readonly subjectId: SubjectId; readonly engine: string } | undefined>;
+  /** `engine` is the retrieval engine the bank records as holding its index; the workflow refuses to run against another. `status` is `erased` for a tombstone. */
+  describe(bankId: BankId): Promise<{ readonly tenantId: TenantId; readonly subjectId: SubjectId; readonly engine: string; readonly status: string } | undefined>;
   /** Freeze the bank for the duration of the workflow: no writes are accepted while an erasure is in flight. Returns the bank as frozen (its recorded engine is re-checked under the lock). */
   beginErasure(bankId: BankId): Promise<{ readonly engine: string }>;
   /** The bank row stays as a tombstone (status `erased`); the id is never reused. */

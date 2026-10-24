@@ -289,7 +289,7 @@ describeWithDb("REST attachment", () => {
     // POST only queues: 202 with the record in `requested`; nothing is deleted and the bank is still active until the worker runs.
     const res = await app.request(`/v1/banks/${bankA.id}/erasure`, { method: "POST", headers: { authorization: `Bearer ${eraserKey}` } });
     expect(res.status).toBe(202);
-    type ErasureBody = { id: string; state: string; stores: { store: string; countBefore: number; deleted: number; hitsAfter: number }[]; receipt: { digest: string; deletions: unknown[] } | null; failure: string | null };
+    type ErasureBody = { id: string; state: string; stores: { store: string; countBefore: number; deleted: number; hitsAfter: number }[]; receipt: { digest: string; deletions: { store: string; evidence: Record<string, string[]> | null }[] } | null; failure: string | null };
     const queued = await json<ErasureBody>(res);
     expect(queued).toMatchObject({ state: "requested", stores: [], receipt: null, failure: null, requestedBy: "eraser" });
     expect(queued.id).toMatch(/^[0-9a-f-]{36}$/);
@@ -366,7 +366,9 @@ describeWithDb("REST attachment", () => {
       ["erasure.verified", "eraser"],
       ["erasure.receipt_issued", "eraser"],
     ]);
-    expect(audit.find((a) => a.action === "erasure.access_revoked")?.details).toEqual({ requestId: body.id, "deleted.governance.grants": 4, "deleted.governance.api_keys": 3 });
+    expect(audit.find((a) => a.action === "erasure.access_revoked")?.details).toEqual({ requestId: body.id, "deleted.governance.grants": 4, "deleted.governance.api_keys": 3, "governance.api_keys.revokedPrincipals": ["eraser", "ro", "rw"] });
+    expect(body.receipt?.deletions.find((d) => d.store === "governance.api_keys")).toMatchObject({ evidence: { revokedPrincipals: ["eraser", "ro", "rw"] } });
+    expect(body.receipt?.deletions.find((d) => d.store === "memory.facts")).toMatchObject({ evidence: null });
     expect(audit.find((a) => a.action === "erasure.receipt_issued")?.details["digest"]).toBe(body.receipt?.digest);
     // rw and ro: erasure without the capability; both: probing A with no grant left, B's erasure record without erase, then A's after the re-grant.
     expect(audit.filter((a) => a.action === "access.denied").map((a) => [a.principalId, a.details["required"]])).toEqual([["rw", "erase"], ["ro", "erase"], ["both", "grant"], ["both", "erase"], ["both", "erase"]]);

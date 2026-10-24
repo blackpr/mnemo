@@ -85,7 +85,7 @@ export class PgApiKeyStore implements ApiKeyStore {
   }
 
   async revoke(hash: string): Promise<boolean> {
-    const r = await this.db.query("UPDATE governance.api_keys SET revoked_at = now() WHERE key_hash = $1 AND revoked_at IS NULL", [hash]);
+    const r = await this.db.query("UPDATE governance.api_keys SET revoked_at = now(), revocation_reason = 'operator' WHERE key_hash = $1 AND revoked_at IS NULL", [hash]);
     return (r.rowCount ?? 0) > 0;
   }
 }

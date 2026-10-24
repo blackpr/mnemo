@@ -54,7 +54,7 @@ export function serializeErasure(r: ErasureRequest) {
       ? {
           digest: r.receipt.digest,
           issuedAt: r.receipt.issuedAt.toISOString(),
-          deletions: r.receipt.deletions.map((d) => ({ store: d.store, deleted: d.deleted, deletedAt: d.deletedAt.toISOString() })),
+          deletions: r.receipt.deletions.map((d) => ({ store: d.store, deleted: d.deleted, deletedAt: d.deletedAt.toISOString(), evidence: d.evidence ?? null })),
           stores: r.receipt.stores.map((s) => ({ store: s.store, hitsAfter: s.hitsAfter, checkedAt: s.checkedAt.toISOString() })),
         }
       : null,

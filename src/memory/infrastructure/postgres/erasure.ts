@@ -19,9 +19,9 @@ import { PgBankRepository } from "./repositories.js";
 export class PgMemoryErasure implements ErasableStore, ErasureBankGateway {
   constructor(private readonly pool: pg.Pool) {}
 
-  async describe(bankId: BankId): Promise<{ readonly tenantId: TenantId; readonly subjectId: SubjectId; readonly engine: string } | undefined> {
+  async describe(bankId: BankId): Promise<{ readonly tenantId: TenantId; readonly subjectId: SubjectId; readonly engine: string; readonly status: string } | undefined> {
     const bank = await new PgBankRepository(this.pool).get(bankId);
-    return bank ? { tenantId: bank.tenantId, subjectId: bank.subjectId, engine: bank.engine } : undefined;
+    return bank ? { tenantId: bank.tenantId, subjectId: bank.subjectId, engine: bank.engine, status: bank.status } : undefined;
   }
 
   /** Locks the bank row, so the freeze waits for every writer that already passed its status check and later writers see `erasing`. */

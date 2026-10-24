@@ -11,7 +11,7 @@ import {
   type StoreInventory,
   type StoreVerification,
 } from "../domain/erasure-request.js";
-import { ErasureClaimLostError, ErasureNotInFlightError, type ErasableStore, type ErasureBankGateway, type ErasureClaim, type ErasureRequestRepository, type ErasureUnitOfWork } from "../ports/repositories.js";
+import { ErasureClaimLostError, ErasureNotInFlightError, type ErasableStore, type ErasureBankGateway, type ErasureClaim, type ErasureRequestRepository, type ErasureUnitOfWork, type StorePurge } from "../ports/repositories.js";
 import { wiredEngines } from "./erase-bank.js";
 
 export interface ErasureWorkerOptions {
@@ -39,12 +39,14 @@ export type ErasureWorkOutcome = "idle" | "receipted" | "failed" | "lost" | "rel
  *     status check finish first and later ones are refused; the recorded engine is re-checked under the lock.
  *     Then every store counts what it holds.
  *   - `inventoried`: every store purges, one at a time, each deletion saved before the next store starts (the
- *     access store, which declares `auditPurgeAs`, gets its `erasure.access_revoked` entry in that transaction).
+ *     access store, which declares `auditPurgeAs`, gets its `erasure.access_revoked` entry in that transaction;
+ *     evidence a purge reports, such as the revoked principal ids, goes on the deletion and on that entry).
  *     On a resumed pass a store whose names are all already recorded is skipped, so a purge is never counted
  *     twice; a store purged by the dead pass but not yet saved is purged again, deletes nothing and records 0
  *     (its `countBefore` in the inventory still shows what it held). The freeze is re-asserted first (also when
  *     resuming at `deleted`): the bank must be `erasing` while stores are purged and re-counted whoever wrote the row.
- *   - `deleted`: every store counts again; any hit, or any inventoried store that did not report, fails closed.
+ *   - `deleted`: every store counts again, given the recorded deletions so a store can re-count exactly what its purge
+ *     named; any hit, or any inventoried store that did not report, fails closed.
  *   - `verified`: the bank becomes a tombstone (`erased`) and, in one transaction, the receipt is saved and its
  *     digest goes into the audit chain (`erasure.receipt_issued`).
  * Any failure leaves the request `failed` with the step and the error kind, whatever was deleted recorded per
@@ -173,15 +175,20 @@ export class ErasureWorker {
         at(`purge of store ${i + 1} of ${this.stores.length}`);
         await this.checkpoint(claim);
         if (resumed && (await this.alreadyPurged(store, request))) continue;
-        const deleted = await store.purge(bankId);
+        const purged = Object.entries(await store.purge(bankId, { id: request.id })).map(([name, p]) => [name, normalize(p)] as const);
         const deletedAt = this.clock.now();
-        for (const [name, n] of Object.entries(deleted)) request = unwrap(recordDeletion(request, { store: name, deleted: n, deletedAt }));
+        for (const [name, p] of purged) request = unwrap(recordDeletion(request, { store: name, deleted: p.deleted, deletedAt, ...(p.evidence ? { evidence: p.evidence } : {}) }));
         track(request);
         const saved = request;
         const action = store.auditPurgeAs;
         await this.uow.run(async (tx) => {
           await tx.requests.save(saved, { claimToken: claim.token });
-          if (action) await tx.audit.append(this.entry(saved, action, Object.fromEntries(Object.entries(deleted).map(([name, n]) => [`deleted.${name}`, n])), deletedAt));
+          // Counts per name plus whatever evidence the purge named (ids only), each key prefixed with its store name so nothing can shadow the workflow's own keys.
+          if (action) {
+            const details: Record<string, number | readonly string[]> = Object.fromEntries(purged.map(([name, p]) => [`deleted.${name}`, p.deleted]));
+            for (const [name, p] of purged) for (const [key, ids] of Object.entries(p.evidence ?? {})) details[`${name}.${key}`] = ids;
+            await tx.audit.append(this.entry(saved, action, details, deletedAt));
+          }
         });
       }
       at("deleted");
@@ -200,7 +207,7 @@ export class ErasureWorker {
       const verifications: StoreVerification[] = [];
       for (const store of this.stores) {
         const checkedAt = this.clock.now();
-        for (const [name, hitsAfter] of Object.entries(await store.count(bankId))) verifications.push({ store: name, hitsAfter, checkedAt });
+        for (const [name, hitsAfter] of Object.entries(await store.count(bankId, { requestId: request.id, deletions: request.deletions }))) verifications.push({ store: name, hitsAfter, checkedAt });
       }
       const verified = recordVerification(request, verifications);
       if (!verified.ok) {
@@ -270,6 +277,8 @@ interface FailureCause {
   readonly reason: string;
   readonly stores?: readonly string[];
 }
+
+const normalize = (p: StorePurge): { readonly deleted: number; readonly evidence?: Readonly<Record<string, readonly string[]>> } => (typeof p === "number" ? { deleted: p } : p);
 
 const isLost = (e: unknown): e is Error => e instanceof ErasureNotInFlightError || e instanceof ErasureClaimLostError;
 
