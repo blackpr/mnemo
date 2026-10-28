@@ -1,13 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { MockLanguageModelV3 } from "ai/test";
+import type { LanguageModelV3CallOptions } from "@ai-sdk/provider";
 import { AiSdkLlmClient, LlmCallError, parseModelSpec, resolveLanguageModel } from "../../src/extraction/index.js";
 
 const ref = { provider: "anthropic", model: "mock", version: "t" } as const;
 const schema = z.object({ city: z.string() });
 
-const usage = (input: number, output: number) => ({
-  inputTokens: { total: input, noCache: input, cacheRead: 0, cacheWrite: 0 },
+const usage = (input: number, output: number, cacheRead = 0, cacheWrite = 0) => ({
+  inputTokens: { total: input, noCache: input - cacheRead - cacheWrite, cacheRead, cacheWrite },
   outputTokens: { total: output, text: output, reasoning: 0 },
 });
 const generate = (text: string, unified: "stop" | "length" | "content-filter" | "error" = "stop", input = 10, output = 5) =>
@@ -49,6 +50,49 @@ describe("AiSdkLlmClient", () => {
     expect(r.value).toEqual({ city: "Lisbon" });
     expect(r.inputTokens).toBe(42);
     expect(r.outputTokens).toBe(7);
+    expect(r.cachedInputTokens).toBe(0);
+  });
+
+  it("marks the system prompt for Anthropic prompt caching and reports cache reads and writes as subsets of the nominal input", async () => {
+    let seen: LanguageModelV3CallOptions | undefined;
+    const lm = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        seen = options;
+        return { content: [{ type: "text" as const, text: '{"city":"Lisbon"}' }], finishReason: { unified: "stop" as const, raw: "stop" }, usage: usage(1000, 5, 600, 300), warnings: [] };
+      },
+    });
+    const r = await client(lm).completeStructured({ system: "stable instructions", user: "episode", schema });
+    expect(r).toMatchObject({ inputTokens: 1000, cachedInputTokens: 600, cacheWriteTokens: 300, outputTokens: 5 });
+    const system = seen?.prompt.find((m) => m.role === "system");
+    expect(system?.content).toBe("stable instructions");
+    expect(system?.providerOptions).toEqual({ anthropic: { cacheControl: { type: "ephemeral" } } });
+    expect(seen?.prompt.at(-1)?.role).toBe("user");
+
+    // Not an Anthropic model: no provider option is attached.
+    let seenOther: LanguageModelV3CallOptions | undefined;
+    const other = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        seenOther = options;
+        return { content: [{ type: "text" as const, text: '{"city":"Lisbon"}' }], finishReason: { unified: "stop" as const, raw: "stop" }, usage: usage(10, 5), warnings: [] };
+      },
+    });
+    await new AiSdkLlmClient({ provider: "openai", model: "mock", version: "t" }, { languageModel: other, timeoutMs: 5_000 }).completeStructured({ system: "s", user: "u", schema });
+    expect(seenOther?.prompt.find((m) => m.role === "system")?.providerOptions).toBeUndefined();
+  });
+
+  it("a provider that reports no cache details leaves the cache numbers absent (stored as NULL, not 0)", async () => {
+    const lm = new MockLanguageModelV3({
+      doGenerate: async () => ({
+        content: [{ type: "text" as const, text: '{"city":"Lisbon"}' }],
+        finishReason: { unified: "stop" as const, raw: "stop" },
+        usage: { inputTokens: { total: 10, noCache: undefined, cacheRead: undefined, cacheWrite: undefined }, outputTokens: { total: 5, text: 5, reasoning: undefined } },
+        warnings: [],
+      }),
+    });
+    const r = await new AiSdkLlmClient({ provider: "openai", model: "mock", version: "t" }, { languageModel: lm, timeoutMs: 5_000 }).completeStructured({ system: "s", user: "u", schema });
+    expect(r.inputTokens).toBe(10);
+    expect(r.cachedInputTokens).toBeUndefined();
+    expect(r.cacheWriteTokens).toBeUndefined();
   });
 
   it("schema-invalid complete output is a retryable LlmCallError with usage", async () => {

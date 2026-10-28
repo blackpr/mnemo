@@ -1,6 +1,8 @@
 import type { BankId, Clock, DomainEvent, EpisodeId, ModelRef, Scope, TenantId } from "../../shared-kernel/index.js";
 import { asPrincipalId } from "../../shared-kernel/index.js";
 import { isSubjectAuthored, type BankRepository, type EpisodeRepository, type FactRepository, type WriteExtractedFactsHandler } from "../../memory/index.js";
+import { skipReason } from "../domain/triage.js";
+import { allCurrentFacts, type CandidateFactSelector } from "../ports/candidate-facts.js";
 import type { Extractor } from "../ports/extractor.js";
 import { LlmCallError } from "../ports/llm-client.js";
 import type { ClaimedRun, ExtractionRunStore } from "../ports/run-store.js";
@@ -14,7 +16,9 @@ export interface RetainPipelineDeps {
   readonly extractorFor: (model: ModelRef) => Extractor;
   readonly write: WriteExtractedFactsHandler;
   readonly clock: Clock;
-  /** How many preceding episodes to include as context. */
+  /** Which current facts the prompt shows for an episode. Default: all of them (RelevanceCandidateSelector picks by similarity and shared entities). */
+  readonly candidates?: CandidateFactSelector;
+  /** How many preceding episodes to include as context (the extractor also applies a character budget). */
   readonly contextTurns?: number;
   /** A running claim older than this is considered abandoned and may be retaken. Must exceed the model call timeout. */
   readonly staleClaimMs?: number;
@@ -33,7 +37,8 @@ export type ProcessOutcome = "idle" | "done" | "skipped" | "failed";
  *  - `handle(events)` is the outbox consumer. It only enqueues EpisodeRecorded episodes into the
  *    extraction queue (cheap, idempotent), so indexing never waits on a model call.
  *  - `processNext()` / `drain()` is the worker. It claims one due episode, gathers context
- *    (recent episodes, facts current NOW), extracts, applies through Memory's WriteExtractedFacts
+ *    (recent episodes, the candidate facts among those current NOW), skips episodes that cannot
+ *    carry a fact (triage), extracts, applies through Memory's WriteExtractedFacts
  *    command (idempotent per trigger episode), and records the run with its cost. Failures are
  *    recorded with a backoff; non-retryable model errors dead-letter the episode.
  *
@@ -90,10 +95,12 @@ export class RetainPipeline {
       const trigger = await d.episodes.get(scope, episodeId);
       if (!trigger) return this.skip(claim, "episode_not_found");
       if (!isSubjectAuthored(trigger)) return this.skip(claim, "not_subject_authored");
+      const recent = (await d.episodes.listRecent(scope, (d.contextTurns ?? 12) + 1, trigger.occurredAt)).filter((e) => e.id !== trigger.id);
+      const triage = skipReason(trigger.text, trigger.kind, recent.at(-1));
+      if (triage) return this.skip(claim, `no_extractable_content:${triage}`);
 
       extractor = d.extractorFor(bank.policy.extractor);
-      const recent = (await d.episodes.listRecent(scope, (d.contextTurns ?? 12) + 1, trigger.occurredAt)).filter((e) => e.id !== trigger.id);
-      const existing = await d.facts.listCurrent(scope);
+      const existing = await (d.candidates ?? allCurrentFacts).select(scope, trigger, recent, await d.facts.listCurrent(scope));
 
       const { candidates, usage } = await extractor.extract(scope, { trigger, recent, existing });
 

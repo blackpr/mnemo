@@ -9,14 +9,20 @@ import type { ExtractionUsage } from "./extractor.js";
  */
 export interface StructuredCompletion<T> {
   readonly value: T;
+  /** Nominal prompt tokens (cache reads and writes included). */
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly latencyMs: number;
+  /** Prompt tokens the provider served from its prompt cache, when it reports them. */
+  readonly cachedInputTokens?: number;
+  /** Prompt tokens the provider wrote to its prompt cache on this call, when it reports them. */
+  readonly cacheWriteTokens?: number;
 }
 
 export interface LlmClient {
   readonly model: ModelRef;
   completeStructured<T>(input: {
+    /** Stable across calls: the adapter may mark it for provider prompt caching. */
     readonly system: string;
     readonly user: string;
     readonly schema: ZodType<T>;

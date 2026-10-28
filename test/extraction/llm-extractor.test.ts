@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { asBankId } from "../../src/shared-kernel/index.js";
-import { LlmExtractor, buildExtractionUserPrompt, PROMPT_VERSION, truncateMiddle } from "../../src/extraction/index.js";
+import { LlmExtractor, buildExtractionUserPrompt, fitContextToBudget, PROMPT_VERSION, truncateMiddle } from "../../src/extraction/index.js";
 import { episodeFixture, factFixture, scopeFor } from "../helpers/fixtures.js";
 import { ScriptedLlmClient } from "../helpers/scripted-llm.js";
 
@@ -43,7 +43,6 @@ describe("LlmExtractor", () => {
         candidates: [
           {
             statement: "The Subject lives in Lisbon",
-            predicate: null,
             validFrom: "2026-05-01T00:00:00Z",
             sourceEpisodeIds: ["e-new", "e-hallucinated"],
             related: [
@@ -52,7 +51,7 @@ describe("LlmExtractor", () => {
             ],
             faithfulness: 1,
           },
-          { statement: "Something unsupported", predicate: null, validFrom: "not a date", sourceEpisodeIds: ["nope"], related: [], faithfulness: 0.8 },
+          { statement: "Something unsupported", validFrom: "not a date", sourceEpisodeIds: ["nope"], related: [], faithfulness: 0.8 },
         ],
       },
     ]);
@@ -60,7 +59,7 @@ describe("LlmExtractor", () => {
     expect(extractor.model.version).toBe(`t1+${PROMPT_VERSION}`);
 
     const { candidates, usage } = await extractor.extract(scopeFor(bank), { trigger, recent, existing });
-    expect(usage).toEqual({ inputTokens: 1234, outputTokens: 56, latencyMs: 7 });
+    expect(usage).toEqual({ inputTokens: 1234, outputTokens: 56, latencyMs: 7, cachedInputTokens: 0, cacheWriteTokens: 0 });
     expect(candidates.map((c) => c.id)).toEqual(["id-1", "id-2"]);
     const [a, b] = candidates;
     expect(a?.sourceEpisodeIds).toEqual(["e-new"]);
@@ -81,6 +80,21 @@ describe("LlmExtractor", () => {
     expect(user.match(/<fact id=/g)).toHaveLength(5);
     expect(user).toContain('<fact id="f-29"');
     expect(user).not.toContain('<fact id="f-0"');
+  });
+
+  it("context episodes fit a character budget: the oldest are dropped first, the trigger always stays, chat-sized turns are unaffected", async () => {
+    const long = (id: string, at: number) => episodeFixture(bank, id, `${id} `.repeat(1_000), new Date(2026, 5, at));
+    const eps = [long("e-a", 1), long("e-b", 2), long("e-c", 3)];
+    expect(fitContextToBudget(eps, 11_000, 8_000).map((e) => e.id)).toEqual(["e-b", "e-c"]); // 5,000 chars each
+    expect(fitContextToBudget(eps, 20_000, 4_000).map((e) => e.id)).toEqual(["e-a", "e-b", "e-c"]); // counted after middle truncation
+    expect(fitContextToBudget(eps, 3_999, 8_000)).toEqual([]);
+    const llm = new ScriptedLlmClient([{ candidates: [] }]);
+    await new LlmExtractor(llm, { maxContextChars: 11_000 }).extract(scopeFor(bank), { trigger, recent: eps, existing });
+    const user = llm.calls[0]?.user ?? "";
+    expect(user).not.toContain('<episode id="e-a"');
+    expect(user).toContain('<episode id="e-b"');
+    expect(user).toContain('<episode id="e-new"');
+    expect(user).not.toContain("predicate");
   });
 
   it("rejects a scripted response that does not match the schema", async () => {

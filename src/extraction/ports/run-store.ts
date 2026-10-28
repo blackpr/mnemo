@@ -36,8 +36,14 @@ export interface ExtractionRunOutcome {
 
 export interface BankRunSummary {
   readonly counts: Readonly<Record<RunStatus, number>>;
+  /** Nominal prompt tokens over every recorded attempt (cache reads and writes included). */
   readonly inputTokens: number;
   readonly outputTokens: number;
+  /** Of inputTokens: served from the provider's prompt cache (priced at a fraction) / written to it (priced at a premium). */
+  readonly cachedInputTokens: number;
+  readonly cacheWriteTokens: number;
+  /** Claims of runs that reached the model (done, failed, dead, or any run with recorded usage), retries included; skipped runs never call it. An upper bound: a crash before the call still counts. */
+  readonly llmAttempts: number;
 }
 
 export interface ExtractionRunStore {

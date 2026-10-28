@@ -2,17 +2,16 @@ import { z } from "zod";
 
 /**
  * The structured output the extractor model must produce. Kept small and literal so every
- * provider's structured-output mode can satisfy it.
+ * provider's structured-output mode can satisfy it, and limited to what WriteExtractedFacts
+ * uses: statement, validFrom, source episodes, relations to shown facts, faithfulness. (The
+ * optional structured predicate was dropped in extract-v3: nothing read it, and it was about a
+ * third of every candidate's output tokens.)
  */
 export const extractionOutputSchema = z.object({
   candidates: z
     .array(
       z.object({
         statement: z.string().min(1).max(500).describe("One atomic, self-contained fact about the Subject or their world, in third person, present tense where still true."),
-        predicate: z
-          .object({ subject: z.string().max(200), predicate: z.string().max(200), object: z.string().max(500) })
-          .nullable()
-          .describe("Optional structured form, or null."),
         validFrom: z.string().nullable().describe("ISO 8601 date-time when this became true, if the text says so; otherwise null."),
         sourceEpisodeIds: z.array(z.string()).min(1).describe("Ids of the episodes (from the list given) that support this fact."),
         related: z

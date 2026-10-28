@@ -7,7 +7,7 @@ import { migrationSources } from "../../platform/postgres/migrations.js";
 import { ErasureWorker, PgAccessRevocation, PgAuditLog, PgErasureRequestRepository, PgErasureUnitOfWork, PgPrincipalRepository, ScopeResolver, scopeAccessPolicy } from "../../governance/index.js";
 import { PgBankRepository, PgEpisodeRepository, PgFactRepository, PgMemoryErasure, PgOutboxRelay, PgUnitOfWork, WriteExtractedFactsHandler } from "../../memory/index.js";
 import { embedderFromEnv, embeddingDimensionsFromEnv, engineFromEnv, EngineErasableStore, EngineMemoryFinder, IndexingProjector, PgvectorEngine, readPinnedIndex } from "../../retrieval/index.js";
-import { AiSdkLlmClient, ExtractionErasableStore, LlmExtractor, PgExtractionRunStore, RetainPipeline, type Extractor } from "../../extraction/index.js";
+import { AiSdkLlmClient, ExtractionErasableStore, LlmExtractor, PgExtractionRunStore, RelevanceCandidateSelector, RetainPipeline, type Extractor } from "../../extraction/index.js";
 import { ExportsErasableStore, PgExportStore } from "../../portability/index.js";
 import { ADDRESS_LIMIT_FACTOR, createApp, DEFAULT_RATE_LIMIT_PER_MINUTE } from "./app.js";
 
@@ -70,6 +70,10 @@ function positiveInt(name: string): number | undefined {
 const erasurePollMs = positiveInt("ERASURE_POLL_MS") ?? 1_000;
 const erasureStaleMs = positiveInt("ERASURE_STALE_MS") ?? 10 * 60_000;
 const llmTimeoutMs = Number(process.env.LLM_TIMEOUT_MS ?? 120_000);
+// Extraction prompt size (extract-v3): candidate facts by similarity, context window in episodes and in characters.
+const extractionCandidateFacts = positiveInt("EXTRACTION_CANDIDATE_FACTS") ?? 20;
+const extractionContextTurns = positiveInt("EXTRACTION_CONTEXT_TURNS") ?? 12;
+const extractionContextChars = positiveInt("EXTRACTION_CONTEXT_CHARS") ?? 16_000;
 const shutdownTimeoutMs = Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 10_000);
 const rateLimitPerMinute = nonNegativeInt("RATE_LIMIT_PER_MINUTE") ?? DEFAULT_RATE_LIMIT_PER_MINUTE;
 const rateLimitPerAddressPerMinute = nonNegativeInt("RATE_LIMIT_PER_ADDRESS_PER_MINUTE") ?? rateLimitPerMinute * ADDRESS_LIMIT_FACTOR;
@@ -147,7 +151,7 @@ const extractorFor = (model: ModelRef): Extractor => {
   const key = `${model.provider}:${model.model}@${model.version}`;
   let e = extractors.get(key);
   if (!e) {
-    e = new LlmExtractor(new AiSdkLlmClient(model, { timeoutMs: llmTimeoutMs }));
+    e = new LlmExtractor(new AiSdkLlmClient(model, { timeoutMs: llmTimeoutMs }), { maxContextChars: extractionContextChars });
     extractors.set(key, e);
   }
   return e;
@@ -161,6 +165,8 @@ const pipeline = new RetainPipeline({
   facts,
   runs,
   extractorFor,
+  candidates: new RelevanceCandidateSelector(engine, { topK: extractionCandidateFacts }),
+  contextTurns: extractionContextTurns,
   write: new WriteExtractedFactsHandler(uow, scopeAccessPolicy, systemClock),
   clock: systemClock,
   staleClaimMs: Math.max(2 * llmTimeoutMs, 10 * 60_000),

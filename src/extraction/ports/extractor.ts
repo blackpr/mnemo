@@ -7,9 +7,14 @@ import type { Episode, ExtractedCandidate, Fact } from "../../memory/index.js";
  * Reports which model and prompt version produced the candidates (Provenance.extractor).
  */
 export interface ExtractionUsage {
+  /** Nominal prompt tokens, cache reads and writes included. */
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly latencyMs: number;
+  /** Prompt tokens served from the provider's prompt cache (a subset of inputTokens; 0 or absent when the provider reports none). */
+  readonly cachedInputTokens?: number;
+  /** Prompt tokens written to the provider's prompt cache on this call (a subset of inputTokens). */
+  readonly cacheWriteTokens?: number;
 }
 
 export interface ExtractionContext {
@@ -17,7 +22,7 @@ export interface ExtractionContext {
   readonly trigger: Episode;
   /** Recent episodes before the trigger, oldest first, for context. */
   readonly recent: readonly Episode[];
-  /** Facts currently believed about the Subject, so the extractor can relate candidates to them. */
+  /** Current facts selected as candidates for this episode (CandidateFactSelector), so the extractor can relate candidates to them. */
   readonly existing: readonly Fact[];
 }
 

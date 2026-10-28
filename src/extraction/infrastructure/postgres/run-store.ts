@@ -42,9 +42,10 @@ export class PgExtractionRunStore implements ExtractionRunStore {
   async complete(claim: ClaimedRun, extractor: ModelRef, o: ExtractionRunOutcome, now: Date): Promise<boolean> {
     const r = await this.db.query(
       `UPDATE extraction.runs SET status = 'done', finished_at = $2, extractor = $3, input_tokens = $4, output_tokens = $5, latency_ms = $6,
-         candidates = $7, asserted = $8, superseded = $9, invalidated = $10, historical = $11, rejected = $12
+         candidates = $7, asserted = $8, superseded = $9, invalidated = $10, historical = $11, rejected = $12,
+         cached_input_tokens = $14, cache_write_tokens = $15
        WHERE episode_id = $1 AND status = 'running' AND claimed_at = $13`,
-      [claim.episodeId, now, JSON.stringify(extractor), o.usage.inputTokens, o.usage.outputTokens, o.usage.latencyMs, o.candidates, o.asserted, o.superseded, o.invalidated, o.historical, o.rejected, claim.claimedAt],
+      [claim.episodeId, now, JSON.stringify(extractor), o.usage.inputTokens, o.usage.outputTokens, o.usage.latencyMs, o.candidates, o.asserted, o.superseded, o.invalidated, o.historical, o.rejected, claim.claimedAt, o.usage.cachedInputTokens ?? null, o.usage.cacheWriteTokens ?? null],
     );
     return (r.rowCount ?? 0) > 0;
   }
@@ -53,9 +54,10 @@ export class PgExtractionRunStore implements ExtractionRunStore {
     const r = await this.db.query(
       `UPDATE extraction.runs
        SET status = $4, finished_at = $2, error = $3, next_attempt_at = COALESCE($5::timestamptz, next_attempt_at),
-           input_tokens = COALESCE($6, input_tokens), output_tokens = COALESCE($7, output_tokens), latency_ms = COALESCE($8, latency_ms)
+           input_tokens = COALESCE($6, input_tokens), output_tokens = COALESCE($7, output_tokens), latency_ms = COALESCE($8, latency_ms),
+           cached_input_tokens = COALESCE($10, cached_input_tokens), cache_write_tokens = COALESCE($11, cache_write_tokens)
        WHERE episode_id = $1 AND status = 'running' AND claimed_at = $9`,
-      [claim.episodeId, now, error.slice(0, 2000), retryAt ? "failed" : "dead", retryAt ?? null, usage?.inputTokens ?? null, usage?.outputTokens ?? null, usage?.latencyMs ?? null, claim.claimedAt],
+      [claim.episodeId, now, error.slice(0, 2000), retryAt ? "failed" : "dead", retryAt ?? null, usage?.inputTokens ?? null, usage?.outputTokens ?? null, usage?.latencyMs ?? null, claim.claimedAt, usage?.cachedInputTokens ?? null, usage?.cacheWriteTokens ?? null],
     );
     return (r.rowCount ?? 0) > 0;
   }
@@ -86,20 +88,28 @@ export class PgExtractionRunStore implements ExtractionRunStore {
   }
 
   async summaryByBank(bankId: BankId): Promise<BankRunSummary> {
-    const { rows } = await this.db.query<{ status: RunStatus; n: string; input_tokens: string; output_tokens: string }>(
-      `SELECT status, count(*)::text AS n, coalesce(sum(input_tokens), 0)::text AS input_tokens, coalesce(sum(output_tokens), 0)::text AS output_tokens
+    const { rows } = await this.db.query<{ status: RunStatus; n: string; input_tokens: string; output_tokens: string; cached_input_tokens: string; cache_write_tokens: string; llm_attempts: string }>(
+      `SELECT status, count(*)::text AS n, coalesce(sum(input_tokens), 0)::text AS input_tokens, coalesce(sum(output_tokens), 0)::text AS output_tokens,
+              coalesce(sum(cached_input_tokens), 0)::text AS cached_input_tokens, coalesce(sum(cache_write_tokens), 0)::text AS cache_write_tokens,
+              coalesce(sum(attempts) FILTER (WHERE input_tokens IS NOT NULL OR status IN ('done', 'failed', 'dead')), 0)::text AS llm_attempts
        FROM extraction.runs WHERE bank_id = $1 GROUP BY status`,
       [bankId],
     );
     const counts: Record<RunStatus, number> = { pending: 0, running: 0, done: 0, failed: 0, dead: 0, skipped: 0 };
     let inputTokens = 0;
     let outputTokens = 0;
+    let cachedInputTokens = 0;
+    let cacheWriteTokens = 0;
+    let llmAttempts = 0;
     for (const r of rows) {
       counts[r.status] = Number(r.n);
       inputTokens += Number(r.input_tokens);
       outputTokens += Number(r.output_tokens);
+      cachedInputTokens += Number(r.cached_input_tokens);
+      cacheWriteTokens += Number(r.cache_write_tokens);
+      llmAttempts += Number(r.llm_attempts);
     }
-    return { counts, inputTokens, outputTokens };
+    return { counts, inputTokens, outputTokens, cachedInputTokens, cacheWriteTokens, llmAttempts };
   }
 
   async countByBank(bankId: BankId): Promise<number> {

@@ -1,4 +1,4 @@
-import { APICallError, generateText, NoObjectGeneratedError, Output, type LanguageModel } from "ai";
+import { APICallError, generateText, NoObjectGeneratedError, Output, type LanguageModel, type SystemModelMessage } from "ai";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createGoogle } from "@ai-sdk/google";
 import { createOpenAI } from "@ai-sdk/openai";
@@ -13,9 +13,14 @@ export { isSupportedProvider, parseModelSpec, SUPPORTED_PROVIDERS, type Supporte
  * The one LLM adapter: Vercel AI SDK with provider packages, so the same code path serves
  * Anthropic, Google and OpenAI (and any OpenAI-compatible endpoint such as Ollama). Credentials
  * come from the providers' standard environment variables (ANTHROPIC_API_KEY,
- * GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY). No provider-specific options are set: each
- * model runs with its provider defaults (for Anthropic that means reasoning is not requested;
- * it can be enabled through providerOptions when the spike shows it helps).
+ * GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY). The only provider-specific option set is
+ * Anthropic prompt caching on the system prompt (`providerOptions.anthropic.cacheControl` on the
+ * instructions message, `@ai-sdk/anthropic` 4.x): the instructions are the stable prefix of every
+ * extraction call, so after the first call they are read from the provider's cache at a fraction
+ * of the price. The prefix must clear the model's minimum cacheable length (512 tokens on Opus 5.5,
+ * more on older models) or the provider silently caches nothing; the extraction system prompt is
+ * about 1,020 tokens (measured live 2026-10-24: 1,017 written, then 1,017 read). Other providers
+ * ignore the option. Reasoning is not requested (provider default).
  */
 export function resolveLanguageModel(ref: ModelRef, env: NodeJS.ProcessEnv = process.env): LanguageModel {
   if (!isSupportedProvider(ref.provider)) {
@@ -38,6 +43,8 @@ export interface AiSdkLlmClientOptions {
   readonly timeoutMs?: number;
   /** Inject a model (e.g. a mock) instead of resolving one from the ModelRef. */
   readonly languageModel?: LanguageModel;
+  /** Mark the system prompt for Anthropic prompt caching (default: on for the anthropic provider). */
+  readonly cacheSystemPrompt?: boolean;
 }
 
 /** Finishes that will repeat identically on the same input: not worth a retry. */
@@ -46,6 +53,7 @@ const NON_RETRYABLE_FINISH = new Set(["length", "content-filter"]);
 export class AiSdkLlmClient implements LlmClient {
   private readonly lm: LanguageModel;
   private readonly timeoutMs: number;
+  private readonly cacheSystemPrompt: boolean;
 
   constructor(
     readonly model: ModelRef,
@@ -53,6 +61,7 @@ export class AiSdkLlmClient implements LlmClient {
   ) {
     this.lm = opts.languageModel ?? resolveLanguageModel(model);
     this.timeoutMs = opts.timeoutMs ?? 120_000;
+    this.cacheSystemPrompt = opts.cacheSystemPrompt ?? model.provider === "anthropic";
   }
 
   async completeStructured<T>(input: {
@@ -63,10 +72,15 @@ export class AiSdkLlmClient implements LlmClient {
     readonly maxOutputTokens?: number;
   }): Promise<StructuredCompletion<T>> {
     const started = Date.now();
+    const instructions: SystemModelMessage = {
+      role: "system",
+      content: input.system,
+      ...(this.cacheSystemPrompt ? { providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } } } : {}),
+    };
     try {
       const result = await generateText({
         model: this.lm,
-        instructions: input.system,
+        instructions,
         prompt: input.user,
         output: Output.object({ schema: input.schema, ...(input.schemaName !== undefined ? { name: input.schemaName } : {}) }),
         maxOutputTokens: input.maxOutputTokens ?? 4000,
@@ -79,7 +93,7 @@ export class AiSdkLlmClient implements LlmClient {
       }
       // `output` is a getter: it parses and validates lazily and throws NoObjectGeneratedError on failure.
       const value = result.output as T;
-      return { value, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, latencyMs: usage.latencyMs };
+      return { value, ...usage };
     } catch (e) {
       if (e instanceof LlmCallError) throw e;
       if (NoObjectGeneratedError.isInstance(e)) {
@@ -105,6 +119,20 @@ function finishReasonOf(fr: unknown): string {
   return "unknown";
 }
 
-function usageOf(u: { inputTokens?: number | undefined; outputTokens?: number | undefined } | undefined, started: number) {
-  return { inputTokens: u?.inputTokens ?? 0, outputTokens: u?.outputTokens ?? 0, latencyMs: Date.now() - started };
+interface SdkUsage {
+  inputTokens?: number | undefined;
+  outputTokens?: number | undefined;
+  inputTokenDetails?: { cacheReadTokens?: number | undefined; cacheWriteTokens?: number | undefined } | undefined;
+}
+
+/** `inputTokens` is the SDK's total (cache reads and writes included); the details split it. Absent details stay absent (the ledger keeps NULL, not 0). */
+function usageOf(u: SdkUsage | undefined, started: number) {
+  const d = u?.inputTokenDetails;
+  return {
+    inputTokens: u?.inputTokens ?? 0,
+    outputTokens: u?.outputTokens ?? 0,
+    latencyMs: Date.now() - started,
+    ...(d?.cacheReadTokens !== undefined ? { cachedInputTokens: d.cacheReadTokens } : {}),
+    ...(d?.cacheWriteTokens !== undefined ? { cacheWriteTokens: d.cacheWriteTokens } : {}),
+  };
 }
