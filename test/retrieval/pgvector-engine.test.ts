@@ -33,11 +33,32 @@ describeWithDb("PgvectorEngine", () => {
     // Different embedder (and different dimensionality): invisible, and no "different vector dimensions" error.
     expect(await current.recall(scopeFor(bankA.id), "neovim editor", { limit: 5 })).toEqual([]);
     expect(await current.staleRowCount(bankA.id)).toBe(1);
+    expect(await current.foreignEmbedders()).toEqual([{ embedder: "hashing-64", rows: 1 }]);
     await current.rebuild(bankA.id, fromArray([f]), fromArray([]));
     expect((await current.recall(scopeFor(bankA.id), "neovim editor", { limit: 5 })).map((h) => h.factId)).toEqual(["f1"]);
     expect(await current.staleRowCount(bankA.id)).toBe(0);
     const { rows } = await db.pool.query<{ embedder: string }>("SELECT DISTINCT embedder FROM retrieval.pgvector_index");
     expect(rows.map((r) => r.embedder)).toEqual(["hashing-256"]);
+  });
+
+  it("a fact indexed for bank A is never retracted or overwritten from bank B", async () => {
+    const bankA = bankFixture("bank-a");
+    const bankB = bankFixture("bank-b");
+    const engine = new PgvectorEngine(db.pool, new HashingEmbedder(256));
+    await engine.indexFact(factFixture(bankA.id, "f1", "the user's editor is neovim"));
+
+    // Retraction names the bank: bank B's event for the same id leaves bank A's row alone.
+    await engine.retractFact(bankB.id, factFixture(bankA.id, "f1", "x").id);
+    expect((await engine.recall(scopeFor(bankA.id), "neovim editor", { limit: 5 })).map((h) => h.factId)).toEqual(["f1"]);
+
+    // The upsert key is (kind, ref_id); the same id from bank B is refused instead of moving bank A's row across.
+    await expect(engine.indexFact(factFixture(bankB.id, "f1", "the user's editor is emacs"))).rejects.toThrow(/already indexed for another bank/);
+    const { rows } = await db.pool.query<{ bank_id: string; text: string }>("SELECT bank_id, text FROM retrieval.pgvector_index");
+    expect(rows).toEqual([{ bank_id: "bank-a", text: "the user's editor is neovim" }]);
+    expect(await engine.recall(scopeFor(bankB.id), "editor", { limit: 5 })).toEqual([]);
+
+    await engine.retractFact(bankA.id, factFixture(bankA.id, "f1", "x").id);
+    expect(await engine.recall(scopeFor(bankA.id), "neovim editor", { limit: 5 })).toEqual([]);
   });
 
   it("end to end: RecallHandler re-reads facts under the scope and applies policy", async () => {

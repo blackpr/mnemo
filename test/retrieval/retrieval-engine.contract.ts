@@ -26,7 +26,7 @@ export function retrievalEngineContract(make: () => Promise<RetrievalEngine> | R
     const engine = await make();
     const f = factFixture(bankA, "f1", "the user's editor is neovim");
     await engine.indexFact(f);
-    await engine.retractFact(f.id);
+    await engine.retractFact(bankA, f.id);
     const hits = await engine.recall(scopeFor(bankA), "editor neovim", { limit: 5 });
     expect(hits.find((h) => h.factId === "f1")).toBeUndefined();
   });

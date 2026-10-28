@@ -62,7 +62,7 @@ describeWithDb("pinIndexDimensions", () => {
     expect(hits.map((h) => h.factId ?? h.episodeId).sort()).toEqual(["e1", "f1", "f2"]);
     expect((await engine.recall(scopeFor(bankB.id), "espresso", { limit: 5 })).map((h) => h.factId)).toEqual(["fb"]);
     // Retraction and as-of filtering still apply on top of the index scan.
-    await engine.retractFact(factFixture(bankA.id, "f2", "x").id);
+    await engine.retractFact(bankA.id, factFixture(bankA.id, "f2", "x").id);
     expect((await engine.recall(scopeFor(bankA.id), "the user's dog Rex", { limit: 5 })).map((h) => h.factId)).toEqual(["f1"]);
     expect(await engine.recall(scopeFor(bankA.id), "neovim editor", { limit: 5, asOf: new Date("2020-01-01T00:00:00Z") })).toEqual([]);
     expect(await engine.purgeBank(bankB.id)).toEqual({ deleted: 1, remaining: 0 });

@@ -128,4 +128,12 @@ describeWithDb("Governance Postgres adapters", () => {
     const got = await repo.get(principal.id);
     expect(got?.grants.map((g) => g.bankId)).toEqual(["bank-b"]);
   });
+
+  it("a principal id of one tenant cannot be saved for another: refused, and the existing principal keeps its name and grants", async () => {
+    const repo = new PgPrincipalRepository(db.pool);
+    const before = await repo.get(principal.id);
+    const hijack: Principal = { ...principal, tenantId: asTenantId("t2"), displayName: "hijacked", grants: [{ bankId: bankB.id, capabilities: new Set(["admin"]), grantedAt: new Date() }] };
+    await expect(repo.save(hijack)).rejects.toThrow(/another tenant/);
+    expect(await repo.get(principal.id)).toEqual(before);
+  });
 });

@@ -26,8 +26,7 @@ import type { RankedHit, RecallOptions, RetrievalEngine } from "../../ports/retr
  * - `purgeBank` deletes the whole Hindsight bank (hard delete) and re-counts; a missing bank counts
  *   as zero. Zero is what the API reports; the research note records what a direct look at
  *   Hindsight's Postgres showed for deleted banks.
- * - The port's `retractFact(factId)` carries no bank id, so the fact's document is looked up across
- *   every bank with our prefix (O(banks)).
+ * - `retractFact` invalidates the fact's document in the fact's own bank only.
  */
 export interface HindsightEngineOptions {
   readonly baseUrl: string;
@@ -156,18 +155,8 @@ export class HindsightEngine implements RetrievalEngine {
     }
   }
 
-  async retractFact(factId: FactId): Promise<void> {
-    for (const hs of await this.ourBanks()) await this.invalidateDocument(hs, FACT, factId);
-  }
-
-  private async ourBanks(): Promise<string[]> {
-    const out: string[] = [];
-    for (let offset = 0; ; offset += 100) {
-      const r = await sdk.listBanks({ client: this.raw, query: { q: this.prefix, limit: 100, offset }, throwOnError: true, signal: this.signal() });
-      out.push(...r.data.banks.map((b) => b.bank_id).filter((id) => id.startsWith(this.prefix)));
-      if (r.data.banks.length < 100 || offset + 100 >= r.data.total) break;
-    }
-    return out;
+  async retractFact(bankId: BankId, factId: FactId): Promise<void> {
+    await this.invalidateDocument(this.hsBank(bankId), FACT, factId);
   }
 
   async recall(scope: Scope, query: string, options: RecallOptions): Promise<readonly RankedHit[]> {

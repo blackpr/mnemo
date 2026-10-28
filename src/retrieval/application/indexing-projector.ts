@@ -49,7 +49,7 @@ export class IndexingProjector {
       }
       case "memory.FactInvalidated": {
         const { factId } = e.payload as { factId: FactId };
-        await this.engine.retractFact(factId);
+        await this.engine.retractFact(e.bankId, factId);
         return;
       }
       default:

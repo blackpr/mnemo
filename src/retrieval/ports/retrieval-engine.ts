@@ -26,8 +26,8 @@ export interface RetrievalEngine {
   readonly name: string; // "pgvector" | "hindsight" | "honcho"
   indexFact(fact: Fact): Promise<void>;
   indexEpisode(episode: Episode): Promise<void>;
-  /** Called on supersession/invalidation so the engine stops surfacing retracted facts as current. */
-  retractFact(factId: FactId): Promise<void>;
+  /** Called on supersession/invalidation so the engine stops surfacing retracted facts as current. Touches the fact in `bankId` only. */
+  retractFact(bankId: BankId, factId: FactId): Promise<void>;
   recall(scope: Scope, query: string, options: RecallOptions): Promise<readonly RankedHit[]>;
   /** Erasure inventory and verification: how many rows (facts and episodes) the engine holds for the bank. */
   countBank(bankId: BankId): Promise<number>;

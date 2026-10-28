@@ -28,8 +28,7 @@ import type { RankedHit, RecallOptions, RetrievalEngine } from "../../ports/retr
  *   sessions, workspace and queue rows were all gone the moment the API stopped listing it), so a
  *   stopped deriver shows up as a purge timeout, not as a false zero.
  * - Sessions are created with summaries off, so the deriver schedules no LLM work for them at all.
- * - `retractFact(factId)` has no bank id on the port, so the message is looked up in every
- *   workspace with our prefix (O(banks)).
+ * - `retractFact` flags the message in the fact's own workspace only.
  */
 export interface HonchoEngineOptions {
   readonly baseUrl: string;
@@ -201,25 +200,13 @@ export class HonchoEngine implements RetrievalEngine {
     return page.items[0];
   }
 
-  async retractFact(factId: FactId): Promise<void> {
-    for (const ws of await this.ourWorkspaces()) {
-      // Only workspaces that already have a facts session (read over HTTP; `session()` would get-or-create one).
-      if (!(await this.sessionIds(ws)).includes(FACTS)) continue;
-      const facts = await this.clientFor(ws).session(FACTS);
-      const existing = await this.findByRef(facts, factId);
-      if (existing) await facts.updateMessage(existing, { ...existing.metadata, retracted: "true" });
-    }
-  }
-
-  private async ourWorkspaces(): Promise<string[]> {
-    const honcho = this.clientFor(`${this.prefix}_probe`);
-    const out: string[] = [];
-    for (let page = 1; ; page++) {
-      const p = await honcho.workspaces({ page, size: 100 });
-      out.push(...p.items.filter((id) => id.startsWith(this.prefix)));
-      if (page >= p.pages) break;
-    }
-    return out;
+  async retractFact(bankId: BankId, factId: FactId): Promise<void> {
+    const ws = this.workspace(bankId);
+    // Only a workspace that exists and already has a facts session (read over HTTP; `session()` would get-or-create one).
+    if (!(await this.workspaceExists(ws)) || !(await this.sessionIds(ws)).includes(FACTS)) return;
+    const facts = await this.clientFor(ws).session(FACTS);
+    const existing = await this.findByRef(facts, factId);
+    if (existing) await facts.updateMessage(existing, { ...existing.metadata, retracted: "true" });
   }
 
   async recall(scope: Scope, query: string, options: RecallOptions): Promise<readonly RankedHit[]> {

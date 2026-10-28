@@ -45,14 +45,19 @@ export class PgPrincipalRepository implements PrincipalRepository {
     return rows[0] ? this.hydrate(rows[0]) : undefined;
   }
 
-  /** The grants are replaced, not merged. On a pool this runs in its own transaction so no reader (erasure's access store included) sees the principal with its grants half-written. */
+  /**
+   * The grants are replaced, not merged. On a pool this runs in its own transaction so no reader (erasure's access store included) sees the principal with its grants half-written.
+   * A principal id that already exists in another tenant is refused: the upsert only updates a row of the same tenant, so another tenant's principal is never renamed or handed these grants.
+   */
   async save(p: Principal): Promise<void> {
     const write = async (db: Queryable) => {
-      await db.query(
+      const upsert = await db.query(
         `INSERT INTO governance.principals (id, tenant_id, kind, display_name) VALUES ($1, $2, $3, $4)
-         ON CONFLICT (id) DO UPDATE SET kind = EXCLUDED.kind, display_name = EXCLUDED.display_name`,
+         ON CONFLICT (id) DO UPDATE SET kind = EXCLUDED.kind, display_name = EXCLUDED.display_name
+         WHERE principals.tenant_id = EXCLUDED.tenant_id`,
         [p.id, p.tenantId, p.kind, p.displayName],
       );
+      if (upsert.rowCount === 0) throw new Error(`Principal ${p.id} already exists in another tenant; refusing to save it for tenant ${p.tenantId}`);
       await db.query("DELETE FROM governance.grants WHERE principal_id = $1", [p.id]);
       for (const g of p.grants) {
         await db.query(

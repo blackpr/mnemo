@@ -78,8 +78,8 @@ export class PgvectorEngine implements RetrievalEngine {
     });
   }
 
-  async retractFact(factId: FactId): Promise<void> {
-    await this.db.query("UPDATE retrieval.pgvector_index SET retracted = true WHERE kind = 'fact' AND ref_id = $1", [factId]);
+  async retractFact(bankId: BankId, factId: FactId): Promise<void> {
+    await this.db.query("UPDATE retrieval.pgvector_index SET retracted = true WHERE bank_id = $1 AND kind = 'fact' AND ref_id = $2", [bankId, factId]);
   }
 
   async recall(scope: Scope, query: string, options: RecallOptions): Promise<readonly RankedHit[]> {
@@ -152,15 +152,21 @@ export class PgvectorEngine implements RetrievalEngine {
     return rows.map((r) => ({ embedder: r.embedder, rows: Number(r.n) }));
   }
 
+  /**
+   * The row key is (kind, ref_id), not the bank: DO UPDATE only overwrites a row of the same bank, and a ref id
+   * already indexed for another bank is refused instead of being moved across (ids are generated, so this means a bug).
+   */
   private async upsert(row: Row): Promise<void> {
-    await this.db.query(
+    const r = await this.db.query(
       `INSERT INTO retrieval.pgvector_index (bank_id, kind, ref_id, text, embedding, embedder, valid_from, valid_to, retracted)
        VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8, $9)
        ON CONFLICT (kind, ref_id) DO UPDATE SET
          text = EXCLUDED.text, embedding = EXCLUDED.embedding, embedder = EXCLUDED.embedder,
-         valid_from = EXCLUDED.valid_from, valid_to = EXCLUDED.valid_to, retracted = EXCLUDED.retracted`,
+         valid_from = EXCLUDED.valid_from, valid_to = EXCLUDED.valid_to, retracted = EXCLUDED.retracted
+       WHERE pgvector_index.bank_id = EXCLUDED.bank_id`,
       [row.bankId, row.kind, row.refId, row.text, toVectorLiteral(row.vector), this.embedder.id, row.validFrom ?? null, row.validTo ?? null, row.retracted],
     );
+    if (r.rowCount === 0) throw new Error(`pgvector: ${row.kind} ${row.refId} is already indexed for another bank; refusing to overwrite it from bank ${row.bankId}`);
   }
 }
 
