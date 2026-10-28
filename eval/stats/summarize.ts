@@ -31,7 +31,7 @@ const datasetCategories = [...new Set(rows.map(datasetCategoryOf).filter((c): c 
 
 console.log(`Source: ${file} (${rows.length} answered results, ${arms.length} arm(s), ${new Set(rows.map((r) => String(r.vars?.conversationId ?? ""))).size} conversation(s)).`);
 if (notRun.size > 0) console.log(`Not run (provider error, excluded from every row below): ${[...notRun].map(([a, n]) => `${a} ${n}`).join(", ")}.`);
-console.log(`Prices: $${PRICE_USD_PER_MTOK.input}/M input, $${PRICE_USD_PER_MTOK.output}/M output (claude-opus-5-5); write cost counts input + output at list price (prompt-cached input is charged at full price here, an over-estimate for engines that cache). Embedding tokens: not priced.\n`);
+console.log(`Prices: $${PRICE_USD_PER_MTOK.input}/M input, $${PRICE_USD_PER_MTOK.output}/M output (claude-opus-5-5); write cost counts input + output at list price, with prompt-cache reads at $${PRICE_USD_PER_MTOK.cacheRead}/M and cache writes at $${PRICE_USD_PER_MTOK.cacheWrite}/M where the arm reports both from our ledger (arm B since extract-v3; Hindsight's trace-reported cache reads stay at full price, their input semantics unverified). Embedding tokens: not priced.\n`);
 
 const header = ["Measure", ...arms];
 const table: string[][] = [];
@@ -111,7 +111,10 @@ table.push(["Write cost, total (USD)", ...col((rs) => {
   const banks = new Map<string, number>();
   for (const r of rs) {
     const m = r.response?.metadata ?? {};
-    if (typeof m.bankId === "string") banks.set(m.bankId, costUsd({ inputTokens: num(m.writeInputTokens), outputTokens: num(m.writeOutputTokens) }));
+    // Cache repricing only where the arm reports both halves from a ledger whose input count is known to include them (arm B since extract-v3).
+    // Hindsight reports cached tokens from its own trace, whose input semantics are unverified: it stays at full price, as before.
+    const repriced = typeof m.writeCacheWriteTokens === "number" ? { cachedInputTokens: num(m.writeCachedTokens), cacheWriteTokens: num(m.writeCacheWriteTokens) } : {};
+    if (typeof m.bankId === "string") banks.set(m.bankId, costUsd({ inputTokens: num(m.writeInputTokens), outputTokens: num(m.writeOutputTokens), ...repriced }));
   }
   return `$${[...banks.values()].reduce((a, b) => a + b, 0).toFixed(3)}`;
 })]);

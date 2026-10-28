@@ -1,5 +1,113 @@
 # Eval results
 
+## Extraction cost, 2026-10-24/28: where arm B's write tokens go, and the cheaper extractor
+
+### Before: the `extract-v2` prompt on the LoCoMo subset
+
+Measured from the four `eval-locomo*` banks' `extraction.runs` ledgers as recorded in
+`eval/results/locomo-ab.json` (the banks themselves are erased), and decomposed by rebuilding every
+one of the 114 prompts offline with `buildExtractionUserPrompt` over the committed corpus (the facts
+block is an estimate: about 12 facts asserted per session chunk, 95 characters each, capped at the
+extractor's 200; the dev ledger for `bank-demo` averages 4,051 input tokens over 9 runs with the
+same shape). The rebuilt prompts come to 1.38M characters/4; the ledger says 2.25M tokens, so
+LoCoMo's dialogue tokenizes at about 2.5 characters per token and the shares below are what matter.
+
+| Part of one extraction call (mean per episode, 114 episodes) | Share of input | Tokens (ledger-scaled) |
+| --- | --- | --- |
+| System prompt (instructions; the JSON schema travels as `output_config.format`, outside the prompt) | 4.7% | about 920 |
+| Current-facts block (`<existing_facts>`, every current fact of the bank, up to 200) | 27% | about 5,300 |
+| Context episodes (`contextTurns` = 12 previous session chunks, each up to 8,000 characters) | 61% | about 12,000 |
+| Trigger episode and the framing | 7% | about 1,400 |
+| **Input, total** | 100% | **19,699** (2,245,667 over 114 runs; 8.98 USD) |
+| Output (candidates with `predicate` objects, `related`, `faithfulness`) | | **938** (106,923; 2.14 USD, 19% of the write cost) |
+
+So on session-sized episodes the previous sessions, not the fact list, are the bulk of the prompt:
+`contextTurns` was tuned for per-turn chat episodes (a few hundred characters each) and was not
+configurable from the environment (it is since extract-v3, f61601f). The facts block is second and grows with the bank; the system
+prompt is the only stable prefix and, at about 900 tokens, is above Opus 5.5's 512-token minimum
+for prompt caching, but nothing marked it. Output is a fifth of the cost; the `predicate` object
+(subject / predicate / object, filled on 19 of bank-demo's 30 facts) is stored and served but read
+by nothing (recall embeds and ranks the statement).
+
+Changes made (`extract-v3`, commit f61601f), in payoff order:
+1. The context block has a character budget (`EXTRACTION_CONTEXT_CHARS`, default 16,000; the
+   oldest episodes go first), and `contextTurns` is configurable (`EXTRACTION_CONTEXT_TURNS`).
+2. The facts block holds candidate facts for the episode instead of the whole bank. They are cut
+   by rank at 3k:
+   - the top-k current facts by the engine's similarity to the episode
+     (`EXTRACTION_CANDIDATE_FACTS`, default 20). A short reply is queried together with the
+     preceding turn;
+   - facts extracted from the context episodes, plus the 5 newest facts. The relay may not have
+     indexed those yet when the worker drains episodes back to back;
+   - facts whose statement entities appear in the episode or the preceding turn, at most 2k,
+     matched without regard to case or accents;
+   - the newest k, with a warning, when the engine fails or returns no current fact.
+3. The system prompt is sent with Anthropic `cacheControl`. The ledger records cache reads and
+   writes (`extraction.runs.cached_input_tokens`, `cache_write_tokens`).
+4. Triage skips turns that cannot carry facts before the model call, with the reason in the
+   ledger. That covers acknowledgements, fenced code only, a stack trace without prose, and JSON
+   whose strings hold no language or names. A reply to an assistant question, a single word that
+   is not an acknowledgement, unspaced scripts and imported documents are never skipped.
+5. The output schema drops `predicate`.
+
+### After: arm B rerun on the same 40 questions (2026-10-28)
+
+Setup: the same 40 LoCoMo questions, seed, corpus (114 session chunks, 88.7k tokens), answering
+model, frozen grader and recall limit (10) as `locomo-ab.json`. Only the extractor changed.
+Fresh banks were used (`EVAL_BANK_SUFFIX=v3`, `eval-locomo4x-v3`) and promptfoo's cache did not
+apply (no answer was served from it). The run used `--filter-providers B-pgvector`.
+Results file: `eval/results/locomo-b-v3.json`.
+
+| Measure (arm B, LoCoMo, 4 conversations, 40 questions) | `extract-v2` (benchmark run, 2026-10-24) | `extract-v3` (2026-10-28) |
+| --- | --- | --- |
+| Accuracy, overall | 75% (30/40) | 77.5% (31/40) |
+| Accuracy by type: fact / decision / temporal / negative | 12/16, 5/8, 5/8, 8/8 | 12/16, 5/8, 6/8, 8/8 |
+| Paired, per question | | 30 pass both, 9 fail both, 1 passes only under v3 (locomo-49-q4, temporal), 0 only under v2 |
+| Write input tokens (nominal) | 2,245,667 | 1,325,729 (−41%) |
+| of which prompt-cache reads / writes | 0 / 0 (not marked) | 192,100 / 1,700 |
+| Write output tokens | 106,923 | 87,401 (−18%) |
+| Input tokens per extraction call (mean) | 19,699 | 11,629 |
+| Write LLM tokens per corpus token | 26.5 | 15.9 |
+| Extraction calls / skipped by triage | 114 / 0 | 114 / 0 (LoCoMo sessions are all prose) |
+| Facts written (4 banks; v2 from the erasure receipts' `memory.facts` counts, v3 from the ledger before erasure) | 701 (supersessions not recorded: the ledger was erased with the banks) | 721 (102 superseded, 3 invalidated, 2 historical, 1 rejected) |
+| Ingest seconds per chunk (per bank: 44 / 47 / 48 / 49) | 10.4 (26.8 / 5.2 / 4.8 / 5.4; without the interrupted locomo44 ingest, 5.1) | 8.6 (8.6 / 8.3 / 8.7 / 9.0): slower per chunk, cause not measured (per-episode candidate recall, or API latency that day) |
+| Write cost (USD, cache reads at 0.20, writes at 5 per million) | 11.12 | **6.32** (−43%) |
+| Read cost / grader cost (USD) | 0.36 / 0.27 | 0.37 / 0.24 |
+| Read tokens per question (prompt, mean) | 1,433 | 1,455 |
+| Total per answered question incl. write (USD) | 0.294 | **0.173** |
+
+Reading:
+- Quality held on accuracy. Every question v2 answered, v3 answers too. The one gain is a temporal
+  question, and one question on 40 is noise, not an improvement.
+- The nine shared misses are of three kinds:
+  - partial set: q8, q48, q44;
+  - not extracted, answered with an abstention: q132, q45, q174, q68;
+  - wrong answer: q52, q23.
+- One shared miss changed character. Under v2, locomo-48-q23 abstained. Under v3 it gives a reason
+  that contradicts the key. That is a false specific on a non-adversarial question, the kind of
+  error arm B's abstention record is meant to avoid. Adversarial questions stay at 8/8.
+- The banks grew by about the same amount: 721 facts against 701. Under v3, 102 of the new
+  statements superseded an earlier fact, so the model still relates statements to facts it is
+  shown. v2's supersession count was erased with its ledger, so the two cannot be compared on this.
+- The cost fell by 43%. Before the run, an offline estimate put the v3 write at about 5.0 USD, a
+  55% cut. It used the same corpus, 20 candidate facts per call and 2.5 characters per token. The
+  likely gap is that the candidate set is larger than the 20 similarity hits, because
+  context-episode facts and entity matches are added. That is inferred, not measured: no v3
+  prompt was decomposed.
+- The cache covers the stable prefix and nothing else. That prefix is 1,700 tokens: 113 calls read
+  1,700 each and one call wrote it. The live check on the instructions alone wrote 1,017 tokens.
+  The rest is the structured-output schema, which the Anthropic adapter renders ahead of the
+  cached system text, unlike the "outside the prompt" estimate in the Before table. The cache
+  saves about 0.73 USD here. Everything after the prefix changes with each episode, by design.
+- Where the write money goes now: uncached input 4.53 USD (72%) and output 1.75 USD (28%). The
+  uncached input is the context episodes, the candidate facts and the trigger together. Context is
+  at most about 6,400 of the 11,629 tokens per call. The next lever is the context budget. At 8,000 characters it would remove roughly another 2,500 tokens
+  per call, about 1.1 USD on this run, but it was not measured. A cheaper extraction model is the
+  user's decision, not a tuning knob.
+
+Spend for this session: 6.95 USD of the 15 USD cap. That is 6.32 for the write, 0.37 for reads,
+0.24 for grading and 0.02 for the live prompt-cache check.
+
 ## Public benchmarks, 2026-10-24: LongMemEval-S and LoCoMo subsets
 
 ### Spend estimate before the run (hard cap 45 USD for this session)
@@ -91,7 +199,7 @@ Reading:
   price is the misses where the fact was never extracted (q132, q45, q68: "I do not have that
   information" against a key that is in the transcript), and the 11 USD of extraction for 89k
   corpus tokens, 26 LLM tokens per corpus token (each prompt carries the 12 previous sessions and
-  up to 200 facts; `contextTurns` is not configurable from the environment, see follow-ups).
+  up to 200 facts; `contextTurns` was not configurable from the environment then; it is since extract-v3, f61601f).
 - B-raw (no extraction) is 7.5 points under B on the same questions, interval [−0.5, 15.5], bootstrap
   [2.5, 10]: the closest thing to a finding in this run, and it says extraction earns its keep on
   abstention (8/8 vs 5/8) rather than on recall.
@@ -176,13 +284,13 @@ and grades came from promptfoo's cache, B's banks from the ingestion record).
   limit in `recall` would make B's read side comparable to the engines' (follow-up for `src/`).
 - Extraction cost per corpus token (26 LLM tokens in B, 46 in Hindsight) is the number that
   decides what any of these engines costs at history sizes like LoCoMo's; `RetainPipeline`'s
-  `contextTurns` (12 previous episodes in every prompt) is not configurable from the environment
+  `contextTurns` (12 previous episodes in every prompt) was not configurable from the environment (done in extract-v3, f61601f)
   and is most of arm B's write cost on session-sized episodes (follow-up for `src/`).
 - Cleanup: the twelve `eval-*` pgvector banks (four B, four B-raw, four LongMemEval raw) were erased
   with receipts (`erasure_requests` holds the ids, all `receipted`), the four Hindsight banks deleted
   (404 on re-read), the four Honcho workspaces and their sessions deleted (workspace list empty);
   `bank-demo` untouched. The ingestion records under `eval/results/` still name the erased banks, so
-  a rerun must delete those entries first (`eval/README.md`).
+  a rerun must delete those entries first (`eval/README.md`), or go to fresh banks with `EVAL_BANK_SUFFIX` (since 2026-10-28).
 
 ## Stage 2 decision run, 2026-10-23/24: four arms, 40 audited questions, 4 conversations
 

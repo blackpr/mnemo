@@ -170,3 +170,20 @@ the evidence sessions pooled per user, not the benchmark's 115k-token haystack, 
 easier than the published task. The published 90-to-95 figures are all within a few points of each
 other, which an independent leaderboard note also observes; on our sample the engines are 20
 points apart, in opposite directions from pgvector.
+
+## Cheaper extraction (2026-10-28)
+
+**The pgvector-plus-extraction recommendation stands, and it gets cheaper.** Arm B was rerun with
+the `extract-v3` extractor on the same 40 LoCoMo questions. The prompt now shows candidate facts
+for the episode instead of the bank's whole list, the context window has a character budget, the
+system prompt is prompt-cached, contentless turns are skipped and the output schema is smaller.
+Arm B scored 31/40 against 30/40 before; per question it lost nothing and gained one temporal
+answer. Write cost fell from 11.12 to 6.32 USD (26.5 to 15.9 LLM tokens per corpus token), so the
+cost per answered question including the write side fell from 0.294 to 0.173 USD. Hindsight was
+1.9 times arm B's cost per question and is now 3.2 times, for a 2-question edge (33/40) that is
+still inside the MDD (C−B −5.0 points against v3, MDD 26.9; B−B-raw is now +10.0, MDD 17.0). Raw pgvector (27/40, 0.052 USD) and full context (30/40, 0.041 USD) remain
+cheaper on histories the size of LoCoMo's, read ten times: extraction still does not amortize at
+that read count. What it buys is the governed, bi-temporal fact layer and abstention on
+adversarial questions (8/8). Uncached input (context episodes, candidate facts and the trigger) is
+72% of the remaining write cost, and session-sized context is the largest part of it; a tighter `EXTRACTION_CONTEXT_CHARS` is the next unmeasured lever. Details:
+`eval/RESULTS.md`, "Extraction cost".

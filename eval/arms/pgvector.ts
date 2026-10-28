@@ -8,7 +8,10 @@
  *
  * EVAL_B_EXTRACTOR (default: the answering model) picks the bank's extractor. `none` is the plan's
  * floor, raw turns embedded with no LLM extraction: a separate bank `eval-<id8>-raw`, recall returns
- * episodes only, and the arm is labelled `B-pgvector-raw` in the metadata.
+ * episodes only, and the arm is labelled `B-pgvector-raw` in the metadata. EVAL_BANK_SUFFIX (letters,
+ * digits, dashes) names a fresh set of banks and ingestion records for a rerun of the same corpus
+ * under a changed extractor (`eval-<id8>-<suffix>`): the earlier banks are erased tombstones and a
+ * bank id is never reused.
  *
  * Nothing here touches `bank-demo`; every bank this arm creates is named `eval-*` in tenant `t-eval`.
  * A bank id is never reused for different content: the ingestion record carries a digest of the
@@ -27,6 +30,8 @@ const TENANT = "t-eval";
 const PRINCIPAL = "eval-runner";
 const SOURCE = "eval-corpus";
 const RECALL_LIMIT = Number(process.env.EVAL_RECALL_LIMIT ?? 10);
+const BANK_SUFFIX = process.env.EVAL_BANK_SUFFIX ?? "";
+if (!/^[A-Za-z0-9-]{0,16}$/.test(BANK_SUFFIX)) throw new Error(`EVAL_BANK_SUFFIX must be up to 16 letters, digits or dashes, got ${JSON.stringify(BANK_SUFFIX)}`);
 const DRAIN_POLL_MS = 5_000;
 const DRAIN_TIMEOUT_MS = Number(process.env.EVAL_DRAIN_TIMEOUT_MS ?? 30 * 60_000);
 const record = new IngestionRecord<Ingestion>(path.join(REPO_ROOT, "eval", "results", "pgvector-banks.json"));
@@ -43,12 +48,17 @@ interface Ingestion {
   readonly ingestMs: number;
   readonly writeInputTokens: number;
   readonly writeOutputTokens: number;
+  /** Of writeInputTokens: served from the provider's prompt cache / written to it (extract-v3 ledger columns; absent on records from before). */
+  readonly writeCachedTokens?: number;
+  readonly writeCacheWriteTokens?: number;
+  /** Extraction claims that reached the model, retries included (ledger `attempts`). */
+  readonly writeLlmCalls?: number;
   readonly runs: Record<string, number>;
   readonly ingestedAt: string;
 }
 
 type RunCounts = Record<"pending" | "running" | "done" | "failed" | "dead" | "skipped", number>;
-type ExtractionSummary = { counts: RunCounts; inputTokens: number; outputTokens: number };
+type ExtractionSummary = { counts: RunCounts; inputTokens: number; outputTokens: number; cachedInputTokens?: number; cacheWriteTokens?: number; llmAttempts?: number };
 
 const drained = (c: RunCounts, turns: number): boolean => c.pending + c.running + c.failed === 0 && c.done + c.skipped + c.dead >= turns;
 
@@ -71,11 +81,11 @@ async function waitForDrain(bankId: string, turns: number): Promise<ExtractionSu
 
 /** Idempotent on every step: an existing bank, grant, extractor or episode is fine. Refused: a bank outside `eval-*`, or a bank whose record is for other content. */
 async function ingest(conversationId: string): Promise<Ingestion> {
-  const bankId = `eval-${conversationId.slice(0, 8)}${EXTRACTOR === "none" ? "-raw" : ""}`;
+  const bankId = `eval-${conversationId.slice(0, 8)}${EXTRACTOR === "none" ? "-raw" : ""}${BANK_SUFFIX ? `-${BANK_SUFFIX}` : ""}`;
   if (!bankId.startsWith("eval-")) throw new Error("refusing to ingest into a non-eval bank");
   const turns = await loadConversation(conversationId);
   const digest = digestOf(turns);
-  const stateKey = `${conversationId}${EXTRACTOR === "none" ? ":raw" : ""}`;
+  const stateKey = `${conversationId}${EXTRACTOR === "none" ? ":raw" : ""}${BANK_SUFFIX ? `:${BANK_SUFFIX}` : ""}`;
   const known = await record.get(stateKey);
   if (known) {
     if (known.bankId !== bankId || known.digest !== digest || known.extractor !== EXTRACTOR) {
@@ -118,11 +128,15 @@ async function ingest(conversationId: string): Promise<Ingestion> {
     ingestMs: created === 0 && known ? known.ingestMs : Date.now() - started,
     writeInputTokens: s.inputTokens,
     writeOutputTokens: s.outputTokens,
+    // Only what the server reports: a server from before extract-v3 has no cache columns, and its banks stay priced at list.
+    ...(s.cachedInputTokens !== undefined ? { writeCachedTokens: s.cachedInputTokens } : {}),
+    ...(s.cacheWriteTokens !== undefined ? { writeCacheWriteTokens: s.cacheWriteTokens } : {}),
+    ...(s.llmAttempts !== undefined ? { writeLlmCalls: s.llmAttempts } : {}),
     runs: s.counts,
     ingestedAt: new Date().toISOString(),
   };
   await record.save(stateKey, ingestion);
-  console.log(`[${ARM}] ${bankId}: ${created} retained, ${duplicates} already there, drained in ${Math.round(ingestion.ingestMs / 1000)} s, write tokens ${s.inputTokens} in / ${s.outputTokens} out, runs ${JSON.stringify(s.counts)}`);
+  console.log(`[${ARM}] ${bankId}: ${created} retained, ${duplicates} already there, drained in ${Math.round(ingestion.ingestMs / 1000)} s, write tokens ${s.inputTokens} in (${s.cachedInputTokens ?? 0} cache reads, ${s.cacheWriteTokens ?? 0} cache writes) / ${s.outputTokens} out, runs ${JSON.stringify(s.counts)}`);
   return ingestion;
 }
 
@@ -183,6 +197,9 @@ export default class PgvectorProvider implements ApiProvider {
         ingestMs: ingestion.ingestMs,
         writeInputTokens: ingestion.writeInputTokens,
         writeOutputTokens: ingestion.writeOutputTokens,
+        ...(ingestion.writeCachedTokens !== undefined ? { writeCachedTokens: ingestion.writeCachedTokens } : {}),
+        ...(ingestion.writeCacheWriteTokens !== undefined ? { writeCacheWriteTokens: ingestion.writeCacheWriteTokens } : {}),
+        ...(ingestion.writeLlmCalls !== undefined ? { writeLlmCalls: ingestion.writeLlmCalls } : {}),
         extractionRuns: ingestion.runs,
       },
       recallMs + a.latencyMs,

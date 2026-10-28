@@ -11,11 +11,17 @@ import type { LanguageModel } from "ai";
 export const ANSWERING_MODEL = "anthropic:claude-opus-5-5" as const;
 export const GRADER_MODEL = "anthropic:claude-opus-5-5" as const;
 
-/** Anthropic list price (USD per million tokens) for claude-opus-5-5, checked 2026-10-23. */
-export const PRICE_USD_PER_MTOK = { input: 4, output: 20 } as const;
+/** Anthropic list price (USD per million tokens) for claude-opus-5-5, checked 2026-10-23 (cache read and 5-minute cache write 2026-10-24). */
+export const PRICE_USD_PER_MTOK = { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 } as const;
 
-export function costUsd(usage: { inputTokens: number; outputTokens: number }): number {
-  return (usage.inputTokens * PRICE_USD_PER_MTOK.input + usage.outputTokens * PRICE_USD_PER_MTOK.output) / 1_000_000;
+/** `inputTokens` is nominal (cache reads and writes included); the cached subsets, when known, are repriced. */
+export function costUsd(usage: { inputTokens: number; outputTokens: number; cachedInputTokens?: number; cacheWriteTokens?: number }): number {
+  const cached = usage.cachedInputTokens ?? 0;
+  const written = usage.cacheWriteTokens ?? 0;
+  const plain = usage.inputTokens - cached - written;
+  // The nominal count includes cache reads and writes (@ai-sdk/anthropic 4.x); a negative remainder means a source with other semantics.
+  if (plain < 0) throw new Error(`costUsd: cached (${cached}) + cache-write (${written}) tokens exceed the nominal input (${usage.inputTokens}); the source does not count cache tokens in its input`);
+  return (plain * PRICE_USD_PER_MTOK.input + cached * PRICE_USD_PER_MTOK.cacheRead + written * PRICE_USD_PER_MTOK.cacheWrite + usage.outputTokens * PRICE_USD_PER_MTOK.output) / 1_000_000;
 }
 
 export function languageModel(spec: string = ANSWERING_MODEL): LanguageModel {

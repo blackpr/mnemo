@@ -75,8 +75,13 @@ npm run eval:summary -- eval/results/locomo.json && npm run eval:ci -- eval/resu
 
 The corpus unit for a benchmark is one session (split at turn boundaries when longer than 7,000
 characters), not one turn: both benchmarks are annotated per session, and every extraction prompt
-in arm B carries the 12 most recent episodes and up to 200 facts, so per-turn ingestion of a
-600-turn LoCoMo conversation would cost an order of magnitude more for the same text. The recall limit stays at
+in arm B carries previous episodes as context (since extract-v3 up to `EXTRACTION_CONTEXT_TURNS`
+of them within `EXTRACTION_CONTEXT_CHARS`, and the `EXTRACTION_CANDIDATE_FACTS` facts most similar
+to the episode instead of the whole bank; before, 12 episodes and up to 200 facts), so per-turn
+ingestion of a 600-turn LoCoMo conversation would cost several times more for the same text. A rerun
+of arm B after an extractor change goes to fresh banks with `EVAL_BANK_SUFFIX=<tag>` (the earlier
+banks are erased tombstones) and is filtered to that arm with promptfoo's `--filter-providers B-pgvector`;
+`eval:summary` prices arm B's prompt-cache reads and writes from the ledger columns the arm records. The recall limit stays at
 stage 2's 10 (`limit` is shared by facts and episodes in `recall`, so arm B sees the ten best of both); arm D's
 ten session chunks are more material than arm C's 4,096-token budget, which the read-token row reports.
 Arm A marks the history block for Anthropic prompt caching, so repeated questions on one history
