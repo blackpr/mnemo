@@ -2,6 +2,7 @@ import type { BankId, PrincipalId, SubjectId, TenantId } from "../../../shared-k
 import { randomUUID } from "node:crypto";
 import type pg from "pg";
 import { withTransaction, type Queryable } from "../../../platform/postgres/pool.js";
+import { crossBank } from "../../../platform/postgres/bank-isolation.js";
 import type { ErasureReceipt, ErasureRequest, ErasureState, StoreDeletion, StoreInventory, StoreVerification } from "../../domain/erasure-request.js";
 import { ErasureClaimLostError, ErasureInFlightError, ErasureNotInFlightError, type ErasureClaim, type ErasureRequestRepository, type ErasureTransaction, type ErasureUnitOfWork } from "../../ports/repositories.js";
 import { PgAuditLog } from "./repositories.js";
@@ -112,11 +113,11 @@ export class PgErasureRequestRepository implements ErasureRequestRepository {
       `UPDATE governance.erasure_requests
        SET state = $2, inventory = $3, deletions = $4, verifications = $5, receipt = $6, failure = $7, updated_at = now(),
            claimed_at = CASE WHEN $8::text IS NULL THEN claimed_at ELSE now() END
-       WHERE id = $1 AND state NOT IN ('receipted', 'failed') AND ($8::text IS NULL OR claim_token = $8)`,
-      [r.id, r.state, ...jsonColumns(r), opts.claimToken ?? null],
+       WHERE id = $1 AND bank_id = $9 AND state NOT IN ('receipted', 'failed') AND ($8::text IS NULL OR claim_token = $8)`,
+      [r.id, r.state, ...jsonColumns(r), opts.claimToken ?? null, r.bankId],
     );
     if (res.rowCount === 0) {
-      const { rows } = await this.db.query<{ state: ErasureState }>("SELECT state FROM governance.erasure_requests WHERE id = $1", [r.id]);
+      const { rows } = await this.db.query<{ state: ErasureState }>("SELECT state FROM governance.erasure_requests WHERE id = $1 AND bank_id = $2", [r.id, r.bankId]);
       const stored = rows[0];
       if (!stored) throw new Error(`ErasureRequest ${r.id} not found`);
       if (stored.state === "receipted" || stored.state === "failed") throw new ErasureNotInFlightError(r.id);
@@ -130,7 +131,7 @@ export class PgErasureRequestRepository implements ErasureRequestRepository {
     // A claim is a row change: `updated_at` moves too, so `AbandonErasureHandler` sees a just-retaken request as live.
     const token = randomUUID();
     const { rows } = await this.db.query<Row>(
-      `UPDATE governance.erasure_requests r
+      `${crossBank("erasure.claim")}UPDATE governance.erasure_requests r
        SET claim_token = $1, claimed_at = now(), updated_at = now(), attempts = r.attempts + 1
        FROM (
          SELECT id FROM governance.erasure_requests
@@ -153,15 +154,15 @@ export class PgErasureRequestRepository implements ErasureRequestRepository {
   /** A graceful stop is not a failed attempt: the claim goes and the attempt is given back. */
   async release(claim: ErasureClaim): Promise<void> {
     await this.db.query(
-      "UPDATE governance.erasure_requests SET claim_token = NULL, claimed_at = NULL, attempts = greatest(attempts - 1, 0) WHERE id = $1 AND claim_token = $2 AND state NOT IN ('receipted', 'failed')",
-      [claim.request.id, claim.token],
+      "UPDATE governance.erasure_requests SET claim_token = NULL, claimed_at = NULL, attempts = greatest(attempts - 1, 0) WHERE id = $1 AND bank_id = $3 AND claim_token = $2 AND state NOT IN ('receipted', 'failed')",
+      [claim.request.id, claim.token, claim.request.bankId],
     );
   }
 
   async get(id: string, within?: { readonly bankId: BankId; readonly tenantId: TenantId }): Promise<ErasureRequest | undefined> {
     const { rows } = within
       ? await this.db.query<Row>("SELECT * FROM governance.erasure_requests WHERE id = $1 AND bank_id = $2 AND tenant_id = $3", [id, within.bankId, within.tenantId])
-      : await this.db.query<Row>("SELECT * FROM governance.erasure_requests WHERE id = $1", [id]);
+      : await this.db.query<Row>(`${crossBank("erasure.get-by-id")}SELECT * FROM governance.erasure_requests WHERE id = $1`, [id]);
     return rows[0] ? toRequest(rows[0]) : undefined;
   }
 

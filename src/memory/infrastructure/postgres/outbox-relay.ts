@@ -1,6 +1,7 @@
 import type pg from "pg";
 import type { BankId, DomainEvent, TenantId } from "../../../shared-kernel/index.js";
 import { withTransaction } from "../../../platform/postgres/pool.js";
+import { crossBank } from "../../../platform/postgres/bank-isolation.js";
 
 interface OutboxRow {
   id: string;
@@ -51,7 +52,7 @@ export class PgOutboxRelay {
   async drainOnce(handler: OutboxHandler): Promise<{ readonly delivered: number; readonly failed: number; readonly seen: number }> {
     return withTransaction(this.pool, async (client) => {
       const { rows } = await client.query<OutboxRow>(
-        `SELECT id, type, occurred_at, tenant_id, bank_id, payload, attempts
+        `${crossBank("outbox.claim")}SELECT id, type, occurred_at, tenant_id, bank_id, payload, attempts
          FROM memory.outbox
          WHERE published_at IS NULL AND failed_at IS NULL AND next_attempt_at <= now()
          ORDER BY id
@@ -66,7 +67,7 @@ export class PgOutboxRelay {
         await client.query("SAVEPOINT ev");
         try {
           await handler([event]);
-          await client.query("UPDATE memory.outbox SET published_at = now() WHERE id = $1", [r.id]);
+          await client.query("UPDATE memory.outbox SET published_at = now() WHERE id = $1 AND bank_id = $2", [r.id, r.bank_id]);
           await client.query("RELEASE SAVEPOINT ev");
           delivered++;
         } catch (e) {
@@ -78,8 +79,8 @@ export class PgOutboxRelay {
              SET attempts = $2::int, last_error = $3::text,
                  next_attempt_at = now() + ($4::int * interval '1 millisecond'),
                  failed_at = CASE WHEN $2::int >= $5::int THEN now() ELSE NULL END
-             WHERE id = $1`,
-            [r.id, attempts, message.slice(0, 2000), Math.round(this.backoffMs(attempts)), this.maxAttempts],
+             WHERE id = $1 AND bank_id = $6`,
+            [r.id, attempts, message.slice(0, 2000), Math.round(this.backoffMs(attempts)), this.maxAttempts, r.bank_id],
           );
           failed++;
         }
@@ -100,18 +101,18 @@ export class PgOutboxRelay {
 
   /** Unpublished and not dead-lettered, whether or not currently in backoff. */
   async pendingCount(): Promise<number> {
-    const { rows } = await this.pool.query<{ n: string }>("SELECT count(*)::text AS n FROM memory.outbox WHERE published_at IS NULL AND failed_at IS NULL");
+    const { rows } = await this.pool.query<{ n: string }>(`${crossBank("outbox.pending-count")}SELECT count(*)::text AS n FROM memory.outbox WHERE published_at IS NULL AND failed_at IS NULL`);
     return Number(rows[0]?.n ?? 0);
   }
 
   async deadLetterCount(): Promise<number> {
-    const { rows } = await this.pool.query<{ n: string }>("SELECT count(*)::text AS n FROM memory.outbox WHERE failed_at IS NOT NULL");
+    const { rows } = await this.pool.query<{ n: string }>(`${crossBank("outbox.dead-letter-count")}SELECT count(*)::text AS n FROM memory.outbox WHERE failed_at IS NOT NULL`);
     return Number(rows[0]?.n ?? 0);
   }
 
   /** Operator action: put dead-lettered events back in the queue. */
   async requeueDeadLetters(): Promise<number> {
-    const r = await this.pool.query("UPDATE memory.outbox SET failed_at = NULL, attempts = 0, next_attempt_at = now() WHERE failed_at IS NOT NULL AND published_at IS NULL");
+    const r = await this.pool.query(`${crossBank("outbox.requeue-dead-letters")}UPDATE memory.outbox SET failed_at = NULL, attempts = 0, next_attempt_at = now() WHERE failed_at IS NOT NULL AND published_at IS NULL`);
     return r.rowCount ?? 0;
   }
 }

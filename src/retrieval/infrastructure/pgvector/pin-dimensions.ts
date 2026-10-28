@@ -1,5 +1,6 @@
 import type pg from "pg";
 import { withTransaction, type Queryable } from "../../../platform/postgres/pool.js";
+import { crossBank } from "../../../platform/postgres/bank-isolation.js";
 
 /**
  * Pinning the pgvector index to one embedding dimensionality.
@@ -59,7 +60,7 @@ export async function readPinnedIndex(db: Queryable): Promise<PinnedIndex | unde
 
 /** Rows that would be deleted by a pin for `embedderId`: everything another embedder wrote. */
 export async function foreignRows(db: Queryable, embedderId: string): Promise<readonly { readonly embedder: string; readonly rows: number }[]> {
-  const { rows } = await db.query<{ embedder: string; n: string }>("SELECT embedder, count(*)::text AS n FROM retrieval.pgvector_index WHERE embedder <> $1 GROUP BY embedder ORDER BY embedder", [embedderId]);
+  const { rows } = await db.query<{ embedder: string; n: string }>(`${crossBank("pin.foreign-rows")}SELECT embedder, count(*)::text AS n FROM retrieval.pgvector_index WHERE embedder <> $1 GROUP BY embedder ORDER BY embedder`, [embedderId]);
   return rows.map((r) => ({ embedder: r.embedder, rows: Number(r.n) }));
 }
 
@@ -72,9 +73,9 @@ export async function pinIndexDimensions(pool: pg.Pool, embedderId: string, dime
     const previous = await readPinnedIndex(client);
 
     const deletedByEmbedder = await foreignRows(client, embedderId);
-    const del = await client.query("DELETE FROM retrieval.pgvector_index WHERE embedder <> $1", [embedderId]);
+    const del = await client.query(`${crossBank("pin.delete-foreign-rows")}DELETE FROM retrieval.pgvector_index WHERE embedder <> $1`, [embedderId]);
 
-    const wrong = await client.query<{ n: string }>("SELECT count(*)::text AS n FROM retrieval.pgvector_index WHERE vector_dims(embedding) <> $1", [dimensions]);
+    const wrong = await client.query<{ n: string }>(`${crossBank("pin.count-wrong-width")}SELECT count(*)::text AS n FROM retrieval.pgvector_index WHERE vector_dims(embedding) <> $1`, [dimensions]);
     if (Number(wrong.rows[0]?.n ?? 0) > 0) {
       throw new Error(`${wrong.rows[0]!.n} row(s) written by embedder "${embedderId}" do not have ${dimensions} dimensions; the embedder id and EMBEDDING_DIMENSIONS disagree, refusing to pin`);
     }

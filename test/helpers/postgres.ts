@@ -4,6 +4,7 @@ import { createPool } from "../../src/platform/postgres/pool.js";
 import { migrate } from "../../src/platform/postgres/migrator.js";
 import { migrationSources } from "../../src/platform/postgres/migrations.js";
 import { HNSW_INDEX_NAME } from "../../src/retrieval/infrastructure/pgvector/pin-dimensions.js";
+import { installQueryGuard } from "./query-guard.js";
 
 /**
  * Database-backed tests run only when TEST_DATABASE_URL is set (see .env.example and
@@ -31,6 +32,8 @@ export async function setupTestDb(): Promise<TestDb> {
   await pool.query(`DROP INDEX IF EXISTS retrieval.${HNSW_INDEX_NAME}`);
   await pool.query("ALTER TABLE retrieval.pgvector_index ALTER COLUMN embedding TYPE vector");
   await pool.query("DELETE FROM retrieval.settings");
+  // From here on every statement the application runs on this pool is checked for bank isolation (query-guard.ts).
+  await installQueryGuard(pool);
   return {
     pool,
     async truncateAll() {

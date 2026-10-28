@@ -174,7 +174,31 @@ Migrations are plain SQL files owned by each context (`src/<context>/infrastruct
 
 `src/platform/` holds infrastructure utilities shared by several contexts (Postgres pool, transaction helper, migrator). It is not a bounded context and contains no domain logic.
 
-Every repository read filters by `scope.bankId` in SQL as a second line of defence behind Governance's `AccessPolicy`, which the application layer applies first. Row-level security keyed by `bank_id` is a later hardening step.
+### How bank isolation works
+
+One bank must never see or change another bank's rows. Two layers keep it that way, and a check in the test suite proves the second one.
+
+1. **Governance decides first.** Every application handler asks `AccessPolicy` (`src/governance/domain/access-policy.ts`) whether the caller's Scope may touch the bank, before any query runs. The Scope comes from the API key, and `ScopeResolver` refuses a bank of another tenant.
+2. **Every query pins itself to one bank.** Each repository statement on a bank's tables carries the bank in its WHERE clause (`bank_id = $1`), even though layer 1 already said yes. If a handler ever forgot its policy check, the query would still only return that bank's rows. The tables and the column that pins each one are listed in `src/platform/postgres/bank-isolation.ts` (`SCOPED_TABLES`): `bank_id` for bank data, `tenant_id` for the audit log, and the principal for Governance's identity tables (one principal belongs to one tenant).
+
+**The guard.** Layer 2 is checked by machine, not by reading the code. During `npm test`, every SQL statement that application code sends to the test database goes through `test/helpers/query-guard.ts`. It parses the statement with the real Postgres parser (`libpg-query`) and looks at every SELECT, UPDATE and DELETE, every subquery (in WHERE, the select list, SET and RETURNING), every CTE, and the update half of an upsert: each listed table must be pinned by an equality on its column, joined by AND, to a parameter or constant, or to another pinned column. `bank_id = $1 OR ...` does not count, a subquery is not accepted as the value, an outer join's ON pins only the joined (nullable) side, and an upsert must keep every scope column of the row it overwrites (`WHERE t.bank_id = EXCLUDED.bank_id`). No UPDATE may assign a scope column: a row never moves to another bank. Statement kinds the guard does not interpret (TRUNCATE, MERGE, COPY, DROP TABLE and the like) fail on a listed table, and DO blocks and function definitions fail outright, since their bodies are strings the parser cannot see into. Note that `bank_id = ANY($1)` counts as a pin even when the array names several banks: the guard checks that a statement is bounded by banks the caller supplied, not how many. Production code does not load the guard and pays nothing for it.
+
+**The allowlist.** A few statements span banks on purpose: the outbox relay and the extraction and erasure workers picking up the next job of any bank, the extraction worker's sweep of stale claims, queue counts and requeues for the operator, looking up an erasure request by its id (operator and worker), API key lookup and revocation by hash (before anyone knows the bank), erasure's revocation of keys, and the vector index's checks for other embedders plus the admin pin. Each is named in `CROSS_BANK_STATEMENTS` in `bank-isolation.ts` with the function that runs it, the tables it may leave unpinned, and why; its SQL starts with the tag `crossBank("<name>")`, which becomes the comment `/* cross-bank: <name> */`. The tag excuses only the entry's tables: any other listed table in the same statement must still be pinned. To add one: write the entry (function, tables, reason), put `${crossBank("<name>")}` in front of the SQL, and make sure a test runs it. The run fails if an entry is never exercised, if a tag names no entry, or if a tagged statement's tables turn out to be pinned after all, so the list cannot rot. The "never exercised" check needs the whole suite; it is skipped when a run is limited to some files or tests (a path, `-t`, `--shard`, `--changed`, `--related`).
+
+**What a failure looks like.** The offending query is not sent; it rejects in the test that ran it, and the test file fails with:
+
+```
+query guard: statement not pinned to one bank
+  memory.episodes is not pinned by bank_id
+  at PgEpisodeRepository.get (src/memory/infrastructure/postgres/repositories.ts:67:36)
+  SQL: SELECT * FROM memory.episodes WHERE id = $1
+```
+
+The fix is almost always to add the bank to the WHERE clause; an allowlist entry is for a statement that really must see every bank. The end of each run prints how many statements were checked and how many were allowlisted. A separate test (`test/platform/cross-bank.test.ts`) fills two banks and calls every bank-scoped repository method for one, proving the other is neither seen nor changed.
+
+**What the guard does not see.** Statements no test runs: today two, both deliberately cross-bank and untagged because no test exercises them (the embedder row count in `admin reindex`, `src/cli/admin.ts`, and the boot warning about banks held by another engine, `src/attachment/rest/main.ts`). Migrations (they run before the guard is installed), functions and triggers (opaque bodies), and SQL that test files send themselves for fixtures and assertions.
+
+**Why not row-level security.** Postgres RLS would enforce the same rule inside the database. The user chose this code-layer enforcement on 2026-10-28 so the rule stays readable and owned in TypeScript. RLS remains an option for a multi-tenant hosted deployment, where a database-side backstop against a compromised application is worth its cost (a session variable per transaction, a non-owner role, and policies on every table).
 
 ## 6. Request flows
 

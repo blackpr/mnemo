@@ -51,6 +51,7 @@
     "@types/pg": "^8.23.1",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
+    "libpg-query": "^17.8.1",
     "promptfoo": "^0.120.19",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3",

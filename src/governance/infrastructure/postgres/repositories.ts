@@ -3,6 +3,7 @@ import pg from "pg";
 import type { BankId, Capability, PrincipalId, TenantId } from "../../../shared-kernel/index.js";
 import type { Queryable } from "../../../platform/postgres/pool.js";
 import { withTransaction } from "../../../platform/postgres/pool.js";
+import { crossBank } from "../../../platform/postgres/bank-isolation.js";
 import { appendEntry, type AuditEntry } from "../../domain/audit-log.js";
 import type { Grant, Principal, PrincipalKind } from "../../domain/principal.js";
 import type { ApiKeyStore, AuditLogStore, NewAuditEntry, PrincipalRepository } from "../../ports/repositories.js";
@@ -38,7 +39,7 @@ export class PgPrincipalRepository implements PrincipalRepository {
 
   async findByApiKeyHash(hash: string): Promise<Principal | undefined> {
     const { rows } = await this.db.query<PrincipalRow>(
-      `SELECT p.* FROM governance.api_keys k JOIN governance.principals p ON p.id = k.principal_id
+      `${crossBank("api-keys.find-by-hash")}SELECT p.* FROM governance.api_keys k JOIN governance.principals p ON p.id = k.principal_id
        WHERE k.key_hash = $1 AND k.revoked_at IS NULL`,
       [hash],
     );
@@ -90,7 +91,7 @@ export class PgApiKeyStore implements ApiKeyStore {
   }
 
   async revoke(hash: string): Promise<boolean> {
-    const r = await this.db.query("UPDATE governance.api_keys SET revoked_at = now(), revocation_reason = 'operator' WHERE key_hash = $1 AND revoked_at IS NULL", [hash]);
+    const r = await this.db.query(`${crossBank("api-keys.revoke-by-hash")}UPDATE governance.api_keys SET revoked_at = now(), revocation_reason = 'operator' WHERE key_hash = $1 AND revoked_at IS NULL`, [hash]);
     return (r.rowCount ?? 0) > 0;
   }
 }

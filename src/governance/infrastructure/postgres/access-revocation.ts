@@ -1,6 +1,7 @@
 import type pg from "pg";
 import type { BankId } from "../../../shared-kernel/index.js";
 import { withTransaction } from "../../../platform/postgres/pool.js";
+import { crossBank } from "../../../platform/postgres/bank-isolation.js";
 import type { ErasableStore, ErasureRecount, StorePurge } from "../../ports/repositories.js";
 
 export const STORE_GRANTS = "governance.grants";
@@ -47,14 +48,14 @@ export class PgAccessRevocation implements ErasableStore {
     const recorded = after?.deletions.find((d) => d.store === STORE_API_KEYS)?.evidence?.[EVIDENCE_REVOKED_PRINCIPALS];
     const { rows } = after !== undefined && recorded !== undefined
       ? await this.pool.query<{ grants: string; keys: string }>(
-          `SELECT (SELECT count(*) FROM governance.grants WHERE bank_id = $1)::text AS grants,
+          `${crossBank("access.keys-count-recorded")}SELECT (SELECT count(*) FROM governance.grants WHERE bank_id = $1)::text AS grants,
                   ((SELECT count(*) FROM governance.api_keys k WHERE k.revoked_at IS NULL AND k.erasure_request_id = $2)
                    + (SELECT count(*) FROM unnest($3::text[]) AS recorded(principal_id)
                       WHERE NOT EXISTS (SELECT 1 FROM governance.api_keys k WHERE k.principal_id = recorded.principal_id AND k.erasure_request_id = $2)))::text AS keys`,
           [bankId, after.requestId, [...recorded]],
         )
       : await this.pool.query<{ grants: string; keys: string }>(
-          `SELECT (SELECT count(*) FROM governance.grants WHERE bank_id = $1)::text AS grants,
+          `${crossBank("access.keys-count-dedicated")}SELECT (SELECT count(*) FROM governance.grants WHERE bank_id = $1)::text AS grants,
                   (SELECT count(*) FROM governance.api_keys k WHERE k.revoked_at IS NULL AND ${DEDICATED_TO_BANK})::text AS keys`,
           [bankId],
         );
@@ -65,14 +66,14 @@ export class PgAccessRevocation implements ErasableStore {
     return withTransaction(this.pool, async (client) => {
       // Keys first: the predicate reads the grants that the next statement deletes.
       const keys = await client.query<{ principal_id: string }>(
-        `UPDATE governance.api_keys k SET revoked_at = now(), revocation_reason = 'erasure', erasure_request_id = $2
+        `${crossBank("access.revoke-dedicated-keys")}UPDATE governance.api_keys k SET revoked_at = now(), revocation_reason = 'erasure', erasure_request_id = $2
          WHERE k.revoked_at IS NULL AND ${DEDICATED_TO_BANK}
          RETURNING k.principal_id`,
         [bankId, request.id],
       );
       const grants = await client.query("DELETE FROM governance.grants WHERE bank_id = $1", [bankId]);
       // A resumed pass re-purges after a dead pass revoked but never saved: the evidence still names every principal this request revoked.
-      const earlier = await client.query<{ principal_id: string }>("SELECT DISTINCT principal_id FROM governance.api_keys WHERE erasure_request_id = $1", [request.id]);
+      const earlier = await client.query<{ principal_id: string }>(`${crossBank("access.principals-revoked-by-request")}SELECT DISTINCT principal_id FROM governance.api_keys WHERE erasure_request_id = $1`, [request.id]);
       const principals = [...new Set([...keys.rows, ...earlier.rows].map((r) => r.principal_id))].sort();
       return { [STORE_GRANTS]: grants.rowCount ?? 0, [STORE_API_KEYS]: { deleted: keys.rowCount ?? 0, evidence: { [EVIDENCE_REVOKED_PRINCIPALS]: principals } } };
     });

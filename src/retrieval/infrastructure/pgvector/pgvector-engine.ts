@@ -1,6 +1,7 @@
 import type { BankId, EpisodeId, FactId, Scope } from "../../../shared-kernel/index.js";
 import type { Episode, Fact } from "../../../memory/index.js";
 import type { Queryable } from "../../../platform/postgres/pool.js";
+import { crossBank } from "../../../platform/postgres/bank-isolation.js";
 import type { Embedder } from "../../ports/embedder.js";
 import type { RankedHit, RecallOptions, RetrievalEngine } from "../../ports/retrieval-engine.js";
 
@@ -148,7 +149,7 @@ export class PgvectorEngine implements RetrievalEngine {
 
   /** Other embedder ids present anywhere in the index, with row counts: a non-empty result means banks need `reindex` (or another writer is live). */
   async foreignEmbedders(): Promise<readonly { readonly embedder: string; readonly rows: number }[]> {
-    const { rows } = await this.db.query<{ embedder: string; n: string }>("SELECT embedder, count(*)::text AS n FROM retrieval.pgvector_index WHERE embedder <> $1 GROUP BY embedder", [this.embedder.id]);
+    const { rows } = await this.db.query<{ embedder: string; n: string }>(`${crossBank("pgvector.foreign-embedders")}SELECT embedder, count(*)::text AS n FROM retrieval.pgvector_index WHERE embedder <> $1 GROUP BY embedder`, [this.embedder.id]);
     return rows.map((r) => ({ embedder: r.embedder, rows: Number(r.n) }));
   }
 
