@@ -90,14 +90,44 @@ export function appendEntry(
   return Object.freeze({ ...unhashed, hash: hash(hashBody(unhashed)) });
 }
 
+/** Where a chain verification stands between two pages: the seq the next entry must have and the hash it must link to. */
+export interface ChainCursor {
+  readonly nextSeq: number;
+  readonly prevHash: string;
+}
+
+export const CHAIN_START: ChainCursor = Object.freeze({ nextSeq: 0, prevHash: GENESIS_HASH });
+
+/**
+ * A break in the chain. `brokenAt` is the first entry that fails; `suspectFrom` is the earliest seq the failure can come from:
+ * `brokenAt` itself when it links but its own hash fails (its content was changed), the last verified entry when `brokenAt` does
+ * not link to it (that entry may have been rewritten and re-hashed, which leaves its own hash valid; or `brokenAt`'s `prevHash`
+ * was changed) or when seqs are missing between them. The chain
+ * is unkeyed, so a run of entries rewritten and re-hashed together shows only where the run ends: everything up to the break is
+ * consistent, not proven untouched.
+ */
+export interface ChainBreak {
+  readonly brokenAt: number;
+  readonly suspectFrom: number;
+}
+
+/**
+ * Verify the next run of entries of a chain, continuing from `from`, so a long chain can be checked page by page
+ * with only the cursor carried between pages. Returns the cursor after the last entry, or the break.
+ */
+export function verifyChainPage(entries: readonly AuditEntry[], hash: Hasher, from: ChainCursor): { readonly cursor: ChainCursor } | ChainBreak {
+  let { nextSeq, prevHash } = from;
+  for (const e of entries) {
+    if (e.seq !== nextSeq || e.prevHash !== prevHash) return { brokenAt: e.seq, suspectFrom: nextSeq - 1 };
+    if (hash(hashBody(e)) !== e.hash) return { brokenAt: e.seq, suspectFrom: e.seq };
+    prevHash = e.hash;
+    nextSeq++;
+  }
+  return { cursor: { nextSeq, prevHash } };
+}
+
 /** Verify a chain of entries; returns the first broken seq or undefined if intact. */
 export function verifyChain(entries: readonly AuditEntry[], hash: Hasher): number | undefined {
-  let prevHash = GENESIS_HASH;
-  let expectedSeq = 0;
-  for (const e of entries) {
-    if (e.seq !== expectedSeq || e.prevHash !== prevHash || hash(hashBody(e)) !== e.hash) return e.seq;
-    prevHash = e.hash;
-    expectedSeq++;
-  }
-  return undefined;
+  const r = verifyChainPage(entries, hash, CHAIN_START);
+  return "brokenAt" in r ? r.brokenAt : undefined;
 }

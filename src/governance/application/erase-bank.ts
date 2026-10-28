@@ -1,7 +1,7 @@
 import type { BankId, Clock, Result, Scope } from "../../shared-kernel/index.js";
 import { err, ok } from "../../shared-kernel/index.js";
 import type { AccessDenied, AccessPolicy } from "../domain/access-policy.js";
-import { fail, requestErasure, type ErasureRequest } from "../domain/erasure-request.js";
+import { requestErasure, type ErasureRequest } from "../domain/erasure-request.js";
 import { ErasureInFlightError, type ErasableStore, type ErasureBankGateway, type ErasureRequestRepository, type ErasureUnitOfWork } from "../ports/repositories.js";
 
 export type EraseBankError =
@@ -88,7 +88,9 @@ export type AbandonErasureError =
   | AccessDenied
   | { readonly kind: "ErasureNotFound"; readonly requestId: string }
   | { readonly kind: "ErasureTerminal"; readonly state: ErasureRequest["state"] }
-  | { readonly kind: "ErasureStillRunning"; readonly updatedAt: Date; readonly staleAfterMs: number };
+  | { readonly kind: "ErasureStillRunning"; readonly updatedAt: Date; readonly staleAfterMs: number }
+  /** `force` was given, but the row moved on (a step landed) every time the abandon tried to apply: a pass is clearly running it. */
+  | { readonly kind: "ErasureKeepsMoving"; readonly state: ErasureRequest["state"] };
 
 /**
  * Operator recovery: a request stuck in a non-terminal state that the worker will not finish (no server runs
@@ -96,8 +98,11 @@ export type AbandonErasureError =
  * bank and keeps the bank frozen. Abandoning it marks it `failed` with an `erasure.failed` audit entry; a new
  * request can then redo the job. Nothing is un-deleted, nothing is deleted. A request whose row changed
  * (any step landed, or a pass claimed it) less than `staleAfterMs` ago is presumed still running and refused
- * unless `force` is given; if a running pass does lose the race, its next save fails (terminal rows are never
- * overwritten) and it stops. A crash alone no longer needs this: the worker retakes a stale claim by itself.
+ * unless `force` is given, and the check is repeated in the update itself (`ErasureRequestRepository.abandon`, a
+ * compare-and-set on the state read and, without `force`, on the row still being stale), so a step landing between the
+ * read and the write is never lost: the update writes only the state and the failure, never the request read here.
+ * If a running pass does lose the race, its next save fails (terminal rows are never overwritten) and it stops.
+ * A crash alone no longer needs this: the worker retakes a stale claim by itself.
  */
 export class AbandonErasureHandler {
   constructor(
@@ -111,16 +116,24 @@ export class AbandonErasureHandler {
   async handle(scope: Scope, bankId: BankId, requestId: string, reason: string, opts: { readonly force?: boolean } = {}): Promise<Result<ErasureRequest, AbandonErasureError>> {
     const allowed = this.access.canErase(scope, bankId);
     if (!allowed.ok) return allowed;
-    const request = await this.requests.get(requestId, { bankId, tenantId: scope.tenantId });
-    if (!request) return err({ kind: "ErasureNotFound", requestId } as const);
-    if (TERMINAL.has(request.state)) return err({ kind: "ErasureTerminal", state: request.state } as const);
-    const updatedAt = request.updatedAt ?? request.requestedAt;
-    if (!opts.force && this.clock.now().getTime() - updatedAt.getTime() < this.staleAfterMs) return err({ kind: "ErasureStillRunning", updatedAt, staleAfterMs: this.staleAfterMs } as const);
-    const failed = fail(request, `abandoned while ${request.state}: ${reason}`.slice(0, 500));
-    await this.uow.run(async (tx) => {
-      await tx.requests.save(failed);
-      await tx.audit.append({ tenantId: scope.tenantId, bankId, principalId: scope.principalId, action: "erasure.failed", details: { requestId, kind: "Abandoned", from: request.state }, at: this.clock.now() });
-    });
-    return ok(failed);
+    // The row is read for the checks and the message, but never written back: the repository's compare-and-set touches only state and
+    // failure, so a deletion the worker saves after this read stays recorded. A miss (the row moved on) re-reads and re-checks.
+    for (let attempt = 1; ; attempt++) {
+      const request = await this.requests.get(requestId, { bankId, tenantId: scope.tenantId });
+      if (!request) return err({ kind: "ErasureNotFound", requestId } as const);
+      if (TERMINAL.has(request.state)) return err({ kind: "ErasureTerminal", state: request.state } as const);
+      const updatedAt = request.updatedAt ?? request.requestedAt;
+      const stillRunning = { kind: "ErasureStillRunning", updatedAt, staleAfterMs: this.staleAfterMs } as const;
+      if (!opts.force && this.clock.now().getTime() - updatedAt.getTime() < this.staleAfterMs) return err(stillRunning);
+      const failure = `abandoned while ${request.state}: ${reason}`.slice(0, 500);
+      const abandoned = await this.uow.run(async (tx) => {
+        const stored = await tx.requests.abandon(request, failure, { state: request.state, ...(opts.force ? {} : { unchangedForMs: this.staleAfterMs }) });
+        if (stored) await tx.audit.append({ tenantId: scope.tenantId, bankId, principalId: scope.principalId, action: "erasure.failed", details: { requestId, kind: "Abandoned", from: request.state }, at: this.clock.now() });
+        return stored;
+      });
+      if (abandoned) return ok(abandoned);
+      // A pass that keeps landing steps: give up after a few rounds rather than chase it.
+      if (attempt >= 3) return err(opts.force ? ({ kind: "ErasureKeepsMoving", state: request.state } as const) : stillRunning);
+    }
   }
 }

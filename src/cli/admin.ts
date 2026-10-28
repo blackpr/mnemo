@@ -31,7 +31,7 @@ import { assertPinnableDimensions, embedderFromEnv, embeddingDimensionsFromEnv, 
  *   npm run admin -- export --bank bank-vangelis --out exports/bank-vangelis.jsonl [--format jsonl|markdown]
  *   npm run admin -- import-claude-code --bank bank-vangelis --dir ~/.claude/projects/<project>/memory
  *   npm run admin -- render-import --bank bank-vangelis --target claude|gemini [--out <path>]
- *   npm run admin -- erase-bank --bank bank-vangelis --principal vangelis --yes [--no-wait]   # principal needs the erase capability; the server's worker runs it
+ *   npm run admin -- erase-bank --bank bank-vangelis --principal vangelis --yes [--no-wait | --timeout <seconds>]   # principal needs the erase capability; the server's worker runs it
  *   npm run admin -- erasure-status --id <request id>
  *   npm run admin -- verify-receipt --id <request id>     # recompute the digest and re-query every store; exit 1 on any failure
  *   npm run admin -- erasure-abandon --id <request id> --reason "no server will run it" [--force]   # give up on a stuck request (a dead pass is retaken by the server on its own)
@@ -44,7 +44,8 @@ import { assertPinnableDimensions, embedderFromEnv, embeddingDimensionsFromEnv, 
  * the CLI refuses early, and the workflow refuses again before and under the freeze. It is irreversible (hence --yes). The
  * command only enqueues the request (audit entry first); the erasure worker in the running server (`npm start`) claims
  * it and runs the workflow, and the command polls the record until it is receipted or failed and prints it (the
- * receipt digest at the end). With --no-wait it prints the request id and returns; `erasure-status --id` shows where it
+ * receipt digest at the end). With --timeout it stops waiting after that many seconds, prints where the request stands and
+ * exits 2 (the request stays queued or running). With --no-wait it prints the request id and returns; `erasure-status --id` shows where it
  * stands. Without a running server the request stays queued until one starts. Erasure also removes every grant on the bank and revokes the API keys of principals that
  * held grants on no other bank (the requesting principal included, if it was dedicated to the bank);
  * that store runs last, so a data-store failure leaves the requester able to retry. If the request
@@ -56,8 +57,9 @@ import { assertPinnableDimensions, embedderFromEnv, embeddingDimensionsFromEnv, 
  * deletes nothing, and refuses a request whose row changed within the stale window (presumed still running) unless --force is given. `verify-receipt` is the after-the-fact check of a
  * receipt: digest recomputed over the stored receipt, receipt checked against its row and against the tenant's
  * audit chain (the tamper evidence; the digest alone is an unkeyed hash beside its payload), every store (the
- * same list erase-bank purges) asked again what it holds for the bank, the keys store counting the live keys this request
- * marked as revoked plus any receipted principal whose keys no longer carry the mark, the whole tenant chain verified end to end, the bank row checked to be the
+ * same list erase-bank purges) asked again what it holds for the bank, the keys store counting the live keys any erasure of the bank
+ * marked as revoked plus any receipted principal whose keys no longer carry the mark, the whole tenant chain verified end to end
+ * (in pages; a break is placed before, at or after this receipt's own entry), the bank row checked to be the
  * `erased` tombstone, pass or fail per line and overall; it reads counts, statuses and digests, never content.
  *
  * The API key is printed once and never stored in plaintext. Every command refuses to silently
@@ -97,6 +99,7 @@ const { values } = parseArgs({
     yes: { type: "boolean", default: false },
     force: { type: "boolean", default: false },
     "no-wait": { type: "boolean", default: false },
+    timeout: { type: "string" },
   },
 });
 
@@ -331,6 +334,10 @@ try {
       const shellEngine = engineNameFromEnv();
       if (bank.engine !== shellEngine) die(`bank ${bankId} records its index in engine "${bank.engine}" but ENGINE is "${shellEngine}"; set ENGINE=${bank.engine} (with that engine's URL and key) so the erasure purges the store that actually holds the bank`);
       const retrieval = engineFromEnv(pool, noEmbedder);
+      const timeout = values.timeout;
+      if (timeout !== undefined && values["no-wait"]) die("--timeout and --no-wait exclude each other: --timeout bounds the wait that --no-wait skips");
+      if (timeout !== undefined && !/^[1-9]\d*$/.test(timeout)) die(`--timeout must be a positive number of seconds, got "${timeout}"`);
+      const timeoutMs = timeout === undefined ? undefined : Number(timeout) * 1000;
       if (!values.yes) die(`erase-bank deletes every fact, episode, retrieval row (engine: ${retrieval.name}), extraction run and export record of ${bankId} (subject ${bank.subjectId}), removes every grant on it and revokes the keys of principals granted on it alone; it cannot be undone; re-run with --yes`);
       const memoryErasure = new PgMemoryErasure(pool);
       const requests = new PgErasureRequestRepository(pool);
@@ -347,6 +354,7 @@ try {
       const started = Date.now();
       let lastState = request.state;
       let lastHint = started;
+      let timedOut = false;
       for (;;) {
         await new Promise((resolve) => setTimeout(resolve, 500));
         request = (await requests.get(request.id)) ?? die(`erasure request ${request.id} disappeared`);
@@ -355,6 +363,11 @@ try {
           lastState = request.state;
         }
         if (request.state === "receipted" || request.state === "failed") break;
+        if (timeoutMs !== undefined && Date.now() - started >= timeoutMs) {
+          console.error(`  stopped waiting after ${timeout} s (--timeout); the request is still ${request.state} and the server's worker carries on with it; check with \`admin erasure-status --id ${request.id}\``);
+          timedOut = true;
+          break;
+        }
         // Every landed step (a store's deletion, a claim) moves updated_at; warn only when nothing has moved for a while.
         const quietFor = Date.now() - Math.max(lastHint, request.updatedAt?.getTime() ?? started);
         if (quietFor > 30_000) {
@@ -363,7 +376,7 @@ try {
         }
       }
       printErasure(request);
-      if (request.state !== "receipted") process.exitCode = 1;
+      if (request.state !== "receipted") process.exitCode = timedOut ? 2 : 1;
       break;
     }
     case "erasure-status": {
@@ -396,7 +409,15 @@ try {
       console.log(`  ${v.digestValid ? "PASS" : "FAIL"}  digest recomputed over the stored receipt ${v.digestValid ? "matches" : "does not match"}`);
       console.log(`  ${v.bound ? "PASS" : "FAIL"}  receipt names this request, bank, tenant and subject`);
       console.log(`  ${v.chained ? "PASS" : "FAIL"}  digest ${v.chained ? "is" : "is not"} in the tenant's audit chain (erasure.receipt_issued)`);
-      console.log(`  ${v.chainIntact ? "PASS" : "FAIL"}  the tenant's audit chain ${v.chainIntact ? "verifies end to end" : `breaks at seq ${v.chainBrokenAt}`}`);
+      const breakAt =
+        v.chainBreak === "before_receipt"
+          ? ", before this receipt's entry (nothing after the first break is checked, the receipt's entry included)"
+          : v.chainBreak === "at_receipt"
+            ? ", at this receipt's entry or its links"
+            : v.chainBreak === "after_receipt"
+              ? ", first inconsistency after this receipt's entry (an unkeyed chain cannot prove the entries before a break were not rewritten together)"
+              : "";
+      console.log(`  ${v.chainIntact ? "PASS" : "FAIL"}  the tenant's audit chain ${v.chainIntact ? "verifies end to end" : `breaks at seq ${v.chainBrokenAt}${breakAt}`}`);
       console.log(`  ${v.bankErased ? "PASS" : "FAIL"}  bank ${v.bankId.padEnd(17)} ${v.bankStatus === "erased" ? "is the erased tombstone" : v.bankStatus === "missing" ? "row is missing" : `is ${v.bankStatus}, not erased`}`);
       for (const s of v.stores) {
         const note = s.note === "not_in_receipt" ? "  (not in the receipt: store wired after it was issued)" : s.note === "not_requeried" ? "  (no wired store answered for it)" : "";
@@ -416,6 +437,7 @@ try {
       if (!r.ok) {
         if (r.error.kind === "ErasureTerminal") die(`request is already ${r.error.state}; nothing to abandon`);
         if (r.error.kind === "ErasureStillRunning") die(`request changed at ${r.error.updatedAt.toISOString()}, less than ${r.error.staleAfterMs / 60_000} min ago: a worker pass may still be running it (and a dead pass is retaken by the server on its own). Re-run with --force only if you are sure no server will finish it`);
+        if (r.error.kind === "ErasureKeepsMoving") die(`request keeps moving (last seen ${r.error.state}): a worker pass is landing steps on it as you abandon, so it is running; let it finish or fail`);
         die(`abandon refused: ${r.error.kind}`);
       } else printErasure(r.value);
       const status = (await banks.get(request.bankId))?.status ?? "missing";

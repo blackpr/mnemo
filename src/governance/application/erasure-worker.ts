@@ -61,6 +61,8 @@ export class ErasureWorker {
   private readonly staleAfterMs: number;
   private readonly maxAttempts: number;
   private stopping = false;
+  /** The claim of the pass in progress, so a shutdown that runs out of time can hand it back mid-step (`releaseInFlight`). */
+  private inFlight: ErasureClaim | undefined;
 
   constructor(
     private readonly requests: ErasureRequestRepository,
@@ -91,11 +93,42 @@ export class ErasureWorker {
     this.stopping = true;
   }
 
+  /**
+   * Shutdown past its deadline: the pass is still inside a store call (a purge longer than the shutdown timeout), so it never
+   * reaches the step boundary where `stop()` hands the row back. Release its claim now (token and `claimed_at` cleared) so the
+   * next boot retakes the row at once instead of after `staleAfterMs`; the process is about to exit. The attempt is kept: a store
+   * that hangs on every pass, restart after restart, still reaches `maxAttempts` and ends failed instead of blocking the queue.
+   * The stuck call may still be running in this process (or its database statement on the server) when another instance retakes
+   * the row; the two then purge the same store at once. The deletions are idempotent, but a transactional purge of the retaker
+   * waits on the old statement's row locks, and two overlapping purge transactions can deadlock (40P01), which fails the request
+   * (a new request finishes the job).
+   * If the pass does get further, its next save carries a token the row no longer has and it stops as `lost`. The next pass
+   * may purge the interrupted store again (purges are idempotent; a deletion the dead pass did not save is recorded as 0, its
+   * `countBefore` in the inventory still says what the store held). A SIGKILL skips this and leaves the stale sweep to it.
+   * Returns whether this pass's claim was handed back by this call; never throws (connections may already be going).
+   */
+  async releaseInFlight(): Promise<boolean> {
+    const claim = this.inFlight;
+    if (!claim) return false;
+    this.stopping = true;
+    try {
+      return await this.requests.release(claim, { refund: false });
+    } catch (e) {
+      console.error(`erasure ${claim.request.id}: release at shutdown failed (${e instanceof Error ? e.name : typeof e}); the claim will go stale instead`);
+      return false;
+    }
+  }
+
   async processNext(): Promise<ErasureWorkOutcome> {
     if (this.stopping) return "idle";
     const claim = await this.requests.claimNext({ staleAfterMs: this.staleAfterMs });
     if (!claim) return "idle";
-    return this.process(claim);
+    this.inFlight = claim;
+    try {
+      return await this.process(claim);
+    } finally {
+      this.inFlight = undefined;
+    }
   }
 
   private async process(claim: ErasureClaim): Promise<ErasureWorkOutcome> {

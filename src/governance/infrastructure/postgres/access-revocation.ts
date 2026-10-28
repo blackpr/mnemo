@@ -23,12 +23,14 @@ export const EVIDENCE_REVOKED_PRINCIPALS = "revokedPrincipals";
  *   records them on the request's deletion and on the `erasure.access_revoked` entry (ids only).
  *
  * The grants re-count is "what still targets the bank" (the rows are gone). The keys re-count, on a request that
- * recorded evidence, is independent of the grants and anchored to the recorded ids: the live keys that carry this
- * request's `erasure_request_id` (exactly the keys the purge revoked; the marker is written by the same UPDATE, so
- * no clock is compared, and a key revoked by a pass that died before saving is still found), plus one hit for every
- * recorded principal that has no key marked by this request at all (a marker stripped by hand looks like a key that was
- * never revoked). Zero means the keys this request revoked are still revoked and still say so, whatever the grants
- * say; the stateless count would read zero as soon as no grant was left, whether or not the UPDATE ran.
+ * recorded evidence, is independent of the grants and anchored to the markers: the live keys that carry the
+ * `erasure_request_id` of any erasure request of this bank (the marker is written by the same UPDATE that revokes, so
+ * no clock is compared, and a key revoked by a pass that died before saving is still found; every attempt of the bank
+ * counts, because a retry after a failed request only revokes what is still live and would otherwise never look at a key
+ * the failed attempt revoked and someone made live again), plus one hit for every principal this request recorded that has
+ * no key marked by this request at all (a marker stripped by hand looks like a key that was never revoked). Zero means
+ * every key an erasure of this bank revoked is still revoked and still says so, whatever the grants say; the stateless
+ * count would read zero as soon as no grant was left, whether or not the UPDATE ran.
  * A key issued to one of those principals later is not what the receipt is about and is not counted. A request from
  * before evidence was recorded falls back to the stateless count. Keys are never deleted: `revoked_at` keeps the issue
  * history, and a revoked key is indistinguishable from an unknown one at the attachment.
@@ -49,7 +51,8 @@ export class PgAccessRevocation implements ErasableStore {
     const { rows } = after !== undefined && recorded !== undefined
       ? await this.pool.query<{ grants: string; keys: string }>(
           `${crossBank("access.keys-count-recorded")}SELECT (SELECT count(*) FROM governance.grants WHERE bank_id = $1)::text AS grants,
-                  ((SELECT count(*) FROM governance.api_keys k WHERE k.revoked_at IS NULL AND k.erasure_request_id = $2)
+                  ((SELECT count(*) FROM governance.api_keys k JOIN governance.erasure_requests e ON e.id = k.erasure_request_id AND e.bank_id = $1
+                    WHERE k.revoked_at IS NULL)
                    + (SELECT count(*) FROM unnest($3::text[]) AS recorded(principal_id)
                       WHERE NOT EXISTS (SELECT 1 FROM governance.api_keys k WHERE k.principal_id = recorded.principal_id AND k.erasure_request_id = $2)))::text AS keys`,
           [bankId, after.requestId, [...recorded]],
@@ -64,10 +67,14 @@ export class PgAccessRevocation implements ErasableStore {
 
   purge(bankId: BankId, request: { readonly id: string }): Promise<Readonly<Record<string, StorePurge>>> {
     return withTransaction(this.pool, async (client) => {
-      // Keys first: the predicate reads the grants that the next statement deletes.
+      // Keys first: the predicate reads the grants that the next statement deletes. Also any live key an earlier erasure of this bank
+      // revoked (a retry after a failed request, the key made live again since): the re-count counts those, so the purge revokes them
+      // again and marks them with this request, or the retry could never pass verification.
       const keys = await client.query<{ principal_id: string }>(
         `${crossBank("access.revoke-dedicated-keys")}UPDATE governance.api_keys k SET revoked_at = now(), revocation_reason = 'erasure', erasure_request_id = $2
-         WHERE k.revoked_at IS NULL AND ${DEDICATED_TO_BANK}
+         WHERE k.revoked_at IS NULL
+           AND ((${DEDICATED_TO_BANK})
+                OR k.erasure_request_id IN (SELECT e.id FROM governance.erasure_requests e WHERE e.bank_id = $1))
          RETURNING k.principal_id`,
         [bankId, request.id],
       );

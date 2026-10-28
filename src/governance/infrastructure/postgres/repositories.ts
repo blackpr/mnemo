@@ -164,7 +164,7 @@ export class PgAuditLog implements AuditLogStore {
     return withTransaction(this.pool, (client) => appendOnClient(client, input));
   }
 
-  list(tenantId: TenantId, opts: { readonly limit?: number } = {}): Promise<readonly AuditEntry[]> {
+  list(tenantId: TenantId, opts: { readonly limit?: number; readonly afterSeq?: number } = {}): Promise<readonly AuditEntry[]> {
     return listEntries(this.pool, tenantId, opts);
   }
 
@@ -178,7 +178,8 @@ async function findEntry(db: Queryable, tenantId: TenantId, match: { readonly ac
   return rows[0] ? toAuditEntry(rows[0]) : undefined;
 }
 
-async function listEntries(db: Queryable, tenantId: TenantId, opts: { readonly limit?: number } = {}): Promise<readonly AuditEntry[]> {
-  const { rows } = await db.query<AuditRow>("SELECT * FROM governance.audit_log WHERE tenant_id = $1 ORDER BY seq ASC LIMIT $2", [tenantId, opts.limit ?? 10_000]);
+/** Keyset pagination on the primary key `(tenant_id, seq)`: each page is an index range scan, however deep into the log. */
+async function listEntries(db: Queryable, tenantId: TenantId, opts: { readonly limit?: number; readonly afterSeq?: number } = {}): Promise<readonly AuditEntry[]> {
+  const { rows } = await db.query<AuditRow>("SELECT * FROM governance.audit_log WHERE tenant_id = $1 AND seq > $3 ORDER BY seq ASC LIMIT $2", [tenantId, opts.limit ?? 10_000, opts.afterSeq ?? -1]);
   return rows.map(toAuditEntry);
 }

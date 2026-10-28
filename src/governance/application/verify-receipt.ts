@@ -1,6 +1,6 @@
-import type { Result } from "../../shared-kernel/index.js";
+import type { Result, TenantId } from "../../shared-kernel/index.js";
 import { err, ok } from "../../shared-kernel/index.js";
-import { verifyChain, type Hasher } from "../domain/audit-log.js";
+import { CHAIN_START, verifyChainPage, type ChainBreak, type Hasher } from "../domain/audit-log.js";
 import { verifyReceipt, type ErasureRequest, type ErasureState } from "../domain/erasure-request.js";
 import type { AuditLogStore, ErasableStore, ErasureBankGateway, ErasureRequestRepository } from "../ports/repositories.js";
 
@@ -31,9 +31,18 @@ export interface ReceiptVerification {
   readonly bound: boolean;
   /** The tenant's hash-chained audit log carries an `erasure.receipt_issued` entry for this request with this digest: the tamper evidence. */
   readonly chained: boolean;
-  /** The tenant's whole audit chain verifies (`verifyChain`): an entry that was altered, removed or inserted breaks it from `chainBrokenAt` on. */
+  /** The tenant's whole audit chain verifies (page by page, `verifyChainPage`): an entry that was altered, removed or inserted breaks it from `chainBrokenAt` on. */
   readonly chainIntact: boolean;
   readonly chainBrokenAt?: number;
+  /**
+   * Where the first inconsistency sits against this receipt's own `erasure.receipt_issued` entry R (absent when the chain is intact
+   * or the entry is not found), from the break's `brokenAt` and `suspectFrom` (see `ChainBreak`): `before_receipt`, the failure
+   * lies wholly before R; `at_receipt`, it may involve R (R's own hash fails, R does not link to the entry before it, or the entry
+   * after R does not link to R, which a rewritten and re-hashed R would cause); `after_receipt`, the first inconsistency is wholly
+   * after R. Never proof that R is untouched: the chain is unkeyed, so R and everything after it up to the break could have been
+   * rewritten and re-hashed together. Whatever the position, a break fails the check.
+   */
+  readonly chainBreak?: "before_receipt" | "at_receipt" | "after_receipt";
   /** The bank row's status now: `erased` is the tombstone the receipt promises; `missing` means the row is gone (only hand-written SQL removes it). */
   readonly bankStatus: string;
   readonly bankErased: boolean;
@@ -48,11 +57,17 @@ export type VerifyReceiptError =
   /** The row says `receipted` but holds no receipt: a corrupted record, not a benign state. */
   | { readonly kind: "ReceiptMissing"; readonly requestId: string };
 
+export interface VerifyReceiptOptions {
+  /** Audit entries read per page while verifying the tenant's chain (default 1,000): memory stays at one page however long the log grows. */
+  readonly chainPageSize?: number;
+}
+
 /**
  * Operator check of an erasure receipt, after the fact. The stored request is loaded, the receipt's
  * digest is recomputed (`verifyReceipt`), the receipt is checked against the row it sits on and against
- * the tenant's audit chain (`erasure.receipt_issued` carries the digest, and the whole chain must verify:
- * `verifyChain` over every entry of the tenant), the bank row must be the `erased` tombstone, and every wired
+ * the tenant's audit chain (`erasure.receipt_issued` carries the digest, and the whole chain must verify: every entry
+ * of the tenant, read in keyset pages with the previous hash carried across, and a break placed before, at or after the
+ * receipt's own entry), the bank row must be the `erased` tombstone, and every wired
  * store is asked again what it holds for the bank, given the receipt's deletions so a store re-counts what its
  * purge named (the keys of the revoked principals). It passes only when all of that holds, every store the
  * receipt lists still reports zero, and every store wired today reports zero too (a store the receipt predates
@@ -68,7 +83,13 @@ export class VerifyReceiptHandler {
     private readonly bank: ErasureBankGateway,
     private readonly stores: readonly ErasableStore[],
     private readonly hash: Hasher,
-  ) {}
+    opts: VerifyReceiptOptions = {},
+  ) {
+    this.chainPageSize = opts.chainPageSize ?? 1_000;
+    if (!Number.isInteger(this.chainPageSize) || this.chainPageSize < 1) throw new Error(`chainPageSize must be a positive integer, got ${this.chainPageSize}`);
+  }
+
+  private readonly chainPageSize: number;
 
   async handle(requestId: string): Promise<Result<ReceiptVerification, VerifyReceiptError>> {
     const request = await this.requests.get(requestId);
@@ -101,8 +122,9 @@ export class VerifyReceiptHandler {
     const bound = receipt.requestId === request.id && receipt.bankId === request.bankId && receipt.tenantId === request.tenantId && receipt.subjectId === request.subjectId;
     const issued = await this.audit.find(request.tenantId, { action: "erasure.receipt_issued", requestId: request.id });
     const chained = issued?.details["digest"] === receipt.digest;
-    // The whole tenant chain, in memory: operator tooling, run rarely. A streaming verifier is a follow-up for very large logs.
-    const chainBrokenAt = verifyChain(await this.audit.list(request.tenantId, { limit: Number.MAX_SAFE_INTEGER }), this.hash);
+    const broken = await this.verifyTenantChain(request.tenantId);
+    const chainBrokenAt = broken?.brokenAt;
+    const chainBreak = broken === undefined || issued === undefined ? undefined : broken.brokenAt < issued.seq ? "before_receipt" : broken.suspectFrom > issued.seq ? "after_receipt" : "at_receipt";
     const bankStatus = (await this.bank.describe(request.bankId))?.status ?? "missing";
     const bankErased = bankStatus === "erased";
     return ok({
@@ -117,10 +139,26 @@ export class VerifyReceiptHandler {
       chained,
       chainIntact: chainBrokenAt === undefined,
       ...(chainBrokenAt !== undefined ? { chainBrokenAt } : {}),
+      ...(chainBreak !== undefined ? { chainBreak } : {}),
       bankStatus,
       bankErased,
       stores,
       ok: digestValid && bound && chained && chainBrokenAt === undefined && bankErased && stores.every((s) => s.ok),
     });
+  }
+
+  /**
+   * The tenant's whole chain from genesis, one keyset page at a time (`seq` after the last verified entry): only the cursor (next
+   * seq, previous hash) is carried between pages. A page shorter than the page size is the end of the log. Returns the first break.
+   */
+  private async verifyTenantChain(tenantId: TenantId): Promise<ChainBreak | undefined> {
+    let cursor = CHAIN_START;
+    for (;;) {
+      const page = await this.audit.list(tenantId, { limit: this.chainPageSize, afterSeq: cursor.nextSeq - 1 });
+      const r = verifyChainPage(page, this.hash, cursor);
+      if ("brokenAt" in r) return r;
+      cursor = r.cursor;
+      if (page.length < this.chainPageSize) return undefined;
+    }
   }
 }

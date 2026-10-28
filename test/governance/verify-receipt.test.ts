@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { asEpisodeId, asPrincipalId, asSubjectId, systemClock, type BankId, type Scope } from "../../src/shared-kernel/index.js";
-import { PgAuditLog, PgErasureRequestRepository, receiptPayload, VerifyReceiptHandler, scopeAccessPolicy, type AuditLogStore, type ErasableStore, type ReceiptVerification } from "../../src/governance/index.js";
+import { hashBody, PgAuditLog, PgErasureRequestRepository, receiptPayload, VerifyReceiptHandler, scopeAccessPolicy, type AuditEntry, type AuditLogStore, type ErasableStore, type ReceiptVerification, type VerifyReceiptOptions } from "../../src/governance/index.js";
 import { sha256 } from "../../src/platform/hash.js";
 import { generateApiKey, PgApiKeyStore, PgPrincipalRepository } from "../../src/governance/index.js";
 import { PgBankRepository, PgUnitOfWork, RecordEpisodeHandler } from "../../src/memory/index.js";
@@ -17,9 +17,9 @@ describeWithDb("VerifyReceipt", () => {
   let requests: PgErasureRequestRepository;
   const bankA = bankFixture("bank-a");
   const eraser = (bankId: BankId): Scope => ({ tenantId: tenant, bankId, principalId: alice, capabilities: new Set(["erase"]) });
-  const verifier = (stores: readonly ErasableStore[] = deps.stores, audit: AuditLogStore = new PgAuditLog(db.pool)) => new VerifyReceiptHandler(requests, audit, deps.bank, stores, sha256);
-  const verify = async (id: string, stores?: readonly ErasableStore[], audit?: AuditLogStore): Promise<ReceiptVerification> => {
-    const r = await verifier(stores, audit).handle(id);
+  const verifier = (stores: readonly ErasableStore[] = deps.stores, audit: AuditLogStore = new PgAuditLog(db.pool), opts?: VerifyReceiptOptions) => new VerifyReceiptHandler(requests, audit, deps.bank, stores, sha256, opts);
+  const verify = async (id: string, stores?: readonly ErasableStore[], audit?: AuditLogStore, opts?: VerifyReceiptOptions): Promise<ReceiptVerification> => {
+    const r = await verifier(stores, audit, opts).handle(id);
     if (!r.ok) throw new Error(r.error.kind);
     return r.value;
   };
@@ -129,6 +129,53 @@ describeWithDb("VerifyReceipt", () => {
     expect(await verify(receipted.id)).toMatchObject({ ok: false, bankStatus: "missing", bankErased: false });
   });
 
+  it("the chain is verified in keyset pages with the previous hash carried across; a break on a page boundary is found and placed before, at or after the receipt's entry", async () => {
+    const real = new PgAuditLog(db.pool);
+    const filler = (n: number) => real.append({ tenantId: tenant, bankId: bankA.id, principalId: alice, action: "facts.listed", details: { n }, at: new Date() });
+    for (let i = 0; i < 4; i++) await filler(i);
+    const receipted = await erase();
+    const issued = (await real.find(tenant, { action: "erasure.receipt_issued", requestId: receipted.id }))!;
+    // Page size = the receipt's seq: page 1 is [0, R-1], the receipt's entry opens page 2, page 3 starts at 2R.
+    const R = issued.seq;
+    expect(R).toBeGreaterThan(4);
+    for (let i = 0; i < R + 3; i++) await filler(100 + i);
+    const total = (await real.list(tenant)).length;
+    expect(total).toBeGreaterThan(2 * R + 1);
+
+    const limits: number[] = [];
+    const paged = (alter: (e: AuditEntry) => AuditEntry | undefined = (e) => e): AuditLogStore => ({
+      append: real.append.bind(real),
+      find: real.find.bind(real),
+      list: async (t, o) => {
+        limits.push(o?.limit ?? -1);
+        return (await real.list(t, o)).flatMap((e) => alter(e) ?? []);
+      },
+    });
+    const intact = await verify(receipted.id, undefined, paged(), { chainPageSize: R });
+    expect(intact).toMatchObject({ ok: true, chainIntact: true });
+    expect(intact.chainBreak).toBeUndefined();
+    // Never the whole log in one read: every page asked for R entries, and the pages covered it.
+    expect(new Set(limits)).toEqual(new Set([R]));
+    expect(limits.length).toBe(Math.floor(total / R) + 1);
+
+    // The last entry of page 1 rewritten and re-hashed: page 1 verifies on its own, and only the hash carried into page 2 shows the
+    // receipt's entry no longer links to it (either of the two may be the rewritten one, so it is placed at the receipt).
+    const rehashed = (e: AuditEntry, altered: AuditEntry = { ...e, details: { ...e.details, n: 999 } }) => ({ ...altered, hash: sha256(hashBody(altered)) });
+    expect(await verify(receipted.id, undefined, paged((e) => (e.seq === R - 1 ? rehashed(e) : e)), { chainPageSize: R })).toMatchObject({ ok: false, chainIntact: false, chainBrokenAt: R, chainBreak: "at_receipt", chained: true });
+    // Altered without re-hashing: the entry itself fails, last of page 1, before the receipt.
+    expect(await verify(receipted.id, undefined, paged((e) => (e.seq === R - 1 ? { ...e, details: { n: 999 } } : e)), { chainPageSize: R })).toMatchObject({ ok: false, chainBrokenAt: R - 1, chainBreak: "before_receipt" });
+    // The receipt's own entry rewritten (a forged digest) and re-hashed: it verifies on its own and the break shows one later, at the
+    // next entry's link; that link involves the receipt's entry, so it is placed at the receipt, never after it.
+    const forged = await verify(receipted.id, undefined, paged((e) => (e.seq === R ? rehashed(e, { ...e, details: { ...e.details, digest: "f".repeat(64) } }) : e)), { chainPageSize: R });
+    expect(forged).toMatchObject({ ok: false, chainBrokenAt: R + 1, chainBreak: "at_receipt" });
+    // The entry after the receipt altered without re-hashing: its own hash fails, wholly after the receipt.
+    expect(await verify(receipted.id, undefined, paged((e) => (e.seq === R + 1 ? { ...e, details: { n: 999 } } : e)), { chainPageSize: R })).toMatchObject({ ok: false, chainBrokenAt: R + 1, chainBreak: "after_receipt" });
+    // The first entry of page 3 removed: the gap is seen at the next seq, after the receipt.
+    expect(await verify(receipted.id, undefined, paged((e) => (e.seq === 2 * R ? undefined : e)), { chainPageSize: R })).toMatchObject({ ok: false, chainBrokenAt: 2 * R + 1, chainBreak: "after_receipt", digestValid: true, bound: true, bankErased: true });
+    // The default page size reads the same log in one page and agrees.
+    expect(await verify(receipted.id, undefined, paged((e) => (e.seq === R - 1 ? rehashed(e) : e)))).toMatchObject({ chainBrokenAt: R, chainBreak: "at_receipt" });
+  });
+
   it("the keys re-count is independent of the grants: a revoked principal's key made live again fails, a key issued to it later does not; a receipt without evidence falls back to the stateless count", async () => {
     const principals = new PgPrincipalRepository(db.pool);
     const keys = new PgApiKeyStore(db.pool);
@@ -167,6 +214,57 @@ describeWithDb("VerifyReceipt", () => {
     await db.pool.query("UPDATE governance.api_keys SET revoked_at = NULL WHERE key_hash = $1", [k.hash]);
     expect(await access.count(bankA.id, { requestId: receipted.id, deletions: legacy })).toEqual({ "governance.grants": 0, "governance.api_keys": 0 });
     expect(await access.count(bankA.id, { requestId: receipted.id, deletions: receipted.receipt!.deletions })).toEqual({ "governance.grants": 0, "governance.api_keys": 1 });
+  });
+
+  it("the keys re-count spans every erasure request of the bank: a key a failed earlier attempt revoked, made live again, fails the retry's receipt", async () => {
+    const principals = new PgPrincipalRepository(db.pool);
+    const keys = new PgApiKeyStore(db.pool);
+    await principals.save({ id: asPrincipalId("dedicated"), tenantId: tenant, kind: "agent", displayName: "dedicated", grants: [{ bankId: bankA.id, capabilities: new Set(["read"]), grantedAt: new Date() }] });
+    const k = generateApiKey();
+    await keys.issue(asPrincipalId("dedicated"), k.hash, "t");
+    // R1 revokes the key, then fails verification (a store that keeps reporting data): the bank stays frozen, access is already gone.
+    const sticky: ErasableStore = { count: async () => ({ "engine.sticky": 1 }), purge: async () => ({ "engine.sticky": 0 }) };
+    const r1 = await erase(bankA.id, [...deps.stores, sticky]);
+    expect(r1.state).toBe("failed");
+    expect((await db.pool.query("SELECT revoked_at IS NOT NULL AS revoked, erasure_request_id FROM governance.api_keys WHERE key_hash = $1", [k.hash])).rows[0]).toEqual({ revoked: true, erasure_request_id: r1.id });
+    // R2 finds nothing live to revoke and records no principal of its own, yet receipts.
+    const r2 = await erase();
+    expect(r2.state).toBe("receipted");
+    expect(r2.deletions.find((d) => d.store === "governance.api_keys")).toMatchObject({ deleted: 0, evidence: { revokedPrincipals: [] } });
+    expect((await verify(r2.id)).ok).toBe(true);
+
+    // R1's key made live again: only the bank-wide join sees it (R2 never marked it, and R2's evidence names nobody).
+    await db.pool.query("UPDATE governance.api_keys SET revoked_at = NULL WHERE key_hash = $1", [k.hash]);
+    const resurrected = await verify(r2.id);
+    expect(resurrected.ok).toBe(false);
+    expect(resurrected.stores.find((s) => s.store === "governance.api_keys")).toEqual({ store: "governance.api_keys", receipted: 0, now: 1, ok: false });
+    // Another bank's erasure marker does not count against this bank.
+    const bankB = bankFixture("bank-b");
+    await new PgBankRepository(db.pool).create(bankB);
+    const rB = await erase(bankB.id);
+    await db.pool.query("UPDATE governance.api_keys SET revoked_at = now() WHERE key_hash = $1", [k.hash]);
+    expect((await verify(r2.id)).ok).toBe(true);
+    await db.pool.query("UPDATE governance.api_keys SET revoked_at = NULL, erasure_request_id = $2 WHERE key_hash = $1", [k.hash, rB.id]);
+    expect((await verify(r2.id)).ok).toBe(true);
+    expect((await verify(rB.id)).stores.find((s) => s.store === "governance.api_keys")).toMatchObject({ now: 1, ok: false });
+  });
+
+  it("a key a failed attempt revoked and someone made live again before the retry is revoked again by the retry's purge, so the retry can pass", async () => {
+    const principals = new PgPrincipalRepository(db.pool);
+    const keys = new PgApiKeyStore(db.pool);
+    await principals.save({ id: asPrincipalId("dedicated"), tenantId: tenant, kind: "agent", displayName: "dedicated", grants: [{ bankId: bankA.id, capabilities: new Set(["read"]), grantedAt: new Date() }] });
+    const k = generateApiKey();
+    await keys.issue(asPrincipalId("dedicated"), k.hash, "t");
+    const sticky: ErasableStore = { count: async () => ({ "engine.sticky": 1 }), purge: async () => ({ "engine.sticky": 0 }) };
+    const r1 = await erase(bankA.id, [...deps.stores, sticky]);
+    expect(r1.state).toBe("failed");
+    // Live again before R2, with no grant on the bank any more: the dedicated-key predicate alone would not see it, the re-count would.
+    await db.pool.query("UPDATE governance.api_keys SET revoked_at = NULL WHERE key_hash = $1", [k.hash]);
+    const r2 = await erase();
+    expect(r2.state).toBe("receipted");
+    expect(r2.deletions.find((d) => d.store === "governance.api_keys")).toMatchObject({ deleted: 1, evidence: { revokedPrincipals: ["dedicated"] } });
+    expect((await db.pool.query("SELECT revoked_at IS NOT NULL AS revoked, erasure_request_id FROM governance.api_keys WHERE key_hash = $1", [k.hash])).rows[0]).toEqual({ revoked: true, erasure_request_id: r2.id });
+    expect((await verify(r2.id)).ok).toBe(true);
   });
 
   it("unknown ids and requests without a receipt are errors, not failures", async () => {

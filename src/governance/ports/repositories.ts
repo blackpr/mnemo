@@ -1,6 +1,6 @@
 import type { BankId, PrincipalId, SubjectId, TenantId } from "../../shared-kernel/index.js";
 import type { AuditAction, AuditEntry } from "../domain/audit-log.js";
-import type { ErasureRequest, StoreDeletion } from "../domain/erasure-request.js";
+import type { ErasureRequest, ErasureState, StoreDeletion } from "../domain/erasure-request.js";
 import type { Principal } from "../domain/principal.js";
 
 export interface PrincipalRepository {
@@ -21,7 +21,8 @@ export type NewAuditEntry = Omit<AuditEntry, "seq" | "prevHash" | "hash">;
 export interface AuditLogStore {
   /** Append one hash-chained entry for the tenant. Serialized per tenant by the adapter. */
   append(entry: NewAuditEntry): Promise<AuditEntry>;
-  list(tenantId: TenantId, opts?: { readonly limit?: number }): Promise<readonly AuditEntry[]>;
+  /** The tenant's entries in seq order, at most `limit` (default 10,000); with `afterSeq`, only those after it (a keyset page on `(tenant_id, seq)`). */
+  list(tenantId: TenantId, opts?: { readonly limit?: number; readonly afterSeq?: number }): Promise<readonly AuditEntry[]>;
   /** The tenant's first entry with this action whose details name this request id (erasure entries carry `requestId`). */
   find(tenantId: TenantId, match: { readonly action: AuditAction; readonly requestId: string }): Promise<AuditEntry | undefined>;
 }
@@ -83,8 +84,19 @@ export interface ErasureRequestRepository {
    * request as stored, in whatever state the previous pass left it: the worker resumes from there.
    */
   claimNext(opts: { readonly staleAfterMs: number }): Promise<ErasureClaim | undefined>;
-  /** Worker shutting down between steps: hand the row back so the next server picks it up at once instead of after `staleAfterMs`. Only while the claim is still this pass's. */
-  release(claim: ErasureClaim): Promise<void>;
+  /**
+   * Worker shutting down: hand the row back so the next server picks it up at once instead of after `staleAfterMs`. Only while
+   * the claim is still this pass's. Between steps the attempt is given back (`refund`, the default); a release from outside a pass
+   * stuck in a store call keeps it (`refund: false`), so a store that hangs on every pass still reaches the attempt limit.
+   */
+  release(claim: ErasureClaim, opts?: { readonly refund?: boolean }): Promise<boolean>;
+  /**
+   * Operator abandon, as a compare-and-set that writes only `state = 'failed'`, `failure` and `updated_at`: the deletions,
+   * inventory and verifications a running pass saved stay as stored. Applies only while the row is still in `expected.state`
+   * and, with `expected.unchangedForMs`, landed no change for that long (database clock). Returns the row as stored after
+   * the update, or undefined when the compare failed (the row moved on, went terminal, or changed too recently).
+   */
+  abandon(request: { readonly id: string; readonly bankId: BankId }, failure: string, expected: { readonly state: ErasureState; readonly unchangedForMs?: number }): Promise<ErasureRequest | undefined>;
   /** `within` narrows to a bank and tenant in SQL (second line of defence behind the handler's check); omitted only by operator tooling. */
   get(id: string, within?: { readonly bankId: BankId; readonly tenantId: TenantId }): Promise<ErasureRequest | undefined>;
 }

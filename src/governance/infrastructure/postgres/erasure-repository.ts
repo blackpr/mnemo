@@ -151,12 +151,27 @@ export class PgErasureRequestRepository implements ErasureRequestRepository {
     return { request: toRequest(row), token, claimedAt: row.claimed_at, attempts: row.attempts };
   }
 
-  /** A graceful stop is not a failed attempt: the claim goes and the attempt is given back. */
-  async release(claim: ErasureClaim): Promise<void> {
-    await this.db.query(
-      "UPDATE governance.erasure_requests SET claim_token = NULL, claimed_at = NULL, attempts = greatest(attempts - 1, 0) WHERE id = $1 AND bank_id = $3 AND claim_token = $2 AND state NOT IN ('receipted', 'failed')",
-      [claim.request.id, claim.token, claim.request.bankId],
+  /** A stop between steps is not a failed attempt: the claim goes and the attempt is given back (unless `refund: false`). */
+  async release(claim: ErasureClaim, opts: { readonly refund?: boolean } = {}): Promise<boolean> {
+    const res = await this.db.query(
+      "UPDATE governance.erasure_requests SET claim_token = NULL, claimed_at = NULL, attempts = CASE WHEN $4 THEN greatest(attempts - 1, 0) ELSE attempts END WHERE id = $1 AND bank_id = $3 AND claim_token = $2 AND state NOT IN ('receipted', 'failed')",
+      [claim.request.id, claim.token, claim.request.bankId, opts.refund ?? true],
     );
+    // False when the claim was no longer this pass's (released at a step boundary already, retaken, or the row went terminal).
+    return res.rowCount === 1;
+  }
+
+  async abandon(request: { readonly id: string; readonly bankId: BankId }, failure: string, expected: { readonly state: ErasureState; readonly unchangedForMs?: number }): Promise<ErasureRequest | undefined> {
+    // Only state and failure: a pass that saved a deletion after the operator read the row keeps it. The staleness test is on the
+    // database clock, like `claimed_at` and `updated_at`, so a step landing between the read and this update makes it miss.
+    const { rows } = await this.db.query<Row>(
+      `UPDATE governance.erasure_requests SET state = 'failed', failure = $3, updated_at = now()
+       WHERE id = $1 AND bank_id = $2 AND state = $4 AND state NOT IN ('receipted', 'failed')
+         AND ($5::double precision IS NULL OR updated_at < now() - make_interval(secs => $5::double precision / 1000))
+       RETURNING *`,
+      [request.id, request.bankId, failure, expected.state, expected.unchangedForMs ?? null],
+    );
+    return rows[0] ? toRequest(rows[0]) : undefined;
   }
 
   async get(id: string, within?: { readonly bankId: BankId; readonly tenantId: TenantId }): Promise<ErasureRequest | undefined> {

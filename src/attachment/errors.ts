@@ -35,6 +35,7 @@ export function toHttpError(err: AppError): HttpError {
       return { status: 409, body: { error: "engine_mismatch" } };
     case "ErasureTerminal":
     case "ErasureStillRunning":
+    case "ErasureKeepsMoving":
       return { status: 409, body: { error: "erasure_not_abandonable", detail: error } };
     case "BankNotWritable":
       return { status: 409, body: { error: "bank_not_writable" } };

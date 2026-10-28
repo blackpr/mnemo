@@ -575,6 +575,38 @@ describeWithDb("EraseBank", () => {
     expect(await erasureActions(bankA.id)).toEqual(FULL_RUN);
   });
 
+  it("a shutdown past its deadline releases the claim of a pass stuck inside a store call: the next boot retakes it at once, and the stuck pass stops as lost if it ever returns", async () => {
+    const a = await handler().handle(eraser(bankA.id), bankA.id);
+    if (!a.ok) throw new Error("setup");
+    let entered!: () => void;
+    const inPurge = new Promise<void>((resolve) => (entered = resolve));
+    let finish!: () => void;
+    const blocked = new Promise<void>((resolve) => (finish = resolve));
+    const slow: ErasableStore = { count: async () => ({ "engine.slow": 0 }), purge: async () => { entered(); await blocked; return { "engine.slow": 0 }; } };
+    const w = worker({ stores: [memory, slow, ...stores.slice(1)] });
+    expect(await w.releaseInFlight()).toBe(false);
+    const pass = w.processNext();
+    await inPurge;
+    // The shutdown signal, then the deadline passes with the purge still running: the claim is handed back from outside the pass.
+    w.stop();
+    expect(await w.releaseInFlight()).toBe(true);
+    // The attempt is kept (unlike a release between steps): a store that hangs on every pass still reaches the attempt limit.
+    expect(await claimOf(a.value.id)).toEqual({ claim_token: null, claimed_at: null, attempts: 1 });
+    expect(await w.releaseInFlight()).toBe(false);
+    const stored = (await requests.get(a.value.id))!;
+    expect(stored.state).toBe("inventoried");
+    expect(stored.deletions.map((d) => d.store)).toEqual(["memory.facts", "memory.episodes", "memory.outbox"]);
+    // The next boot (staleAfterMs 60 s, nothing backdated) takes it at once.
+    const next = worker({ stores: [memory, { count: async () => ({ "engine.slow": 0 }), purge: async () => ({ "engine.slow": 0 }) }, ...stores.slice(1)] });
+    expect(await next.processNext()).toBe("receipted");
+    expect(await claimOf(a.value.id)).toMatchObject({ attempts: 2 });
+    // The stuck purge returns after all: its save is refused and the pass stops without writing.
+    finish();
+    expect(await pass).toBe("lost");
+    expect((await requests.get(a.value.id))?.state).toBe("receipted");
+    expect(await erasureActions(bankA.id)).toEqual(FULL_RUN);
+  });
+
   it("a pass that died during the freeze is retaken from `requested`; a request that keeps killing its worker ends failed after the attempt limit, and a late save of a lost claim is refused", async () => {
     // A claim older than the stale window on a still-`requested` row: the retaker starts over (freeze, inventory, ...).
     const queued = await handler().handle(eraser(bankA.id), bankA.id);
@@ -641,6 +673,62 @@ describeWithDb("EraseBank", () => {
     // Repository reads are bank- and tenant-scoped when asked.
     expect(await requests.get(inFlight.id, { bankId: bankB.id, tenantId: tenant })).toBeUndefined();
     expect(await requests.get(inFlight.id, { bankId: bankA.id, tenantId: asTenantId("t2") })).toBeUndefined();
+  });
+
+  it("an abandon interleaved with a worker save keeps the saved deletion: it writes only state and failure, and without --force the late step turns it into a still-running refusal", async () => {
+    /** A repository whose first `get` lets a worker pass land a deletion after the row was read: the abandon's snapshot is then stale. */
+    const interleaved = (step: () => Promise<void>) => {
+      let done = false;
+      return new (class extends PgErasureRequestRepository {
+        override async get(...args: Parameters<PgErasureRequestRepository["get"]>) {
+          const read = await super.get(...args);
+          if (!done) {
+            done = true;
+            await step();
+          }
+          return read;
+        }
+      })(db.pool);
+    };
+    const workerSaves = (claim: NonNullable<Awaited<ReturnType<typeof requests.claimNext>>>, at: ReturnType<typeof requestErasure>) => async () =>
+      requests.save(unwrap(recordDeletion(at, { store: "memory.facts", deleted: 1, deletedAt: new Date() })), { claimToken: claim.token });
+
+    // --force: the read snapshot has no deletion, the worker saves one, the abandon lands on the same state and leaves it recorded.
+    const a = await handler().handle(eraser(bankA.id), bankA.id);
+    if (!a.ok) throw new Error("setup");
+    const claimA = (await requests.claimNext({ staleAfterMs: 60_000 }))!;
+    const atA = await driveTo(claimA, "inventoried");
+    const forced = await new AbandonErasureHandler(scopeAccessPolicy, interleaved(workerSaves(claimA, atA)), uow, systemClock).handle(eraser(bankA.id), bankA.id, a.value.id, "operator", { force: true });
+    if (!forced.ok) throw new Error(forced.error.kind);
+    expect(forced.value).toMatchObject({ state: "failed", failure: "abandoned while inventoried: operator" });
+    expect(forced.value.deletions.map((d) => [d.store, d.deleted])).toEqual([["memory.facts", 1]]);
+    const storedA = (await requests.get(a.value.id))!;
+    expect(storedA).toMatchObject({ state: "failed", failure: "abandoned while inventoried: operator" });
+    expect(storedA.deletions.map((d) => [d.store, d.deleted])).toEqual([["memory.facts", 1]]);
+    expect(storedA.inventory).toEqual(atA.inventory);
+    expect((await audit.list(tenant)).filter((e) => e.bankId === bankA.id && e.action === "erasure.failed").map((e) => [e.details["kind"], e.details["from"]])).toEqual([["Abandoned", "inventoried"]]);
+
+    // Without --force: the row was stale when read, the worker's save makes it fresh, so the update misses and the re-read refuses.
+    const b = await handler().handle(eraser(bankB.id), bankB.id);
+    if (!b.ok) throw new Error("setup");
+    const claimB = (await requests.claimNext({ staleAfterMs: 60_000 }))!;
+    expect(claimB.request.id).toBe(b.value.id);
+    const atB = await driveTo(claimB, "inventoried");
+    await db.pool.query("UPDATE governance.erasure_requests SET updated_at = now() - interval '1 hour' WHERE id = $1", [b.value.id]);
+    const refused = await new AbandonErasureHandler(scopeAccessPolicy, interleaved(workerSaves(claimB, atB)), uow, systemClock).handle(eraser(bankB.id), bankB.id, b.value.id, "operator");
+    expect(refused.ok === false && refused.error.kind).toBe("ErasureStillRunning");
+    const storedB = (await requests.get(b.value.id))!;
+    expect(storedB.state).toBe("inventoried");
+    expect(storedB.deletions.map((d) => d.store)).toEqual(["memory.facts"]);
+    expect(await erasureActions(bankB.id)).toEqual(["erasure.requested"]);
+
+    // --force while the pass moves the row on (inventoried -> deleted) between the read and the update: the compare on the state read
+    // misses, the handler reads again and abandons the row as it now is.
+    const moved = await new AbandonErasureHandler(scopeAccessPolicy, interleaved(async () => requests.save(unwrap(markDeleted(storedB)), { claimToken: claimB.token })), uow, systemClock).handle(eraser(bankB.id), bankB.id, b.value.id, "operator", { force: true });
+    if (!moved.ok) throw new Error(moved.error.kind);
+    expect(moved.value).toMatchObject({ state: "failed", failure: "abandoned while deleted: operator" });
+    expect(moved.value.deletions.map((d) => d.store)).toEqual(["memory.facts"]);
+    expect((await audit.list(tenant)).filter((e) => e.bankId === bankB.id && e.action === "erasure.failed").map((e) => e.details["from"])).toEqual(["deleted"]);
   });
 
   it("status reads need erase on the request's own bank; other banks and tenants see not-found", async () => {

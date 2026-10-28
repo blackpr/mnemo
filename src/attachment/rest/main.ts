@@ -22,8 +22,10 @@ import { ADDRESS_LIMIT_FACTOR, createApp, DEFAULT_RATE_LIMIT_PER_MINUTE } from "
  * times that, per client address; 0 means no address ceiling; in-process counters, see app.ts), OUTBOX_POLL_MS (default 500),
  * EXTRACTION_POLL_MS (default 1000), ERASURE_POLL_MS (default 1000), ERASURE_STALE_MS (default 600000: an erasure pass
  * that has landed no step for this long is presumed dead and retaken; raise it if a single store's purge of a large
- * bank takes longer; on the third retake a request ends failed instead), LLM_TIMEOUT_MS (default 120000),
- * SHUTDOWN_TIMEOUT_MS (default 10000), plus the provider keys the configured extractor models
+ * bank takes longer), ERASURE_MAX_ATTEMPTS (default 3: a request claimed more often than this without finishing ends failed
+ * instead of being retaken again), LLM_TIMEOUT_MS (default 120000),
+ * SHUTDOWN_TIMEOUT_MS (default 10000; an erasure pass still in a store call is then released and the pool closed, up to
+ * 4 s more, so give an orchestrator's kill grace period that margin), plus the provider keys the configured extractor models
  * need (ANTHROPIC_API_KEY, GOOGLE_GENERATIVE_AI_API_KEY, OPENAI_API_KEY,
  * OPENAI_COMPATIBLE_BASE_URL). EMBEDDER selects the embedding model ("provider:model", default
  * openai:text-embedding-3-small; "hashing" for the offline test double); EMBEDDING_DIMENSIONS (default
@@ -62,13 +64,14 @@ function positiveInt(name: string): number | undefined {
   const raw = process.env[name];
   if (raw === undefined || raw === "") return undefined;
   if (!/^[1-9]\d*$/.test(raw)) {
-    console.error(`${name} must be a positive integer (milliseconds), got "${raw}"`);
+    console.error(`${name} must be a positive integer, got "${raw}"`);
     process.exit(1);
   }
   return Number(raw);
 }
 const erasurePollMs = positiveInt("ERASURE_POLL_MS") ?? 1_000;
 const erasureStaleMs = positiveInt("ERASURE_STALE_MS") ?? 10 * 60_000;
+const erasureMaxAttempts = positiveInt("ERASURE_MAX_ATTEMPTS") ?? 3;
 const llmTimeoutMs = Number(process.env.LLM_TIMEOUT_MS ?? 120_000);
 // Extraction prompt size (extract-v3): candidate facts by similarity, context window in episodes and in characters.
 const extractionCandidateFacts = positiveInt("EXTRACTION_CANDIDATE_FACTS") ?? 20;
@@ -210,7 +213,7 @@ const extractionTimer = setInterval(async () => {
 }, extractionPollMs);
 
 // Loop 3: erasure worker. Purges run here, never inside the HTTP request that asked for them; the request id is the handle.
-const erasureWorker = new ErasureWorker(erasureRequests, memoryErasure, erasureUow, erasableStores, systemClock, sha256, { staleAfterMs: erasureStaleMs });
+const erasureWorker = new ErasureWorker(erasureRequests, memoryErasure, erasureUow, erasableStores, systemClock, sha256, { staleAfterMs: erasureStaleMs, maxAttempts: erasureMaxAttempts });
 let erasing = false;
 const erasureTimer = setInterval(async () => {
   if (erasing) return;
@@ -236,7 +239,7 @@ async function shutdown(signal: string): Promise<void> {
   clearInterval(timer);
   clearInterval(extractionTimer);
   clearInterval(erasureTimer);
-  // The erasure pass hands its row back at the next step boundary; a purge longer than the timeout keeps its claim and is retaken after ERASURE_STALE_MS.
+  // The erasure pass hands its row back at the next step boundary; one still inside a store call at the deadline is released below.
   erasureWorker.stop();
   const deadline = Date.now() + shutdownTimeoutMs;
   const closed = new Promise<void>((resolve) => server.close(() => resolve()));
@@ -244,7 +247,12 @@ async function shutdown(signal: string): Promise<void> {
   try {
     await Promise.race([closed, timeout]);
     while ((draining || extracting || erasing) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
-    await pool.end();
+    // A purge longer than SHUTDOWN_TIMEOUT_MS: hand its claim back now so the next boot retakes it at once, not after ERASURE_STALE_MS.
+    // (A SIGKILL never gets here; that claim goes stale and is retaken by the sweep.) Both waits are bounded: a client held by the stuck
+    // purge would otherwise keep `pool.end()` (which waits for checked-out clients) and the process alive while the next instance retakes the row.
+    const released = erasing && (await Promise.race([erasureWorker.releaseInFlight(), new Promise<false>((r) => setTimeout(() => r(false), 2_000).unref())]));
+    if (released) console.error("erasure: the pass in progress was released at shutdown; the next start resumes it");
+    await Promise.race([pool.end(), new Promise<void>((r) => setTimeout(r, 2_000).unref())]);
     process.exit(0);
   } catch (e) {
     console.error("shutdown error", e);
